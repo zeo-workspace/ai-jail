@@ -1804,6 +1804,15 @@ pub struct BridgeSockets {
 /// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
 /// macOS points its seatbelt endpoint rule and the child env at its
 /// loopback TCP port.
+/// Transparent egress plumbing for one launch (Linux): the fds bwrap
+/// reports on and blocks on, and the resolv.conf naming the fake resolver.
+#[derive(Clone, Copy)]
+pub struct TransparentFds<'a> {
+    pub info_fd: std::os::fd::RawFd,
+    pub block_fd: std::os::fd::RawFd,
+    pub resolv: &'a Path,
+}
+
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1812,6 +1821,7 @@ pub fn build(
     sandbox_tty: Option<&Path>,
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
+    transparent: Option<TransparentFds<'_>>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1823,11 +1833,12 @@ pub fn build(
             verbose,
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
+            transparent,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (guard, bridge_sockets);
+        let _ = (guard, bridge_sockets, transparent);
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
