@@ -1396,6 +1396,12 @@ fn landlock_wrapper_args(
         args.push("--cpus".into());
         args.push(cpus.clone());
     }
+    // --memory: the wrapper marks the sandbox as the preferred OOM
+    // victim, so the supervisor survives to report the kill.
+    if let Some(memory) = &config.memory_max {
+        args.push("--memory".into());
+        args.push(memory.clone());
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
