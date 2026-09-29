@@ -766,6 +766,43 @@ Code creates that directory unconditionally at startup and ignores `TMPDIR`;
 unlike the session directory, it persists between runs. Use a map or
 `--agent-state` for anything durable.
 
+## Resource limits
+
+rlimits (on by default) cap each process on its own. To cap the sandbox as a
+whole — and to learn why it died — use the cgroup limits (Linux):
+
+```bash
+ai-jail --memory 8G --max-tasks 2000 --cpu-quota 400% --cpus 8-15 claude
+```
+
+- `--memory SIZE` caps RAM for everything inside, with swap off so a runaway
+  agent is killed instead of stalling the host.
+- `--max-tasks N` caps processes **and threads** (`pids.max`); a Node or JVM
+  agent alone runs dozens of threads, so size it generously.
+- `--cpu-quota PCT` caps CPU time, in percent of one CPU.
+- `--cpus LIST` restricts the sandbox to those CPUs (`8,24`, `0-3`).
+
+The first three need a systemd user session and no privilege: ai-jail
+re-execs itself through `systemd-run --user --scope`, which puts the
+supervisor and the sandbox in one fresh cgroup, then checks that the kernel
+really enforces the limits — or refuses to launch. The PID, stdio and signals
+are unchanged, so `--exec` clients (ACP adapters, harnesses) see no
+difference. `--cpus` needs no systemd: it is CPU affinity, and seccomp then
+refuses `sched_setaffinity` so nothing inside can widen it (it therefore
+requires seccomp).
+
+When the sandbox dies, ai-jail says why on stderr, also under `--exec`:
+
+```text
+✗ sandbox exited with 137: out of memory: the kernel killed 1 process(es) at
+  the sandbox memory limit (8.0 GiB, peak 8.0 GiB)
+```
+
+With `--audit-log`, the launch record carries the limits and what the cgroup
+counted (`oom_kills`, `memory_peak`, `tasks_refused`, `cpu_usage_usec`). The
+config fields are `memory_max`, `max_tasks`, `cpu_quota` and `cpus`; a project
+`.ai-jail` may add or lower a limit, never raise it.
+
 ## Browsers
 
 `--browser[=hard|soft]` reuses an isolated browser profile, but browsers still
@@ -817,7 +854,7 @@ Common fields: `command`, `rw_maps`, `ro_maps`, `overlay_maps`, `mask`,
 `network`, `x11`, `host_shm`, `terminal_passthrough`, `macos_host_ipc`,
 `macos_chromium`, `macos_trustd`, `allow_loopback_connect`, `systemd_user`, `kvm`, `ssh`, `pictures`,
 `private_home`, `lockdown`, `browser_profile`, `claude_dir`, `allow_tcp_ports`,
-`status_bar_style`.
+`status_bar_style`, `memory_max`, `max_tasks`, `cpu_quota`, `cpus`.
 
 Global config also accepts `env_pass` (see Environment policy above) and the
 legacy `trust_project_config` field. The latter affects only a legacy
@@ -883,6 +920,10 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --systemd-user / --no-systemd-user  host user manager access (off by default)
 --ssh / --no-ssh                OPEN: full ~/.ssh and ambient-agent sharing (off by default)
 --claude-dir PATH               explicit Claude state directory
+--memory SIZE / --max-tasks N / --cpu-quota PCT
+                                cap the whole sandbox (Linux, systemd user
+                                session; see Resource limits)
+--cpus LIST                     pin the sandbox to CPUs, locked by seccomp
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit
