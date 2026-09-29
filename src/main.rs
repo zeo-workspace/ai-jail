@@ -14,6 +14,7 @@ mod forge_auth;
 mod fsutil;
 mod github_auth;
 mod integration;
+mod limits;
 mod onboarding;
 mod output;
 mod proxy;
@@ -314,6 +315,22 @@ fn untrusted_project_command_carries_credentials(
 /// `--allow-tcp-port` stays dead (the filtered-egress proxy is the
 /// strictly better answer, docs/connect-proxy-plan.md), and filtered
 /// egress combines with neither unrestricted network nor browser mode.
+/// Resolve and check the resource limits before anything is launched.
+/// Every refusal here is a limit the user asked for and would not get.
+fn validate_resource_limits(
+    config: &config::Config,
+) -> Result<limits::ResourceLimits, String> {
+    let limits = limits::ResourceLimits::from_config(config)?;
+    #[cfg(not(target_os = "linux"))]
+    if !limits.is_empty() {
+        return Err(
+            "--memory, --max-tasks, --cpu-quota and --cpus are Linux only"
+                .into(),
+        );
+    }
+    Ok(limits)
+}
+
 fn validate_network_flags(config: &config::Config) -> Result<(), String> {
     if !config.allow_tcp_ports().is_empty() {
         return Err("--allow-tcp-port is disabled (UDP cannot be isolated); use --allow-host for filtered egress instead".into());
@@ -960,6 +977,13 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         &cli.landlock_rw_paths,
         cli.verbose,
     )?;
+
+    // --memory: the supervisor sits in the same cgroup and must outlive
+    // an OOM kill to report it, so the sandbox volunteers as the victim.
+    #[cfg(target_os = "linux")]
+    if config.memory_max.is_some() {
+        limits::prefer_sandbox_as_oom_victim();
+    }
 
     // --cpus: pin this process (and so the command it becomes) before
     // seccomp below refuses sched_setaffinity for good. Order: bridges,
@@ -1652,6 +1676,7 @@ fn run(
     config::absolutize_user_paths(&mut config, &invocation_cwd);
     apply_browser_profile(&mut config, !command_from_untrusted_project);
     validate_network_flags(&config)?;
+    let resource_limits = validate_resource_limits(&config)?;
 
     // Handle status command
     if cli.status {
@@ -1758,6 +1783,17 @@ fn run(
     if cli.bootstrap {
         bootstrap::run(cli.verbose, config.claude_dir.as_deref())?;
         return Ok(0);
+    }
+
+    // Whole-sandbox limits need a cgroup: re-exec through a systemd
+    // user scope (this call does not return on the way in), then prove
+    // on the way back that the limits are really enforced. Placed after
+    // the status/init/bootstrap returns and before the launch is
+    // finalized, so no thread, socket or temp file exists yet and the gh
+    // token is fetched once, inside the scope, never crossing argv.
+    #[cfg(target_os = "linux")]
+    if resource_limits.needs_scope() && !cli.dry_run {
+        limits::enter_scope(&resource_limits, cli.verbose)?;
     }
 
     let finalized = match prepared_launch.take() {
@@ -1973,6 +2009,23 @@ fn run(
         }
         if let Some(cpus) = &config.cpus {
             output::dry_run_line(&format!("cpus={cpus}"));
+        }
+        if resource_limits.needs_scope() {
+            output::info(&format!(
+                "Resource limits: {} (via systemd-run --user --scope {})",
+                resource_limits.describe(),
+                resource_limits
+                    .scope_properties()
+                    .iter()
+                    .map(|p| format!("-p {p}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        } else if !resource_limits.is_empty() {
+            output::info(&format!(
+                "Resource limits: {}",
+                resource_limits.describe()
+            ));
         }
         let formatted = sandbox::dry_run(
             &guard,
@@ -2196,6 +2249,26 @@ fn run(
         code
     };
 
+    // Read what the sandbox's cgroup counted while the scope still
+    // exists (this process keeps it alive), and explain a death the
+    // exit code alone cannot -- also under --exec, where a harness
+    // otherwise sees only "137".
+    #[cfg(target_os = "linux")]
+    let cgroup_report = if resource_limits.needs_scope() {
+        limits::own_cgroup_dir().map(|dir| limits::CgroupReport::read(&dir))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_report: Option<limits::CgroupReport> = None;
+    if let Some(msg) = limits::describe_exit(
+        exit_code,
+        &resource_limits,
+        cgroup_report.as_ref(),
+    ) {
+        output::error(&msg);
+    }
+
     // Append the launch record only now: exit code and duration are
     // what make it an audit trail rather than a log of intentions.
     if let Some(log) = &audit_log {
@@ -2232,6 +2305,9 @@ fn run(
             duration: launch_start.elapsed(),
             rlimits: &effective_limits,
             cpus: config.cpus.as_deref(),
+            limits: (!resource_limits.is_empty())
+                .then(|| resource_limits.to_json()),
+            cgroup: cgroup_report.as_ref().map(limits::CgroupReport::to_json),
         }));
     }
 
