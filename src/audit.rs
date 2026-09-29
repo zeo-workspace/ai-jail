@@ -352,6 +352,11 @@ pub(crate) struct LaunchRecord<'a> {
     pub rlimits: &'a [crate::sandbox::rlimits::EffectiveLimit],
     /// The `--cpus` set, when one was given; omitted otherwise.
     pub cpus: Option<&'a str>,
+    /// Resource limits requested for the launch, when any were set.
+    pub limits: Option<serde_json::Value>,
+    /// What the sandbox cgroup counted (OOM kills, peak memory, ...),
+    /// when the launch ran in its own scope.
+    pub cgroup: Option<serde_json::Value>,
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -649,6 +654,8 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         },
         "exit_code": record.exit_code,
         "duration_s": record.duration.as_millis() as f64 / 1000.0,
+        "limits": record.limits,
+        "cgroup": record.cgroup,
     });
     // Optional and additive: a reader of older records sees no new key,
     // and existing keys are untouched.
@@ -896,6 +903,8 @@ mod tests {
             duration: std::time::Duration::from_millis(1500),
             rlimits: &[],
             cpus: None,
+            limits: Some(serde_json::json!({"memory": 1024})),
+            cgroup: Some(serde_json::json!({"oom_kills": 1})),
         };
         log.record(launch_record(&launch));
         log.record(connect_record(
@@ -919,6 +928,8 @@ mod tests {
         assert_eq!(lines[0]["config"]["project_source"], "legacy_untrusted");
         assert_eq!(lines[0]["config"]["project_grants"], false);
         assert_eq!(lines[0]["config"]["project_constraints"], true);
+        assert_eq!(lines[0]["limits"]["memory"], 1024);
+        assert_eq!(lines[0]["cgroup"]["oom_kills"], 1);
         assert_eq!(lines[1]["type"], "connect");
         assert_eq!(lines[1]["host"], "api.anthropic.com");
         assert_eq!(lines[1]["verdict"], "allow");
@@ -951,6 +962,8 @@ mod tests {
             duration: std::time::Duration::ZERO,
             rlimits,
             cpus,
+            limits: None,
+            cgroup: None,
         };
         // An old-shaped record: no new key appears.
         let old = launch_record(&base(&[], None));
