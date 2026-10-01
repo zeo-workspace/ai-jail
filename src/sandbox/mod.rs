@@ -1795,7 +1795,9 @@ pub struct BridgeSockets {
 
 /// Transparent egress plumbing for one launch (Linux): the fds bwrap
 /// reports on and blocks on, and the resolv.conf naming the fake resolver.
+/// Read only by the bwrap path; macOS has no transparent egress.
 #[derive(Clone, Copy)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub struct TransparentFds<'a> {
     pub info_fd: std::os::fd::RawFd,
     pub block_fd: std::os::fd::RawFd,
