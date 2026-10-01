@@ -308,6 +308,7 @@ pub fn own_cgroup_dir() -> Option<std::path::PathBuf> {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn read_limit(dir: &std::path::Path, file: &str) -> Option<String> {
     std::fs::read_to_string(dir.join(file))
         .ok()
@@ -317,6 +318,7 @@ fn read_limit(dir: &std::path::Path, file: &str) -> Option<String> {
 /// Whether the cgroup at `dir` enforces `limits`. memory.max is kept in
 /// pages, so a byte count that is not page-aligned reads back rounded
 /// down; anything within one 64 KiB page of the request counts.
+#[cfg(target_os = "linux")]
 fn cgroup_enforces(dir: &std::path::Path, limits: &ResourceLimits) -> bool {
     if let Some(want) = limits.memory {
         let Some(got) =
@@ -443,6 +445,7 @@ pub struct CgroupReport {
     pub cpu_throttled_usec: Option<u64>,
 }
 
+#[cfg(target_os = "linux")]
 fn keyed(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let (k, v) = line.split_once(' ')?;
@@ -450,6 +453,7 @@ fn keyed(text: &str, key: &str) -> Option<u64> {
     })
 }
 
+#[cfg(target_os = "linux")]
 impl CgroupReport {
     pub fn read(dir: &std::path::Path) -> Self {
         let events = read_limit(dir, "memory.events").unwrap_or_default();
@@ -683,6 +687,7 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cgroup_enforcement_is_read_back_from_files() {
         let dir = scratch("limits");
@@ -713,6 +718,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cgroup_report_reads_kernel_counters() {
         let dir = scratch("report");
@@ -744,6 +750,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cgroup_report_tolerates_missing_files() {
         let report =
