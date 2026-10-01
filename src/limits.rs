@@ -680,6 +680,7 @@ mod tests {
         assert_eq!(tighten_number::<u32>(None, None), (None, false));
     }
 
+    #[cfg(target_os = "linux")]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("ai-jail-{tag}-test-{}", std::process::id()));
