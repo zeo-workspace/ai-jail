@@ -1576,7 +1576,6 @@ pub fn build(
     // well as its child. All intended child values are encoded in opt_args.
     cmd.env_clear();
 
-
     // Transparent egress: bwrap reports the sandbox pid on the info fd
     // and holds the agent back until the block fd is written, so the
     // supervisor-side helper can bind inside the sandbox's netns first.

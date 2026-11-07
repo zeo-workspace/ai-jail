@@ -52,6 +52,8 @@ or integration rather than saved sandbox authority.
   `--no-seccomp`, `--rlimits`, `--no-rlimits`
 - Filtered egress policy: `--allow-host`, `--allow-private-host`,
   `--prompt-hosts`, `--no-prompt-hosts`
+- Transparent egress for proxy-ignoring clients (Linux, fork-only):
+  `--transparent-egress`, `--no-transparent-egress`
 - Port bridges: `--forward-port`, `--publish-port`
 - Environment/secret sources: `--env-from-file`, `--secret`
 - Harness-specific path override: `--claude-dir`
