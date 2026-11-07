@@ -504,7 +504,7 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
 
     // One resolution serves both the prompt and the dial (DNS pinning):
     // the addresses the user approves are the ones dialed.
-    let addrs = match resolve(&host, port) {
+    let addrs = match resolve_upstream(&host, port, &shared.config) {
         Ok(addrs) => addrs,
         Err(why) => {
             reject(&mut client, &why);
@@ -856,18 +856,25 @@ fn connect_upstream(
     port: u16,
     config: &ProxyConfig,
 ) -> Result<TcpStream, Reject> {
-    // Test-hooks only: a fixture hostname the proxy resolves to loopback
-    // (tests/transparent_egress.rs). Never config- or CLI-exposable.
-    let addrs = if config
+    dial_resolved(host, &resolve_upstream(host, port, config)?, config, false)
+}
+
+/// [`resolve`], except that the test-hooks fixture hostname resolves to
+/// loopback (tests/transparent_egress.rs). `danger_loopback_name` is
+/// `None` outside `test-hooks` and never config- or CLI-exposable.
+fn resolve_upstream(
+    host: &str,
+    port: u16,
+    config: &ProxyConfig,
+) -> Result<Vec<SocketAddr>, Reject> {
+    if config
         .danger_loopback_name
         .as_deref()
         .is_some_and(|name| normalize_host(name) == normalize_host(host))
     {
-        vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
-    } else {
-        resolve(host, port)?
-    };
-    dial_resolved(host, &addrs, config, false)
+        return Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+    }
+    resolve(host, port)
 }
 
 fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, Reject> {

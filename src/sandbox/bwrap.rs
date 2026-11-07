@@ -1579,24 +1579,23 @@ pub fn build(
     // Transparent egress: bwrap reports the sandbox pid on the info fd
     // and holds the agent back until the block fd is written, so the
     // supervisor-side helper can bind inside the sandbox's netns first.
-    // Both fds are close-on-exec in the supervisor; only this child
-    // inherits them.
+    // v3 spawns bwrap through the supervised-exec wrapper
+    // (signals::wrap_supervised_command), which replaces this Command and
+    // drops any pre_exec hook, so both fds are made inheritable here in
+    // the supervisor -- the pattern upstream uses for its own gate fd and
+    // the bwrap args memfd. Later supervisor children inherit them too;
+    // none of them reads them.
     if let Some(t) = &transparent {
-        use std::os::unix::process::CommandExt;
         cmd.args(["--info-fd", &t.info_fd.to_string()]);
         cmd.args(["--block-fd", &t.block_fd.to_string()]);
-        let (info_fd, block_fd) = (t.info_fd, t.block_fd);
-        // SAFETY: only async-signal-safe fcntl(2) calls between fork and
-        // exec.
-        unsafe {
-            cmd.pre_exec(move || {
-                for fd in [info_fd, block_fd] {
-                    if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-                Ok(())
-            });
+        for fd in [t.info_fd, t.block_fd] {
+            // SAFETY: fcntl(2) on an fd the Transparent guard owns.
+            if unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) } == -1 {
+                return Err(format!(
+                    "transparent egress: cannot pass fd {fd} to bwrap: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
     }
 
