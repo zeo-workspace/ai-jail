@@ -248,7 +248,16 @@ fn a_clean_run_under_limits_is_quiet_and_accounted() {
         ],
     );
     assert_eq!(output.status.code(), Some(4), "{}", text(&output.stderr));
-    assert_eq!(text(&output.stderr), "", "no report for a normal exit");
+    // v3 security-warns that the hidden legacy `.ai-jail` mask has nothing
+    // to cover in a fresh project; that notice is upstream's, not a report.
+    let stderr = text(&output.stderr);
+    let report: Vec<&str> = stderr
+        .lines()
+        .filter(|line| {
+            !line.ends_with(".ai-jail does not exist; rule not applied")
+        })
+        .collect();
+    assert!(report.is_empty(), "no report for a normal exit: {stderr}");
     let record = launch_record(&home);
     assert_eq!(record["exit_code"], 4);
     assert_eq!(record["limits"]["max_tasks"], 500);
