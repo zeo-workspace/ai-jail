@@ -522,6 +522,14 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
+## Run observability
+
+When the command dies of a signal, ai-jail prints one stderr line naming the
+signal and the limit behind it when one is known (the file-size rlimit under
+`--lockdown`, with the value actually in force), even under `--exec`. Ordinary
+exits and deliberate signals print nothing, and the exit code is unchanged.
+There is no setting for it.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

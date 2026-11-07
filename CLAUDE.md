@@ -26,6 +26,7 @@ src/
   statusbar.rs    -- persistent terminal status bar overlay (redraw, update check)
   signals.rs      -- signal forwarding + child process reaping
   output.rs       -- colored terminal output helpers (raw ANSI, no deps)
+  exit_reason.rs  -- why a run ended: wait status + limits in force -> one stderr line
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
   command.rs      -- harness/ai-memory wrapper detection, effective command names
   fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
