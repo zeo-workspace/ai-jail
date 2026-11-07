@@ -1435,6 +1435,10 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("hide_dotdirs", Restriction),
     excluded_policy!("mask", Restriction),
     excluded_policy!("deny_paths", Restriction),
+    excluded_policy!("memory_max", Restriction),
+    excluded_policy!("max_tasks", Restriction),
+    excluded_policy!("cpu_quota", Restriction),
+    excluded_policy!("cpus", Restriction),
     static_policy!("mask_exceptions", Authority, MaskExceptions),
     static_policy!("deny_path_exceptions", Authority, DenyExceptions),
     directional_policy!("no_gpu", Gpu, "gpu"),
@@ -2230,6 +2234,10 @@ mod tests {
         expected_excluded!("hide_dotdirs", Restriction),
         expected_excluded!("mask", Restriction),
         expected_excluded!("deny_paths", Restriction),
+        expected_excluded!("memory_max", Restriction),
+        expected_excluded!("max_tasks", Restriction),
+        expected_excluded!("cpu_quota", Restriction),
+        expected_excluded!("cpus", Restriction),
         expected_authority!(
             "mask_exceptions",
             Authority,
@@ -2334,6 +2342,10 @@ mod tests {
             "hide_dotdirs" => config.hide_dotdirs = vec![".secret".into()],
             "mask" => config.mask = vec!["/secret".into()],
             "deny_paths" => config.deny_paths = vec!["/denied".into()],
+            "memory_max" => config.memory_max = Some("1G".into()),
+            "max_tasks" => config.max_tasks = Some(100),
+            "cpu_quota" => config.cpu_quota = Some(200),
+            "cpus" => config.cpus = Some("0-1".into()),
             "mask_exceptions" => {
                 config.mask_exceptions = vec!["/outside/mask".into()];
             }
