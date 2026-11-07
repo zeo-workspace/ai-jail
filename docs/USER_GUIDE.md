@@ -522,6 +522,22 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
+## Run observability
+
+`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
+onboarding screens do not offer it. On Linux, when the command exits,
+ai-jail stops every process the command left behind in the sandbox: SIGTERM
+(with SIGCONT, for a stopped one) first, then SIGKILL to whatever is still
+alive after 2000 ms. It lists the sandbox again afterwards and stops what
+appeared meanwhile, for at most three more rounds. If any were stopped, one
+stderr line gives their count and names (at most ten, then `+N more`), even
+under `--exec`. A report that could not be completed prints one
+`Teardown report incomplete: <reason>` line instead of passing for a clean
+teardown. Survivors are named by their kernel command
+name (`comm`) only; their command lines and environments are never read.
+The exit code is the command's own. On macOS the flag is accepted and
+changes nothing.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

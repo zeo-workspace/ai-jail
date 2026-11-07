@@ -76,6 +76,8 @@ or integration rather than saved sandbox authority.
 - Maintenance and inspection: `--clean`, `--dry-run`, `--init`, `--bootstrap`,
   `--audit-show`, `--audit-verify`
 - Standard process information: `--help`, `--version`, `--verbose`
+- Run observability: `--teardown-report` (reports on one run; no saved
+  authority and no config key)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule
