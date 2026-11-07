@@ -1815,6 +1815,10 @@ pub struct TransparentFds<'a> {
 /// filtered mode. Linux bind-mounts its Unix socket into the sandbox;
 /// macOS points its seatbelt endpoint rule and the child env at its
 /// loopback TCP port.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fork-only transparent egress adds one launch input to upstream's seven"
+)]
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
