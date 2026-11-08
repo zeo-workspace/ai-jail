@@ -4546,7 +4546,10 @@ cpus = "8,24"
         assert_eq!(c.memory_max.as_deref(), Some("8G"));
         assert_eq!(c.max_tasks, Some(2000));
         assert_eq!(c.cpu_quota, Some(400));
-        assert_eq!(c.cpus.as_deref(), Some("0-7"));
+        // Disjoint CPUs leave nothing to run on: the empty list is kept
+        // and the launch refuses it (sandbox::affinity::tighten_cpus,
+        // R4.5) instead of quietly keeping the baseline set.
+        assert_eq!(c.cpus.as_deref(), Some(""));
         assert_eq!(warnings.len(), 4, "{warnings:?}");
 
         // A project may add a limit the baseline did not set.
