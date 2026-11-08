@@ -71,6 +71,9 @@ fn test_tree(name: &str) -> (PathBuf, PathBuf) {
     let home = root.join("home");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&home).unwrap();
+    // The mandatory `.ai-jail` mask warns (even
+    // under --exec) when the file is absent, so give it one to mask.
+    std::fs::write(project.join(".ai-jail"), "").unwrap();
     (project, home)
 }
 
@@ -219,11 +222,13 @@ fn task_limit_refusals_are_reported() {
             "40",
             "bash",
             "-c",
-            "for i in $(seq 80); do sleep 1 & done 2>/dev/null; wait",
+            // Refusals are named only when the run
+            // failed; a clean exit is not blamed on the task limit.
+            "for i in $(seq 80); do sleep 1 & done 2>/dev/null; wait; exit 1",
         ],
     );
     let stderr = text(&output.stderr);
-    assert!(stderr.contains("task limit reached"), "{stderr}");
+    assert!(stderr.contains("fork/clone attempt(s) refused"), "{stderr}");
     assert!(stderr.contains("max-tasks 40"), "{stderr}");
 }
 
@@ -248,16 +253,7 @@ fn a_clean_run_under_limits_is_quiet_and_accounted() {
         ],
     );
     assert_eq!(output.status.code(), Some(4), "{}", text(&output.stderr));
-    // v3 security-warns that the hidden legacy `.ai-jail` mask has nothing
-    // to cover in a fresh project; that notice is upstream's, not a report.
-    let stderr = text(&output.stderr);
-    let report: Vec<&str> = stderr
-        .lines()
-        .filter(|line| {
-            !line.ends_with(".ai-jail does not exist; rule not applied")
-        })
-        .collect();
-    assert!(report.is_empty(), "no report for a normal exit: {stderr}");
+    assert_eq!(text(&output.stderr), "", "no report for a normal exit");
     let record = launch_record(&home);
     assert_eq!(record["exit_code"], 4);
     assert_eq!(record["limits"]["max_tasks"], 500);
@@ -345,4 +341,70 @@ fn dry_run_names_the_scope_without_entering_it() {
     assert!(stderr.contains("-p MemorySwapMax=0"), "{stderr}");
     let stdout = text(&output.stdout);
     assert!(stdout.contains("--cpus 0"), "wrapper gets --cpus: {stdout}");
+}
+
+// ── the exit reason and summary fed by cgroup counters ──
+
+fn summary_of(
+    home: &std::path::Path,
+    name: &str,
+    args: &[&str],
+) -> (Output, serde_json::Value) {
+    let path = home.join(format!("{name}-summary.json"));
+    let mut full = vec!["--run-summary", path.to_str().unwrap()];
+    full.extend_from_slice(args);
+    let (output, _) = run_in(name, &full);
+    let doc =
+        serde_json::from_slice(&std::fs::read(&path).expect("summary written"))
+            .expect("summary is JSON");
+    (output, doc)
+}
+
+#[test]
+fn memory_limit_death_names_memory_from_the_cgroup() {
+    require!(bwrap_available(), "bwrap cannot create user namespaces");
+    require!(scope_available(), "no systemd user session");
+    let (_, home) = test_tree("046-oom-home");
+    let (output, doc) = summary_of(
+        &home,
+        "046-oom",
+        &[
+            "--exec",
+            "--memory",
+            "64M",
+            "bash",
+            "-c",
+            "x=$(head -c 256M /dev/zero | tr '\\0' a); echo ${#x}",
+        ],
+    );
+    let stderr = text(&output.stderr);
+    assert_ne!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(doc["exit"]["limit"], "memory", "{doc:#}");
+    assert_eq!(doc["exit"]["reason"], "limit");
+    assert_eq!(doc["resources"]["source"], "cgroup", "{doc:#}");
+    assert_eq!(doc["resources"]["peak_rss_scope"], "whole-sandbox");
+    // Exactly one explanation line (the merge keeps one printer).
+    let lines = stderr.lines().filter(|l| l.contains("memory")).count();
+    assert_eq!(lines, 1, "one explanation, not two: {stderr}");
+}
+
+#[test]
+fn fork_bomb_under_max_tasks_names_processes() {
+    require!(bwrap_available(), "bwrap cannot create user namespaces");
+    require!(scope_available(), "no systemd user session");
+    let (_, home) = test_tree("046-tasks-home");
+    let (output, doc) = summary_of(
+        &home,
+        "046-tasks",
+        &[
+            "--exec",
+            "--max-tasks",
+            "8",
+            "bash",
+            "-c",
+            "for i in $(seq 40); do sleep 2 & done 2>/dev/null; wait; exit 1",
+        ],
+    );
+    assert_ne!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(doc["exit"]["limit"], "processes", "{doc:#}");
 }

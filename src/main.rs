@@ -2552,14 +2552,32 @@ fn run(
         // sandbox; this process only waited for bwrap. macOS has no
         // wrapper: getrusage covers every child this process waited for.
         #[cfg(target_os = "linux")]
-        let usage = match &teardown_section {
+        let mut usage = match &teardown_section {
             teardown::TeardownSection::Reported(report) => {
                 run_summary::usage_from_report(report.usage.as_ref())
             }
             _ => run_summary::unavailable_usage(),
         };
         #[cfg(target_os = "macos")]
-        let usage = run_summary::resource_usage();
+        let mut usage = run_summary::resource_usage();
+
+        // Read what the sandbox's cgroup counted while the scope still
+        // exists (this process keeps it alive). Its counters feed the one
+        // classifier below, and its memory peak covers the whole sandbox,
+        // where the wrapper's figure is the largest single process.
+        #[cfg(target_os = "linux")]
+        let cgroup_report = if resource_limits.needs_scope() {
+            limits::own_cgroup_dir().map(|dir| limits::CgroupReport::read(&dir))
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_report: Option<limits::CgroupReport> = None;
+        if let Some(peak) = cgroup_report.as_ref().and_then(|r| r.memory_peak) {
+            run_summary::apply_cgroup_peak(&mut usage, peak);
+        }
+        let counters =
+            cgroup_report.as_ref().map(exit_reason::LimitCounters::from);
 
         // The wrapper saw the command's own end: it replaces the status
         // inferred from bwrap's exit code, for the reason and the one
@@ -2576,33 +2594,16 @@ fn run(
 
         // One explanation line per run, after the terminal is restored so
         // it is not drawn into the child's screen; silent for an ordinary end.
-        let reason = exit_reason::classify(
+        // Also under --exec, where a harness otherwise sees only "137".
+        let reason = exit_reason::classify_counted(
             &classified_status,
-            &exit_reason::LimitsInForce::read_back(file_size_set),
+            &resource_limits
+                .in_force(exit_reason::LimitsInForce::read_back(file_size_set)),
+            counters.as_ref(),
         );
         if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT)
         {
             output::security_warn(&line);
-        }
-
-        // Read what the sandbox's cgroup counted while the scope still
-        // exists (this process keeps it alive), and explain a death the
-        // exit code alone cannot -- also under --exec, where a harness
-        // otherwise sees only "137".
-        #[cfg(target_os = "linux")]
-        let cgroup_report = if resource_limits.needs_scope() {
-            limits::own_cgroup_dir().map(|dir| limits::CgroupReport::read(&dir))
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let cgroup_report: Option<limits::CgroupReport> = None;
-        if let Some(msg) = limits::describe_exit(
-            exit_code,
-            &resource_limits,
-            cgroup_report.as_ref(),
-        ) {
-            output::error(&msg);
         }
         let run_end = run_summary::RunEnd {
             exit: reason,

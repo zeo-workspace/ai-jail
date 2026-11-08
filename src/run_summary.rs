@@ -30,6 +30,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeakScope {
     LargestProcess,
+    /// The sandbox cgroup's `memory.peak`: every process at once.
+    WholeSandbox,
 }
 
 /// Where the figures come from. On Linux every process the command
@@ -46,6 +48,8 @@ pub enum UsageSource {
     #[cfg(any(test, target_os = "macos"))]
     Getrusage,
     Unavailable,
+    /// The sandbox cgroup, when whole-sandbox limits put the run in one.
+    Cgroup,
 }
 
 /// `None` figures are unknown, never zero: they are written as `null`.
@@ -113,6 +117,15 @@ pub fn program_name(command: &[String]) -> &str {
         .unwrap_or("")
 }
 
+/// The sandbox cgroup's `memory.peak` (bytes) replaces the wrapper's
+/// largest-process figure: it covers every process at once. The CPU
+/// figures stay the wrapper's.
+pub fn apply_cgroup_peak(usage: &mut ResourceUsage, peak_bytes: u64) {
+    usage.peak_rss_kib = Some(peak_bytes / 1024);
+    usage.scope = PeakScope::WholeSandbox;
+    usage.source = UsageSource::Cgroup;
+}
+
 /// The version-1 document, as `docs/run-summary.schema.json` describes it.
 pub fn build(f: &RunFacts) -> Value {
     // `ended` is `started` plus a monotonic elapsed time in production
@@ -150,6 +163,7 @@ fn resources_json(u: &ResourceUsage) -> Value {
         "peak_rss_kib": u.peak_rss_kib,
         "peak_rss_scope": match u.scope {
             PeakScope::LargestProcess => "largest-process",
+            PeakScope::WholeSandbox => "whole-sandbox",
         },
         "source": match u.source {
             #[cfg(any(test, target_os = "linux"))]
@@ -157,6 +171,7 @@ fn resources_json(u: &ResourceUsage) -> Value {
             #[cfg(any(test, target_os = "macos"))]
             UsageSource::Getrusage => "getrusage",
             UsageSource::Unavailable => "unavailable",
+            UsageSource::Cgroup => "cgroup",
         },
     })
 }
@@ -640,14 +655,20 @@ mod tests {
                 termination: Termination::Exited(0),
                 source: StatusSource::Reported,
             },
-            &LimitsInForce { file_size: None },
+            &LimitsInForce {
+                file_size: None,
+                ..LimitsInForce::default()
+            },
         )
     }
 
     fn exit_killed() -> crate::exit_reason::ExitReason {
         classify(
             &crate::exit_reason::from_exit_code(137, LINUX_HOST),
-            &LimitsInForce { file_size: None },
+            &LimitsInForce {
+                file_size: None,
+                ..LimitsInForce::default()
+            },
         )
     }
 
@@ -1108,7 +1129,10 @@ mod tests {
 
     #[test]
     fn wire_child_status_becomes_reported() {
-        let no_limits = LimitsInForce { file_size: None };
+        let no_limits = LimitsInForce {
+            file_size: None,
+            ..LimitsInForce::default()
+        };
         // A reported exit(137) is a normal exit, not a
         // SIGKILL; the 128+N decode must not be applied to it.
         let status = ChildStatus::from(&ChildStatusWire::Exited(137));
@@ -1149,7 +1173,10 @@ mod tests {
 
     #[test]
     fn summary_marks_a_plain_exit_code_exit_code() {
-        let no_limits = LimitsInForce { file_size: None };
+        let no_limits = LimitsInForce {
+            file_size: None,
+            ..LimitsInForce::default()
+        };
         let summary_of = |status: &ChildStatus| -> Value {
             let exit = classify(status, &no_limits);
             build(&facts(
@@ -1465,5 +1492,21 @@ mod tests {
             .expect("a name prepare accepts can be written");
         assert!(dir.join(name).is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cgroup_peak_is_converted_from_bytes_to_kib() {
+        let mut usage = ResourceUsage {
+            cpu_user_ms: Some(10),
+            cpu_system_ms: Some(2),
+            peak_rss_kib: Some(1),
+            scope: PeakScope::LargestProcess,
+            source: UsageSource::SandboxWrapper,
+        };
+        apply_cgroup_peak(&mut usage, 300 << 20);
+        assert_eq!(usage.peak_rss_kib, Some(300 << 10), "bytes to KiB");
+        assert!(matches!(usage.scope, PeakScope::WholeSandbox));
+        assert!(matches!(usage.source, UsageSource::Cgroup));
+        assert_eq!(usage.cpu_user_ms, Some(10), "CPU stays the wrapper's");
     }
 }

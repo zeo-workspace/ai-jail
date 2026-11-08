@@ -105,6 +105,10 @@ impl ChildStatus {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitsInForce {
     pub file_size: Option<u64>,
+    /// The sandbox cgroup's `memory.max`, when `--memory` set one.
+    pub memory: Option<u64>,
+    /// The sandbox cgroup's `pids.max`, when `--max-tasks` set one.
+    pub max_tasks: Option<u64>,
 }
 
 impl LimitsInForce {
@@ -121,12 +125,17 @@ impl LimitsInForce {
         } else {
             None
         };
-        LimitsInForce { file_size }
+        LimitsInForce {
+            file_size,
+            ..LimitsInForce::default()
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
+    Memory,
+    Processes,
     CpuTime,
     FileSize,
 }
@@ -134,6 +143,8 @@ pub enum Limit {
 impl Limit {
     fn as_str(self) -> &'static str {
         match self {
+            Limit::Memory => "memory",
+            Limit::Processes => "processes",
             Limit::CpuTime => "cpu-time",
             Limit::FileSize => "file-size",
         }
@@ -195,13 +206,40 @@ pub fn from_exit_code(code: i32, host: HostTraits) -> ChildStatus {
 }
 
 /// Apply the rules in order: SIGXCPU, SIGXFSZ, SIGKILL, then every
-/// other signal.
+/// other signal. On this line every launch has the cgroup's word on it,
+/// so `run` calls `classify_counted`; the tests keep this entry point.
+#[cfg(test)]
 pub fn classify(status: &ChildStatus, limits: &LimitsInForce) -> ExitReason {
+    classify_counted(status, limits, None)
+}
+
+/// What the sandbox cgroup counted over the run: the fork's whole-sandbox
+/// limits (`limits::CgroupReport`) feed the one classifier through this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitCounters {
+    pub oom_kills: u64,
+    pub tasks_refused: u64,
+    pub memory_peak: Option<u64>,
+}
+
+/// `classify`, with the cgroup's counters ruled first: a counted kill is
+/// named even behind a normally silent SIGTERM.
+pub fn classify_counted(
+    status: &ChildStatus,
+    limits: &LimitsInForce,
+    counters: Option<&LimitCounters>,
+) -> ExitReason {
     let (signal, core) = match status.termination {
         Termination::Exited(_) => (None, false),
         Termination::Signaled { signal, core } => (Some(signal), core),
     };
-    let (kind, limit, evidence) = signal_reason(signal, limits);
+    let (kind, limit, evidence) =
+        match counted_limit(status.exit_code(), signal, limits, counters) {
+            Some((limit, evidence)) => {
+                (ReasonKind::Limit, Some(limit), Some(evidence))
+            }
+            None => signal_reason(signal, limits, counters),
+        };
     ExitReason {
         code: status.exit_code(),
         signal,
@@ -297,9 +335,49 @@ impl ExitReason {
     }
 }
 
+/// The counter rules. Refused forks are blamed only on a run that failed
+/// with an exit code: a command that exited 0 coped with them, and the
+/// processes limit refuses a fork without ever sending a signal (R1.14),
+/// so a SIGKILL beside refused forks is left to the SIGKILL rule.
+fn counted_limit(
+    code: i32,
+    signal: Option<i32>,
+    limits: &LimitsInForce,
+    counters: Option<&LimitCounters>,
+) -> Option<(Limit, String)> {
+    let c = counters?;
+    // oom_kill counts kills by any OOM killer, the host's too: only a
+    // memory limit ai-jail set makes a counted kill the sandbox's.
+    if c.oom_kills > 0 && limits.memory.is_some() {
+        let limit = limits.memory.map_or_else(String::new, human_bytes);
+        let peak = c.memory_peak.map_or("unknown".into(), human_bytes);
+        return Some((
+            Limit::Memory,
+            format!(
+                "out of memory: the kernel killed {} process(es) at the \
+                 sandbox memory limit ({limit}, peak {peak})",
+                c.oom_kills
+            ),
+        ));
+    }
+    if c.tasks_refused > 0 && code != 0 && signal.is_none() {
+        let max = limits.max_tasks.map_or("unset".into(), |n| n.to_string());
+        return Some((
+            Limit::Processes,
+            format!(
+                "probably the processes limit: {} fork/clone attempt(s) \
+                 refused (max-tasks {max})",
+                c.tasks_refused
+            ),
+        ));
+    }
+    None
+}
+
 fn signal_reason(
     signal: Option<i32>,
     limits: &LimitsInForce,
+    counters: Option<&LimitCounters>,
 ) -> (ReasonKind, Option<Limit>, Option<String>) {
     let Some(sig) = signal else {
         return (ReasonKind::Exited, None, None);
@@ -332,9 +410,32 @@ fn signal_reason(
             (ReasonKind::Limit, Some(Limit::FileSize), Some(evidence))
         }
         SIGKILL => {
-            let evidence = "ai-jail cannot attribute it to one of its \
-                            limits; the usual cause is the host OOM killer";
-            (ReasonKind::Signaled, None, Some(evidence.into()))
+            // `None`: no cgroup to ask. A counted kill reaches here only
+            // without a memory limit, so it was the host's OOM killer.
+            let counted = match counters.map(|c| c.oom_kills) {
+                None => String::new(),
+                Some(0) => {
+                    "no OOM kill was counted in the sandbox cgroup, so ".into()
+                }
+                Some(n) => format!(
+                    "the sandbox cgroup counted {n} OOM kill(s) but ai-jail set \
+                     no memory limit, so "
+                ),
+            };
+            // Refused forks did not send the kill, but they are a clue
+            // to what the command was doing when it came.
+            let refused = match counters.map_or(0, |c| c.tasks_refused) {
+                0 => String::new(),
+                n => format!(
+                    "; the sandbox cgroup also refused {n} fork/clone \
+                     attempt(s)"
+                ),
+            };
+            let evidence = format!(
+                "{counted}ai-jail cannot attribute it to one of its limits; \
+                 the usual cause is the host OOM killer{refused}"
+            );
+            (ReasonKind::Signaled, None, Some(evidence))
         }
         _ => (ReasonKind::Signaled, None, None),
     }
@@ -1012,6 +1113,7 @@ mod tests {
     fn sigxfsz_names_the_file_size_value_in_force() {
         let limits = LimitsInForce {
             file_size: Some(GIB),
+            ..LimitsInForce::default()
         };
         let r = classify(&signaled(25, StatusSource::Reported), &limits);
         assert!(matches!(r.limit, Some(Limit::FileSize)));
@@ -1079,5 +1181,136 @@ mod tests {
                 .is_some_and(|e| e.contains("Failed to start sandbox: boom")),
             "{json}"
         );
+    }
+
+    // ── cgroup counters: the fork's whole-sandbox limits ──
+
+    const MIB_64: u64 = 64 << 20;
+
+    fn mentions_64_mib(s: &str) -> bool {
+        s.contains("64 MiB") || s.contains("64.0 MiB") || s.contains("67108864")
+    }
+
+    fn counters(oom: u64, refused: u64, peak: Option<u64>) -> LimitCounters {
+        LimitCounters {
+            oom_kills: oom,
+            tasks_refused: refused,
+            memory_peak: peak,
+        }
+    }
+
+    #[test]
+    fn silence_never_swallows_a_counted_limit_kill() {
+        // SIGTERM is normally silent (R1.8), but R1.8 only applies when no
+        // limit counter fired: an OOM kill must still be named.
+        let limits = LimitsInForce {
+            memory: Some(MIB_64),
+            ..no_limits()
+        };
+        let r = classify_counted(
+            &signaled(15, StatusSource::Reported),
+            &limits,
+            Some(&counters(1, 0, Some(MIB_64))),
+        );
+        assert!(matches!(r.limit, Some(Limit::Memory)), "{}", r.to_json());
+        assert!(r.explanation(LINUX).is_some());
+    }
+
+    #[test]
+    fn oom_counter_names_memory_with_limit_and_peak() {
+        let limits = LimitsInForce {
+            memory: Some(MIB_64),
+            ..no_limits()
+        };
+        let r = classify_counted(
+            &signaled(9, StatusSource::Reported),
+            &limits,
+            Some(&counters(1, 0, Some(MIB_64))),
+        );
+        assert!(matches!(r.limit, Some(Limit::Memory)), "{}", r.to_json());
+        assert!(matches!(r.kind, ReasonKind::Limit));
+        let line = r.explanation(LINUX).expect("explained");
+        assert!(mentions_64_mib(&line), "limit and peak: {line}");
+        assert!(
+            !line.to_lowercase().contains("host oom"),
+            "a counted OOM kill is not the host OOM killer: {line}"
+        );
+        assert_eq!(r.to_json()["limit"], "memory");
+        assert_eq!(r.code, 137, "R1.9: the reason never changes the code");
+    }
+
+    #[test]
+    fn refused_forks_need_a_non_zero_exit() {
+        // Hostile half first: refusals during a run that still exited 0
+        // must not be blamed for anything.
+        let limits = LimitsInForce {
+            max_tasks: Some(20),
+            ..no_limits()
+        };
+        let ok =
+            classify_counted(&exited(0), &limits, Some(&counters(0, 5, None)));
+        assert!(
+            !matches!(ok.limit, Some(Limit::Processes)),
+            "exit 0 is not a processes-limit death: {}",
+            ok.to_json()
+        );
+        let failed =
+            classify_counted(&exited(1), &limits, Some(&counters(0, 5, None)));
+        assert!(matches!(failed.limit, Some(Limit::Processes)));
+        let line = failed.explanation(LINUX).expect("explained");
+        assert!(line.contains('5'), "number of refusals: {line}");
+        assert!(line.contains("probabl"), "named as probable: {line}");
+        assert_eq!(failed.to_json()["limit"], "processes");
+        assert_eq!(failed.code, 1);
+    }
+
+    #[test]
+    fn quiet_counters_keep_the_silence() {
+        // Counters that are present but recorded nothing do not break the
+        // silence either.
+        let quiet = counters(0, 0, Some(1 << 20));
+        let r = classify_counted(&exited(0), &no_limits(), Some(&quiet));
+        assert!(r.explanation(LINUX).is_none());
+    }
+
+    #[test]
+    fn sigkill_with_quiet_counters_names_no_memory_limit() {
+        // Hostile half first: counters exist but recorded no kill -- the
+        // memory limit must not be named.
+        let limits = LimitsInForce {
+            memory: Some(MIB_64),
+            ..no_limits()
+        };
+        let with_counters = classify_counted(
+            &signaled(9, StatusSource::Reported),
+            &limits,
+            Some(&counters(0, 0, Some(1 << 20))),
+        );
+        assert!(with_counters.limit.is_none(), "{}", with_counters.to_json());
+        let line = with_counters.explanation(LINUX).expect("explained");
+        assert!(line.contains("SIGKILL"), "{line}");
+        assert_eq!(line.matches("journalctl").count(), 1, "{line}");
+    }
+
+    #[test]
+    fn oom_kill_without_a_memory_limit_is_the_host_oom_killer() {
+        // The cgroup's oom_kill counts kills by any OOM killer: with no
+        // --memory, a counted kill is the host's, not the sandbox limit.
+        let limits = LimitsInForce {
+            max_tasks: Some(64),
+            ..no_limits()
+        };
+        let r = classify_counted(
+            &signaled(9, StatusSource::Reported),
+            &limits,
+            Some(&counters(1, 0, Some(300 << 20))),
+        );
+        assert!(r.limit.is_none(), "{}", r.to_json());
+        let line = r.explanation(LINUX).expect("explained");
+        assert!(!line.contains("sandbox memory limit"), "{line}");
+        assert!(line.contains("host OOM killer"), "{line}");
+        assert!(!line.contains("no OOM kill was counted"), "{line}");
+        // The kernel-log hint is added once, by the explanation.
+        assert_eq!(line.matches("journalctl").count(), 1, "{line}");
     }
 }

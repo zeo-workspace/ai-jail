@@ -22,7 +22,7 @@
         "signal": { "type": ["string", "null"] },
         "core_dumped": { "type": "boolean" },
         "reason": { "type": "string", "enum": ["exited", "signaled", "limit", "start-failed"] },
-        "limit": { "type": ["string", "null"], "enum": ["memory", "processes", "cpu-time", "file-size", null], "description": "memory and processes are reserved for a whole-sandbox limit source such as a cgroup and are not written" },
+        "limit": { "type": ["string", "null"], "enum": ["memory", "processes", "cpu-time", "file-size", null], "description": "memory and processes come from the sandbox cgroup's counters, written only on a launch with whole-sandbox limits (--memory, --max-tasks)" },
         "evidence": { "type": ["string", "null"] },
         "status_source": { "type": "string", "enum": ["reported", "inferred", "direct", "exit-code", "none"], "description": "reported: the in-sandbox wrapper's report; inferred: decoded from a 128+N exit code; direct: waitpid saw a signal; exit-code: an exit code taken as it is; none: the command never started, so no end was observed" },
         "error": { "type": ["string", "null"] }
@@ -34,9 +34,9 @@
       "properties": {
         "cpu_user_ms": { "type": ["integer", "null"], "description": "CPU time in user mode of the command and every process it left behind; processes the kernel ends after the wrapper exits (an incomplete teardown) are not counted; null when unavailable" },
         "cpu_system_ms": { "type": ["integer", "null"], "description": "CPU time in kernel mode, same scope and the same exclusion; null when unavailable" },
-        "peak_rss_kib": { "type": ["integer", "null"], "description": "peak resident set of the largest single process, in KiB; null when unavailable" },
-        "peak_rss_scope": { "type": "string", "enum": ["largest-process", "whole-sandbox"], "description": "whole-sandbox is reserved for a whole-sandbox source such as a cgroup and is not written" },
-        "source": { "type": "string", "enum": ["sandbox-wrapper", "getrusage", "unavailable", "cgroup"], "description": "sandbox-wrapper: measured inside the sandbox on Linux; getrusage: on macOS, every process ai-jail waited for (the command and its own helpers), not what the command left behind; unavailable: no measurement, the figures are null; cgroup is reserved and not written" }
+        "peak_rss_kib": { "type": ["integer", "null"], "description": "peak memory in KiB: the largest single process (peak_rss_scope largest-process), or the sandbox cgroup's memory.peak (whole-sandbox); null when unavailable" },
+        "peak_rss_scope": { "type": "string", "enum": ["largest-process", "whole-sandbox"], "description": "whole-sandbox: the sandbox cgroup's memory.peak, every process at once (the supervisor's in-cgroup helpers and page cache included); written when whole-sandbox limits put the run in a cgroup" },
+        "source": { "type": "string", "enum": ["sandbox-wrapper", "getrusage", "unavailable", "cgroup"], "description": "sandbox-wrapper: measured inside the sandbox on Linux; getrusage: on macOS, every process ai-jail waited for (the command and its own helpers), not what the command left behind; unavailable: no measurement, the figures are null; cgroup: peak_rss_kib is the sandbox cgroup's memory.peak; the CPU figures still come from the in-sandbox wrapper" }
       }
     },
     "network": {

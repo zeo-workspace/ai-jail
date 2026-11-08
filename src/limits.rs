@@ -482,87 +482,60 @@ impl CgroupReport {
     }
 }
 
-/// Signals a user or a harness sends on purpose; their deaths need no
-/// explanation.
-fn deliberate_signal(sig: i32) -> bool {
-    matches!(sig, 1 | 2 | 13 | 15)
+/// What the cgroup counted, in the shape `exit_reason::classify_counted`
+/// reads.
+impl From<&CgroupReport> for crate::exit_reason::LimitCounters {
+    fn from(r: &CgroupReport) -> Self {
+        crate::exit_reason::LimitCounters {
+            oom_kills: r.oom_kills,
+            tasks_refused: r.tasks_refused,
+            memory_peak: r.memory_peak,
+        }
+    }
 }
 
-fn signal_name(sig: i32) -> String {
-    nix::sys::signal::Signal::try_from(sig)
-        .map(|s| s.as_str().to_string())
-        .unwrap_or_else(|_| format!("signal {sig}"))
+impl ResourceLimits {
+    /// The whole-sandbox limits in force, layered over `base` (the
+    /// rlimits `exit_reason::LimitsInForce::read_back` already knows,
+    /// such as the lockdown file size).
+    pub fn in_force(
+        &self,
+        base: crate::exit_reason::LimitsInForce,
+    ) -> crate::exit_reason::LimitsInForce {
+        crate::exit_reason::LimitsInForce {
+            memory: self.memory,
+            max_tasks: self.max_tasks,
+            ..base
+        }
+    }
 }
+
+/// The host the limit tests describe: bwrap folds signals and the kernel
+/// log exists.
+#[cfg(test)]
+const LINUX_HOST: crate::exit_reason::HostTraits =
+    crate::exit_reason::HostTraits {
+        folds_signals: true,
+        kernel_log_hint: true,
+    };
 
 /// Explain an exit that the exit code alone does not. `None` when there
 /// is nothing to say (clean exit, or a deliberate signal with no limit
-/// involved).
+/// involved). The one classifier is `exit_reason::classify_counted`; this
+/// wrapper keeps the signature the tests below use.
+#[cfg(test)]
 pub fn describe_exit(
     exit_code: i32,
     limits: &ResourceLimits,
     report: Option<&CgroupReport>,
 ) -> Option<String> {
-    let signal = (129..=192).contains(&exit_code).then(|| exit_code - 128);
-    let mut lines = Vec::new();
-
-    if let Some(r) = report {
-        if r.oom_kills > 0 {
-            let limit = limits
-                .memory
-                .map(format_bytes)
-                .unwrap_or_else(|| "unset".into());
-            let peak = r
-                .memory_peak
-                .map(format_bytes)
-                .unwrap_or_else(|| "unknown".into());
-            lines.push(format!(
-                "out of memory: the kernel killed {} process(es) at the \
-                 sandbox memory limit ({limit}, peak {peak})",
-                r.oom_kills
-            ));
-        }
-        if r.tasks_refused > 0 {
-            lines.push(format!(
-                "task limit reached: {} fork/clone attempt(s) refused \
-                 (max-tasks {})",
-                r.tasks_refused,
-                limits.max_tasks.map_or("unset".into(), |n| n.to_string())
-            ));
-        }
-    }
-
-    match signal {
-        Some(sig) if !lines.is_empty() || deliberate_signal(sig) => {}
-        Some(24) => lines
-            .push("killed by SIGXCPU: the CPU-time rlimit was reached".into()),
-        Some(25) => lines.push(
-            "killed by SIGXFSZ: the file-size rlimit was reached \
-             (1 GiB under --lockdown)"
-                .into(),
-        ),
-        Some(9) if limits.memory.is_some() => lines.push(
-            "killed by SIGKILL, not by the sandbox memory limit (no OOM \
-             kill was counted in the sandbox cgroup)"
-                .into(),
-        ),
-        Some(9) => lines.push(
-            "killed by SIGKILL; ai-jail set no memory limit, so the usual \
-             cause is the host OOM killer (`journalctl -k | grep -i oom`) \
-             -- --memory caps the sandbox and makes this report exact"
-                .into(),
-        ),
-        Some(sig) => lines.push(format!("killed by {}", signal_name(sig))),
-        None => {}
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "sandbox exited with {exit_code}: {}",
-            lines.join("; ")
-        ))
-    }
+    let counters = report.map(crate::exit_reason::LimitCounters::from);
+    crate::exit_reason::classify_counted(
+        &crate::exit_reason::from_exit_code(exit_code, LINUX_HOST),
+        &limits.in_force(crate::exit_reason::LimitsInForce::default()),
+        counters.as_ref(),
+    )
+    .explanation(LINUX_HOST)
 }
 
 #[cfg(test)]
@@ -773,7 +746,10 @@ mod tests {
         let msg = describe_exit(137, &limits, Some(&report)).unwrap();
         assert!(msg.contains("out of memory"), "{msg}");
         assert!(msg.contains("64.0 MiB"), "{msg}");
-        assert!(!msg.contains("SIGKILL"), "{msg}");
+        // The one classifier names the signal and then the counted limit
+        // ("killed by SIGKILL: out of memory ..."); what must never appear
+        // is the host-OOM guess for a kill the cgroup counted.
+        assert!(!msg.contains("host OOM"), "{msg}");
     }
 
     #[test]
@@ -789,6 +765,28 @@ mod tests {
         let msg = describe_exit(1, &limits, Some(&report)).unwrap();
         assert!(msg.contains("5 fork/clone"), "{msg}");
         assert!(msg.contains("max-tasks 20"), "{msg}");
+    }
+
+    // R1.14 over R1.5: the processes limit refuses a fork and never sends
+    // SIGKILL (R1.6), so a SIGKILL the cgroup did not count as an OOM kill
+    // points at the host OOM killer even when forks were refused; the
+    // refused count stays on the line as a clue. The exit-1 half is
+    // `exit_report_names_refused_forks` above.
+    #[test]
+    fn sigkill_with_refused_forks_points_at_the_host_oom_killer() {
+        let limits = ResourceLimits {
+            max_tasks: Some(20),
+            ..Default::default()
+        };
+        let report = CgroupReport {
+            tasks_refused: 5,
+            ..Default::default()
+        };
+        let msg = describe_exit(137, &limits, Some(&report)).unwrap();
+        assert!(!msg.contains("processes limit"), "{msg}");
+        assert!(msg.contains("host OOM killer"), "{msg}");
+        assert!(msg.contains("5 fork/clone"), "{msg}");
+        assert_eq!(msg.matches("journalctl").count(), 1, "{msg}");
     }
 
     #[test]
