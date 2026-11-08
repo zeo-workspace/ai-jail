@@ -2522,13 +2522,16 @@ pub(crate) fn render_effective_access_with_profile(
         format!("Duration: {}", duration(saved)),
         format!("Project: {project_label} (read and write)"),
         "Scope: global policy, proposed project grants, command-line grants, project constraints, and derived platform defaults".into(),
-        match named_profile {
-            Some(name) => format!(
-                "Named profile: profile={} (a trusted global layer)",
-                escape_control_bytes(name)
-            ),
-            None => "Named profile: none".into(),
-        },
+    ];
+    // Only when one is selected: a user who never names a profile sees the
+    // review as it was before profiles existed (R5.6).
+    if let Some(name) = named_profile {
+        lines.push(format!(
+            "Named profile: profile={} (a trusted global layer)",
+            escape_control_bytes(name)
+        ));
+    }
+    lines.extend([
         "Effective policy (every nondefault field):".into(),
         policy
             .trim_end()
@@ -2541,8 +2544,9 @@ pub(crate) fn render_effective_access_with_profile(
             crate::config::DEFAULT_ENV_ALLOWLIST.join(", "),
             crate::config::DEFAULT_ENV_PREFIXES.join(", ")
         ),
-        "Authority details (resource; access; scope/limits; consequence):".into(),
-    ];
+        "Authority details (resource; access; scope/limits; consequence):"
+            .into(),
+    ]);
     let mut authority = |enabled: bool, text: &str| {
         if enabled {
             if let Some(text) = text.strip_prefix("ALLOWED: ") {
