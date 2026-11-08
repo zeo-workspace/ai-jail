@@ -5,6 +5,8 @@ use nix::sys::signal::{
     self, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal,
 };
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
@@ -88,10 +90,60 @@ impl Drop for HandledSignalMask {
     }
 }
 
+/// The gate pipe, both ends close-on-exec. Linux creates it atomically
+/// with pipe2; libc declares no pipe2 for Apple targets, so every other
+/// target sets FD_CLOEXEC right after pipe(), before any child can be
+/// spawned from this thread.
+#[cfg(target_os = "linux")]
+fn gate_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut fds = [-1; 2];
+    // SAFETY: pipe2 writes two fresh descriptors into `fds` or fails.
+    if unsafe { nix::libc::pipe2(fds.as_mut_ptr(), nix::libc::O_CLOEXEC) } < 0 {
+        return Err(format!(
+            "Cannot create supervised execution gate: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: both descriptors are fresh and owned by nothing else.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gate_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let (read, write) = nix::unistd::pipe()
+        .map_err(|e| format!("Cannot create supervised execution gate: {e}"))?;
+    for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+        // SAFETY: F_GETFD only reads the flags of a descriptor this
+        // function just created and owns.
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+        if flags < 0
+            // SAFETY: F_SETFD on the same owned descriptor; it changes
+            // only its close-on-exec flag.
+            || unsafe {
+                nix::libc::fcntl(
+                    fd,
+                    nix::libc::F_SETFD,
+                    flags | nix::libc::FD_CLOEXEC,
+                )
+            } < 0
+        {
+            return Err(format!(
+                "Cannot prepare supervised execution gate: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok((read, write))
+}
+
 pub fn wrap_supervised_command(
     command: &mut Command,
 ) -> Result<SupervisionGate, String> {
-    let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
+    // Both ends start close-on-exec; only the read end is then opened up
+    // for the wrapper. The write end stays the supervisor's: inherited, it
+    // reached every sandboxed command as a stray descriptor whose number
+    // shifted with the supervisor's other threads.
+    let (read, write) = gate_pipe()?;
     let flags =
         unsafe { nix::libc::fcntl(read.as_raw_fd(), nix::libc::F_GETFD) };
     if flags < 0
@@ -133,15 +185,38 @@ pub fn wrap_supervised_command(
     Ok(SupervisionGate { read, write })
 }
 
+/// Supervisor work that must sit exactly around the sandbox spawn. The
+/// teardown report descriptor is made inheritable right
+/// before the fork and closed right after it, so no other child of the
+/// supervisor holds it. A `pre_exec` hook cannot do this:
+/// `wrap_supervised_command` replaces the `Command` and drops them.
+pub trait SpawnBracket {
+    /// Runs right before the fork; an error aborts the spawn.
+    fn before_spawn(&mut self) -> Result<(), String>;
+    /// Runs right after the spawn returns, whether it succeeded or not.
+    fn after_spawn(&mut self, spawned: bool);
+}
+
+/// No work around the spawn.
+impl SpawnBracket for () {
+    fn before_spawn(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn after_spawn(&mut self, _spawned: bool) {}
+}
+
 pub fn spawn_supervised(
     command: &mut Command,
     gate: SupervisionGate,
+    bracket: &mut dyn SpawnBracket,
 ) -> Result<Child, String> {
     let mut mask = HandledSignalMask::block()?;
     abort_if_cancelled()?;
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Failed to start sandbox gate: {e}"))?;
+    bracket.before_spawn()?;
+    let spawned = command.spawn();
+    bracket.after_spawn(spawned.is_ok());
+    let mut child =
+        spawned.map_err(|e| format!("Failed to start sandbox gate: {e}"))?;
     drop(gate.read);
     #[cfg(test)]
     if INJECT_CANCEL_IN_SPAWN_WINDOW.swap(false, Ordering::SeqCst) {
@@ -419,6 +494,21 @@ mod tests {
     }
 
     #[test]
+    fn only_the_gate_read_end_reaches_the_child() {
+        fn close_on_exec(fd: &OwnedFd) -> bool {
+            // SAFETY: F_GETFD only reads the flags of an owned descriptor.
+            let flags =
+                unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFD) };
+            assert!(flags >= 0);
+            flags & nix::libc::FD_CLOEXEC != 0
+        }
+        let mut command = Command::new("true");
+        let gate = wrap_supervised_command(&mut command).unwrap();
+        assert!(!close_on_exec(&gate.read), "the wrapper reads the gate");
+        assert!(close_on_exec(&gate.write), "the command never holds it");
+    }
+
+    #[test]
     fn signal_in_spawn_registration_window_never_executes_child() {
         let _guard = PID_LOCK.lock().unwrap();
         let saved = CHILD_PID.load(Ordering::SeqCst);
@@ -462,7 +552,7 @@ mod tests {
             .args(["-c", &format!("printf executed > '{}'", canary.display())]);
         let gate = SupervisionGate { read, write };
         INJECT_CANCEL_IN_SPAWN_WINDOW.store(true, Ordering::SeqCst);
-        let error = spawn_supervised(&mut command, gate).unwrap_err();
+        let error = spawn_supervised(&mut command, gate, &mut ()).unwrap_err();
         assert!(error.contains("cancelled"));
         assert!(!canary.exists(), "gated child command must not execute");
         assert_eq!(CHILD_PID.load(Ordering::SeqCst), 0);

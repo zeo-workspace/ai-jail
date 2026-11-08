@@ -655,6 +655,20 @@ permissions do not remove that privacy limit.
 
 ### Run observability
 
+When the sandboxed command dies of a signal, ai-jail prints one line on stderr
+saying which, and the limit behind it when one is known, also under `--exec`:
+
+```text
+⚠ sandbox exited with 153: killed by SIGXFSZ: the file-size rlimit was reached (1.0 GiB) (inferred from exit code 153)
+```
+
+A `SIGKILL` no ai-jail limit explains points at the host OOM killer, with the
+`journalctl` command to check on Linux. A normal exit, and a deliberate
+`SIGHUP`, `SIGINT`, `SIGPIPE` or `SIGTERM`, print nothing. On Linux bwrap
+reports a signal death as an exit code `128 + N`; a signal decoded from one
+rather than seen directly says so (`inferred from exit code N`). On macOS an
+exit code is always taken as it is. The exit code is never changed.
+
 `--egress-log <PATH>` appends one JSON line to `PATH` for every connection the
 filtered-egress proxy accepts, whether it was allowed, refused, or failed. It
 needs filtered networking (`--allow-host`, or the filtered default a known
@@ -693,19 +707,31 @@ it left open and waits up to 2 seconds for their lines, warning with the count
 of any still open after that.
 The existing `--audit-log` `connect` records are unchanged by this flag.
 
-When the sandboxed command dies of a signal, ai-jail prints one line on stderr
-saying which, and the limit behind it when one is known, also under `--exec`:
+`--teardown-report` (Linux) deals with processes that outlive the command,
+such as a dev server or watcher left running in the background. When the
+command exits, ai-jail lists every process still alive in the sandbox,
+sends each SIGTERM (and SIGCONT, so a stopped one can act on it), waits up to
+a fixed 2000 ms grace, then sends SIGKILL to the rest. Processes started
+meanwhile, such as a worker a supervisor respawns on SIGTERM, are found by
+listing again and stopped the same way, for at most three more rounds. When
+there were survivors it prints one line on stderr with the count and names
+of those it stopped, at most ten and then `+N more`; with none it prints
+nothing and adds no delay. The line is printed even under `--exec`.
 
-```text
-⚠ sandbox exited with 153: killed by SIGXFSZ: the file-size rlimit was reached (1.0 GiB) (inferred from exit code 153)
+```bash
+ai-jail --teardown-report --exec sh -c 'sleep 300 & exit 0'
+# ⚠ 1 process outlived the command and was stopped: sleep
 ```
 
-A `SIGKILL` no ai-jail limit explains points at the host OOM killer, with the
-`journalctl` command to check on Linux. A normal exit, and a deliberate
-`SIGHUP`, `SIGINT`, `SIGPIPE` or `SIGTERM`, print nothing. On Linux bwrap
-reports a signal death as an exit code `128 + N`; a signal decoded from one
-rather than seen directly says so (`inferred from exit code N`). On macOS an
-exit code is always taken as it is. The exit code is never changed.
+Survivors are named by `comm` only, the kernel's short command name; their
+command lines and environments are never read. The command's exit code is
+returned unchanged, including death by a signal. The in-sandbox wrapper
+reports to the supervisor on a descriptor the command cannot see or reopen.
+If that report is missing, malformed or incomplete (for example
+`survivors-respawned`, or `/proc` could not be read), one
+`Teardown report incomplete: <reason>` line says so, and the kernel's
+pid-namespace teardown ends whatever is left. On macOS the flag
+is accepted and changes nothing.
 
 ## Project secrets
 
