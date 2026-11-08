@@ -550,6 +550,17 @@ data = "8G"
 - A `--rlimit` or `--cpus` given on the command line applies to that launch
   only. It is never saved into the project policy.
 
+Whole-sandbox limits are advanced CLI/config-only controls too, for the same
+reason. They cap everything inside the sandbox together, through a cgroup, and
+need a systemd user session:
+
+- `--memory SIZE` (`memory_max` in config) caps memory, with swap off.
+- `--max-tasks N` (`max_tasks`) caps processes and threads together.
+- `--cpu-quota PCT` (`cpu_quota`) caps CPU time, in percent of one CPU.
+
+A project policy may only tighten them. If the kernel does not enforce them,
+the launch is refused.
+
 The final `Complete effective access` review lists each explicit limit as
 `rlimit NAME=SOFT/HARD (SOURCE)` and the CPU set as `cpus=LIST`. `--dry-run`
 prints every effective limit, defaults included. The README section
