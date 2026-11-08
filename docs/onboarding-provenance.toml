@@ -245,6 +245,7 @@ verified_by = [
 ]
 guide_sections = ["Resource limits and CPU set"]
 
+[[claim]]
 # Advanced CLI/config-only control: no onboarding message of its own; the
 # final review names the selected profile.
 message_ids = []

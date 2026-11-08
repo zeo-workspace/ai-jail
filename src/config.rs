@@ -10011,6 +10011,8 @@ mod profile_field_coverage_tests {
     /// cannot come from a file at all.
     const NEVER_WIDENS: &[&str] = &[
         "runtime_harnesses",
+        // Runtime-only provenance of each rlimit (`serde(skip)`).
+        "rlimit_source",
         "command",
         "hide_dotdirs",
         "mask",
@@ -10050,6 +10052,16 @@ mod profile_field_coverage_tests {
             "[\"x.example\"]",
             "[4242]",
             "{ AJ047 = \"x.example\" }",
+            // Fields other fork branches add on integration: CPU lists,
+            // sizes, counts and the per-process rlimit table.
+            "\"0\"",
+            "\"0-1\"",
+            "\"1G\"",
+            "\"2G\"",
+            "1",
+            "2",
+            "{ nofile = \"1024\" }",
+            "{ nofile = \"unlimited\" }",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");

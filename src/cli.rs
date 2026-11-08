@@ -1320,7 +1320,7 @@ const INTERFACE_INTERNAL_FIELDS: &[&str] =
 /// (fe4dfe0). The drift test is a ratchet: it holds every name added
 /// since to the guide, and documenting one of these lets it be removed.
 #[cfg(test)]
-const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
+pub(crate) const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "rw_maps",
     "overlay_maps",
     "hide_dotdirs",
@@ -1381,7 +1381,6 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--request",
     "--private-home",
     "--no-private-home",
-    "--lockdown",
     "--no-lockdown",
     "--no-display",
     "--display",
@@ -1431,8 +1430,6 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--pictures",
     "--no-pictures",
     "--clean",
-    "--exec",
-    "--dry-run",
     "--rw-map",
     "--ro-map",
     "--overlay-map",
@@ -1443,7 +1440,6 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--deny-path-except",
     "--hide-dotdir",
     "--allow-tcp-port",
-    "--allow-host",
     "--allow-private-host",
     "--systemd-user",
     "--no-systemd-user",
@@ -3507,12 +3503,9 @@ mod interface_rlimit_tests {
 // "named profile (`[profiles.NAME]`)", kept apart from the onboarding
 // access profile; the TUI design with the reason it has no onboarding
 // control; the onboarding provenance with an entry in its existing
-// shape. And a drift test: every `Config` field and every
-// `SANDBOX_LONG_FLAGS` entry appears in `docs/USER_GUIDE.md` as a whole
-// token, or is allowlisted. The allowlist has two parts: fields that are
-// internal, and the names already undocumented at upstream fe4dfe0, so the
-// test is a ratchet — nothing new may land undocumented, and a name
-// leaves the baseline once the guide documents it.
+// shape. The drift test itself is `interface_rlimit_tests`' (one ratchet,
+// one baseline, `INTERFACE_UNDOCUMENTED_BASELINE`); this module checks that
+// the baseline only holds names that exist and are still undocumented.
 #[cfg(test)]
 mod interface_profile_tests {
     use super::SANDBOX_LONG_FLAGS;
@@ -3520,54 +3513,6 @@ mod interface_profile_tests {
     const GUIDE: &str = include_str!("../docs/USER_GUIDE.md");
     const TUI_DESIGN: &str = include_str!("../docs/TUI_DESIGN.md");
     const PROVENANCE: &str = include_str!("../docs/onboarding-provenance.toml");
-    const CONFIG_RS: &str = include_str!("config.rs");
-
-    /// `Config` fields that no user sets: runtime state, never parsed.
-    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
-
-    /// `Config` fields already missing from the guide at upstream fe4dfe0.
-    const UNDOCUMENTED_FIELDS_AT_FE4DFE0: &str = r"
-    rw_maps overlay_maps hide_dotdirs mask deny_paths mask_exceptions
-    deny_path_exceptions no_gpu no_docker tailscale no_display audio
-    aws kube gcloud docker_config kvm prompt_hosts macos_host_ipc
-    macos_chromium macos_trustd allow_pty allow_loopback_listen
-    allow_loopback_connect x11 host_shm terminal_passthrough
-    no_worktree no_mise no_toolchains no_save_config no_hide_config
-    pictures browser_profile private_home no_landlock no_status_bar
-    status_bar_style resize_redraw_key no_seccomp no_rlimits
-    systemd_user allow_tcp_ports allow_hosts allow_private_hosts
-    forward_ports publish_ports claude_dir inherit_env env_pass
-    env_from_file secret_hosts trust_project_config update_check
-    audit_log
-";
-
-    /// Sandbox long flags already missing from the guide at fe4dfe0.
-    const UNDOCUMENTED_FLAGS_AT_FE4DFE0: &str = r"
-    --harness --request-file --request --private-home
-    --no-private-home --lockdown --no-lockdown --no-display --display
-    --audio --no-audio --no-github --aws --no-aws --kube --no-kube
-    --gcloud --no-gcloud --docker-config --no-docker-config --kvm
-    --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network
-    --macos-host-ipc --no-macos-host-ipc --macos-chromium
-    --no-macos-chromium --macos-trustd --no-macos-trustd --allow-pty
-    --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
-    --allow-loopback-connect --no-allow-loopback-connect --no-gpu
-    --gpu --no-docker --docker --tailscale --no-tailscale --landlock
-    --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
-    --no-ssh --pictures --no-pictures --clean --exec --dry-run
-    --rw-map --ro-map --overlay-map --map --mask --deny-path
-    --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
-    --allow-host --allow-private-host --systemd-user --no-systemd-user
-    --worktree --no-worktree --browser --no-browser --claude-dir --x11
-    --no-x11 --host-shm --no-host-shm --terminal-passthrough
-    --no-terminal-passthrough --agent-state --no-agent-state
-    --publish-port --inherit-env --no-inherit-env --update-check
-    --no-update-check --audit-log --no-audit-log --audit-verify
-    --env-from-file --secret --mise --no-mise --toolchains
-    --no-toolchains --save-config --no-save-config --hide-config
-    --no-hide-config --status-bar --no-status-bar --bootstrap
-    --verbose
-";
 
     /// A name counts as documented only as a whole token: the bytes on
     /// either side are not `[A-Za-z0-9_-]`, so `--map` inside `--ro-map`
@@ -3593,22 +3538,6 @@ mod interface_profile_tests {
             .iter()
             .copied()
             .filter(|n| !allowed.contains(n) && !documented(n, doc))
-            .collect()
-    }
-
-    /// The `pub` fields of `pub struct Config`, read from its source.
-    fn config_fields() -> Vec<&'static str> {
-        let body = CONFIG_RS
-            .split_once("\npub struct Config {\n")
-            .expect("pub struct Config in config.rs")
-            .1
-            .split_once("\n}\n")
-            .expect("end of struct Config")
-            .0;
-        body.lines()
-            .filter_map(|l| l.strip_prefix("    pub "))
-            .filter_map(|l| l.split_once(':').map(|(n, _)| n))
-            .map(|n| n.trim_start_matches("r#"))
             .collect()
     }
 
@@ -3640,43 +3569,19 @@ mod interface_profile_tests {
     }
 
     #[test]
-    fn every_config_field_and_sandbox_flag_is_in_the_user_guide() {
-        let fields = config_fields();
-        assert!(fields.contains(&"allow_hosts"), "field parse: {fields:?}");
-        let baseline_fields: Vec<&str> =
-            UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace().collect();
-        let mut allowed_fields = INTERNAL_FIELDS.to_vec();
-        allowed_fields.extend(&baseline_fields);
-        let missing_fields = undocumented(&fields, GUIDE, &allowed_fields);
-        let baseline_flags: Vec<&str> =
-            UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace().collect();
-        let missing_flags =
-            undocumented(SANDBOX_LONG_FLAGS, GUIDE, &baseline_flags);
-        assert!(
-            missing_fields.is_empty() && missing_flags.is_empty(),
-            "missing from docs/USER_GUIDE.md: fields {missing_fields:?}, \
-             flags {missing_flags:?}"
-        );
-    }
-
-    #[test]
     fn drift_baseline_holds_only_names_that_exist_and_are_undocumented() {
-        // The ratchet only tightens: a name documented since, or removed,
-        // must leave the baseline.
-        let fields = config_fields();
-        for name in UNDOCUMENTED_FIELDS_AT_FE4DFE0.split_whitespace() {
-            assert!(fields.contains(&name), "{name} is no longer a field");
-            assert!(!documented(name, GUIDE), "{name} is documented now");
-        }
-        for name in UNDOCUMENTED_FLAGS_AT_FE4DFE0.split_whitespace() {
+        // One ratchet for the whole interface: the baseline the drift test
+        // in `interface_rlimit_tests` uses. It only tightens: a name
+        // documented since, or removed, must leave it.
+        let fields = crate::config_store::config_field_names();
+        for &name in super::INTERFACE_UNDOCUMENTED_BASELINE {
             assert!(
-                SANDBOX_LONG_FLAGS.contains(&name),
-                "{name} is no longer a sandbox flag"
+                fields.contains(&name) || SANDBOX_LONG_FLAGS.contains(&name),
+                "{name} is no longer a field or a sandbox flag"
             );
             assert!(!documented(name, GUIDE), "{name} is documented now");
         }
     }
-
     #[test]
     fn user_guide_introduces_the_named_profile_apart_from_onboarding() {
         assert!(documented("--profile", GUIDE), "--profile not in the guide");

@@ -616,6 +616,17 @@ prints every effective limit, defaults included. The README section
 [Resource limits without root](../README.md#resource-limits-without-root---rlimit-and---cpus)
 covers each limit name and what it does to a process.
 
+## Clients that ignore the proxy
+
+`--transparent-egress` (`transparent_egress` in config) is an advanced
+CLI/config-only control for filtered networking on Linux. It routes clients
+that ignore `HTTPS_PROXY` through the same egress proxy: inside the sandbox,
+allowlisted names resolve to private loopback addresses and every other name
+fails, so nothing new is reachable. `--no-transparent-egress` turns it off for
+one launch. The README section
+[Clients that ignore the proxy](../README.md#clients-that-ignore-the-proxy---transparent-egress)
+explains how it works.
+
 ## Named profiles
 
 A named profile (`[profiles.NAME]`) is a set of grants and restrictions kept
