@@ -1324,6 +1324,7 @@ enum DirectionalAuthority {
     Landlock,
     Seccomp,
     Rlimits,
+    RlimitValues,
     Systemd,
     InheritEnv,
     Worktree,
@@ -1466,6 +1467,10 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("resize_redraw_key", Preference),
     directional_policy!("no_seccomp", Seccomp, "disable-seccomp"),
     directional_policy!("no_rlimits", Rlimits, "disable-resource-limits"),
+    directional_policy!("rlimit", RlimitValues, "raise-resource-limits"),
+    // Runtime label of where each `rlimit` came from; never read from a
+    // file (`#[serde(skip)]`).
+    excluded_policy!("rlimit_source", Preference),
     directional_policy!("systemd_user", Systemd, "systemd-user"),
     static_policy!("allow_tcp_ports", Authority, TcpPorts),
     static_policy!("allow_hosts", Authority, Hosts),
@@ -1558,6 +1563,7 @@ impl DirectionalAuthority {
             Self::Rlimits => {
                 c.no_rlimits == Some(true) && b.no_rlimits != Some(true)
             }
+            Self::RlimitValues => crate::sandbox::rlimits::widens(c, b),
             Self::Systemd => {
                 c.systemd_user == Some(true) && b.systemd_user != Some(true)
             }
@@ -2199,6 +2205,7 @@ mod tests {
         expected_excluded!("no_status_bar", Preference),
         expected_excluded!("status_bar_style", Preference),
         expected_excluded!("resize_redraw_key", Preference),
+        expected_excluded!("rlimit_source", Preference),
         expected_authority!(
             "allow_tcp_ports",
             Authority,
@@ -2295,6 +2302,12 @@ mod tests {
             "status_bar_style" => config.status_bar_style = Some("dark".into()),
             "resize_redraw_key" => {
                 config.resize_redraw_key = Some("top-secret".into());
+            }
+            "rlimit_source" => {
+                config.rlimit_source.insert(
+                    "nofile".into(),
+                    crate::sandbox::rlimits::LimitSource::Cli,
+                );
             }
             "allow_tcp_ports" => config.allow_tcp_ports = vec![443],
             "allow_hosts" => {
@@ -2431,6 +2444,7 @@ mod tests {
             no_landlock: Some(false),
             no_seccomp: Some(false),
             no_rlimits: Some(false),
+            rlimit: [("nofile".to_string(), "1024".to_string())].into(),
             systemd_user: Some(false),
             inherit_env: Some(false),
             no_worktree: Some(true),
@@ -2473,6 +2487,7 @@ mod tests {
             no_landlock: Some(true),
             no_seccomp: Some(true),
             no_rlimits: Some(true),
+            rlimit: [("nofile".to_string(), "unlimited".to_string())].into(),
             systemd_user: Some(true),
             inherit_env: Some(true),
             no_worktree: Some(false),

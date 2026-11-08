@@ -1384,6 +1384,12 @@ fn landlock_wrapper_args(
     } else {
         "--no-rlimits".into()
     });
+    // Explicit limits travel to the wrapper, which recomputes the same
+    // `rlimits::effective()` set and applies it inside the sandbox.
+    for (name, value) in &config.rlimit {
+        args.push("--rlimit".into());
+        args.push(format!("{name}={value}"));
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
