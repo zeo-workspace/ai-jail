@@ -227,6 +227,9 @@ must still appear in the final `Complete effective access` review.
   widens is printed as a `profile=NAME widens=FIELD` line before the launch.
 - `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
   review shows it as `cpus=LIST`.
+- `--memory`, `--max-tasks` and `--cpu-quota` (`memory_max`, `max_tasks`,
+  `cpu_quota`): whole-sandbox cgroup limits, tighten-only, shown by
+  `--dry-run`.
 
 ## Plain-terminal fallback
 
