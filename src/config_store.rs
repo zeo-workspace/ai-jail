@@ -706,6 +706,7 @@ fn read_project(
     };
     let text = std::str::from_utf8(&raw)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
+    config::warn_if_project_selects_profile(text, &["grants", "constraints"]);
     let doc: ProjectPolicyDocument = toml::from_str(text)
         .map_err(|e| format!("Failed to parse {}: {e}", path.display()))?;
     if doc.schema_version != MIGRATION_VERSION {
@@ -1054,6 +1055,7 @@ fn migrate_project(
     let text = std::str::from_utf8(raw).map_err(|e| {
         format!("Failed to parse {}: {e}", paths.legacy_project.display())
     })?;
+    config::warn_if_project_selects_profile(text, &[]);
     let legacy = config::parse_toml(text).map_err(|e| {
         format!("Failed to parse {}: {e}", paths.legacy_project.display())
     })?;
@@ -1065,7 +1067,7 @@ fn migrate_project(
         load_global(paths)?,
         &selector,
         &Config::default(),
-    );
+    )?;
     // The legacy file lives in, and its relative paths refer to, the launch
     // checkout. Only the destination document follows the policy root; the
     // runtime merge filters stored paths against the launch directory again.

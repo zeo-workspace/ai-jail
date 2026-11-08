@@ -1575,7 +1575,7 @@ fn run(
             config_store::load_global(&store)?,
             &cli,
             global_command_selector,
-        )
+        )?
     } else {
         // Read-only compatibility path. Writable modes migrated this above.
         config::load_global_for_command_report(&cli, global_command_selector)?
@@ -1586,6 +1586,14 @@ fn run(
             table
         ));
     }
+    // Printed on every launch, `--dry-run` included and without
+    // `--verbose`: a profile may widen the jail only where it is seen.
+    if let Some(profile) = &global_selection.profile {
+        for line in profile.lines() {
+            output::warn(&line);
+        }
+    }
+    let profile_report = global_selection.profile;
     let global = global_selection.config;
     let onboarding_complete = stored_project.onboarding_complete;
     let global_for_onboarding = global.clone();
@@ -1841,7 +1849,7 @@ fn run(
         ));
     }
     for warning in security_warnings {
-        output::security_warn(&warning);
+        output::security_warn(&warning.text);
     }
     // Resolve any relative paths in rw_maps/ro_maps against the user's
     // invocation cwd before they reach bwrap/landlock/seatbelt (issue
@@ -2634,6 +2642,7 @@ fn run(
                         .is_some_and(|home| home.join(".ai-jail").exists()),
                 exit_code,
                 duration: launch_start.elapsed(),
+                profile: profile_report.as_ref(),
                 rlimits: &effective_limits,
                 cpus: config.cpus.as_deref(),
                 limits: (!resource_limits.is_empty())
