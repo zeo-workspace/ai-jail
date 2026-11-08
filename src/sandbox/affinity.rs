@@ -194,6 +194,8 @@ mod affinity_tests {
     }
 
     /// The kernel's own view of this process's CPUs, as `0-31` text.
+    /// Reads `/proc`, so Linux only, like `validate_cpus`.
+    #[cfg(target_os = "linux")]
     fn kernel_allowed_list() -> String {
         std::fs::read_to_string("/proc/self/status")
             .unwrap()
@@ -218,6 +220,7 @@ mod affinity_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cpus_outside_the_supervisors_set_are_refused_naming_entry_and_set() {
         let allowed = kernel_allowed_list();

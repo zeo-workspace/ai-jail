@@ -830,6 +830,30 @@ fn build_noninteractive_onboarding_effective(
     restrictions.secret_hosts.clear();
     restrictions.trust_project_config.clear();
     restrictions.browser_profile = None;
+    // `monotonic_project_constraints` keeps a stored project's limits as
+    // written (R3.17); this layer is the trusted global one, so only the
+    // limits that tighten the built-in defaults restrict the first run. A
+    // raised or `unlimited` global value is not a restriction (6.2 review).
+    // Compared against the defaults this launch runs under, lockdown's
+    // included, so a value between the two defaults stays `default`.
+    let defaults = config::Config {
+        lockdown: restrictions.lockdown,
+        ..config::Config::default()
+    };
+    restrictions.rlimit.retain(|key, value| {
+        let single = config::Config {
+            rlimit: std::collections::BTreeMap::from([(
+                key.clone(),
+                value.clone(),
+            )]),
+            ..defaults.clone()
+        };
+        !sandbox::rlimits::widens(&single, &defaults)
+    });
+    let kept: Vec<String> = restrictions.rlimit.keys().cloned().collect();
+    restrictions
+        .rlimit_source
+        .retain(|key, _| kept.contains(key));
     let automatic_api =
         restrictions.network != Some(false) && !restrictions.lockdown_enabled();
     let mut safe_grants = onboarding::Selection {
@@ -939,7 +963,9 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
 
     // --cpus: pin this process (and so the command it becomes) before
     // seccomp below refuses sched_setaffinity for good. Order: bridges,
-    // Landlock, affinity, seccomp, rlimits, then the agent.
+    // Landlock, affinity, seccomp, rlimits, then the agent. Linux only:
+    // `affinity::check_launch` refuses `--cpus` elsewhere before we get here.
+    #[cfg(target_os = "linux")]
     if let Some(cpus) = config.cpus.as_deref() {
         sandbox::affinity::apply_cpus(&sandbox::affinity::parse_cpu_list(
             cpus,
@@ -3093,6 +3119,51 @@ mod tests {
         ] {
             assert!(validate_write_flags(&cli).is_err());
         }
+    }
+
+    #[test]
+    fn noninteractive_onboarding_drops_global_limits_that_raise_the_defaults() {
+        // 6.2 tech review: the global layer is trusted, not a restriction,
+        // so a raised or `unlimited` global limit must not become a
+        // first-run project restriction; one that tightens still does.
+        let global = Config {
+            rlimit: std::collections::BTreeMap::from([
+                ("nproc".to_string(), "unlimited".to_string()),
+                ("nofile".to_string(), "1048576".to_string()),
+                ("cpu".to_string(), "600".to_string()),
+            ]),
+            ..Config::default()
+        };
+        let cli = CliArgs {
+            command: vec!["claude".into()],
+            ..CliArgs::default()
+        };
+        let effective = build_noninteractive_onboarding_effective(
+            &global,
+            "claude",
+            &cli,
+            Config::default(),
+            Path::new("/project"),
+        )
+        .unwrap();
+        assert_eq!(
+            effective.rlimit.get("nproc"),
+            None,
+            "{:?}",
+            effective.rlimit
+        );
+        assert_eq!(
+            effective.rlimit.get("nofile"),
+            None,
+            "{:?}",
+            effective.rlimit
+        );
+        assert_eq!(
+            effective.rlimit.get("cpu").map(String::as_str),
+            Some("600"),
+            "{:?}",
+            effective.rlimit
+        );
     }
 
     #[test]

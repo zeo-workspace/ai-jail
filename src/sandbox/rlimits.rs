@@ -420,14 +420,45 @@ fn apply_one(
     Ok(())
 }
 
-/// Apply the supervisor's limits before spawning the sandbox. Limits are
-/// inherited across fork+exec.
+/// The limits `apply` sets on the supervisor — the ai-jail process that
+/// holds the PTY loop, the egress proxy with its secret substitution, and
+/// the audit writer. Only defaults, with hard pinned to soft:
 ///
-/// Only today's defaults (NOFILE, CORE, lockdown FSIZE) are applied here,
-/// and only those no explicit value replaces. An explicit `cpu`, `fsize`,
-/// `data` or `as` on the supervisor would kill or cap the PTY loop, the
-/// proxy and the audit writer and orphan the sandbox; explicit values are
-/// applied inside the sandbox by `apply_sandbox` instead.
+/// - `core` and `nofile` always: an explicit value for them is the
+///   sandbox's alone. Skipping them let `--rlimit core=0` leave the
+///   supervisor dumpable, with the proxy's secrets in a core file (second
+///   upstream gate, R3.19).
+/// - `fsize` (lockdown) only when no explicit value replaces it; an
+///   explicit `cpu`, `fsize`, `data` or `as` on the supervisor would kill
+///   or cap it and orphan the sandbox.
+/// - never `nproc`, which counts against bwrap's own clone(); see
+///   `apply_sandbox`.
+pub fn supervisor_limits(config: &Config) -> Vec<EffectiveLimit> {
+    if !config.rlimits_enabled() {
+        return Vec::new();
+    }
+    default_limits(config)
+        .into_iter()
+        .filter(|(name, _)| match name {
+            RlimitName::Core | RlimitName::Nofile => true,
+            RlimitName::Nproc => false,
+            RlimitName::Cpu
+            | RlimitName::Fsize
+            | RlimitName::Data
+            | RlimitName::As => !config.rlimit.contains_key(name.as_str()),
+        })
+        .map(|(name, soft)| EffectiveLimit {
+            name,
+            soft,
+            hard: soft,
+            source: LimitSource::Default,
+        })
+        .collect()
+}
+
+/// Apply the supervisor's limits before spawning the sandbox. Limits are
+/// inherited across fork+exec. The set is exactly `supervisor_limits`;
+/// explicit values are applied inside the sandbox by `apply_sandbox`.
 pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
     if !config.rlimits_enabled() {
         if verbose {
@@ -435,20 +466,12 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    for (name, soft) in default_limits(config) {
-        // NPROC counts against bwrap's own clone(); see `apply_sandbox`.
-        if name == RlimitName::Nproc
-            || config.rlimit.contains_key(name.as_str())
-        {
-            continue;
-        }
-        let limit = EffectiveLimit {
-            name,
-            soft,
-            hard: soft,
-            source: LimitSource::Default,
-        };
-        apply_one(&limit, true, verbose)?;
+    for limit in supervisor_limits(config) {
+        // A `core`/`nofile` default kept under an explicit value of the
+        // same name is clamped silently here: the wrapper reports that
+        // name's clamp, once per launch (R3.15).
+        let shadowed = config.rlimit.contains_key(limit.name.as_str());
+        apply_one(&limit, !shadowed, verbose)?;
     }
     Ok(())
 }
@@ -835,9 +858,14 @@ mod effective_tests {
     #[test]
     fn defaults_are_unchanged_when_no_value_is_given() {
         let normal = limits(&Config::default());
+        // NPROC has a default on Linux only (`default_limits`).
+        #[cfg(target_os = "linux")]
         assert_eq!(names(&normal), vec!["core", "nofile", "nproc"]);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(names(&normal), vec!["core", "nofile"]);
         assert_eq!(pair(&normal, "nofile"), (65536, 65536));
         assert_eq!(pair(&normal, "core"), (0, 0));
+        #[cfg(target_os = "linux")]
         assert_eq!(pair(&normal, "nproc"), (4096, 4096));
         for l in &normal {
             assert!(matches!(l.source, LimitSource::Default));
@@ -847,9 +875,13 @@ mod effective_tests {
             lockdown: Some(true),
             ..Config::default()
         });
+        #[cfg(target_os = "linux")]
         assert_eq!(names(&lockdown), vec!["core", "fsize", "nofile", "nproc"]);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(names(&lockdown), vec!["core", "fsize", "nofile"]);
         assert_eq!(pair(&lockdown, "nofile"), (4096, 4096));
         assert_eq!(pair(&lockdown, "fsize"), (GIB, GIB));
+        #[cfg(target_os = "linux")]
         assert_eq!(pair(&lockdown, "nproc"), (1024, 1024));
     }
 
@@ -861,6 +893,7 @@ mod effective_tests {
         // The other defaults stay, still labelled as defaults.
         assert_eq!(pair(&got, "core"), (0, 0));
         assert!(matches!(find(&got, "core").source, LimitSource::Default));
+        #[cfg(target_os = "linux")]
         assert_eq!(pair(&got, "nproc"), (4096, 4096));
     }
 
@@ -1030,6 +1063,8 @@ mod rlimit_gatefix_tests {
     use super::*;
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    // The child-process cases drive `apply_sandbox`, which is Linux only.
+    #[cfg(target_os = "linux")]
     const CHILD_ENV: &str = "AI_JAIL_GATEFIX_CHILD";
 
     fn explicit(pairs: &[(&str, &str)], source: LimitSource) -> Config {
@@ -1060,6 +1095,7 @@ mod rlimit_gatefix_tests {
 
     /// Run `gatefix_child` in a fresh test process for `case`; return its
     /// warning lines (`⚠ ...` on a non-terminal stderr).
+    #[cfg(target_os = "linux")]
     fn child_warnings(case: &str) -> Vec<String> {
         let output =
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -1157,7 +1193,6 @@ mod rlimit_gatefix_tests {
         for (name, value, ceiling) in [
             ("nofile", "8192", 4096),
             ("nofile", "unlimited", 4096),
-            ("nproc", "2048", 1024),
             ("fsize", "2G", GIB),
             ("core", "1", 0),
         ] {
@@ -1169,6 +1204,13 @@ mod rlimit_gatefix_tests {
                 "lockdown {name}={value} applies the ceiling"
             );
         }
+        // The NPROC ceiling exists on Linux only (`lockdown_ceiling`).
+        #[cfg(target_os = "linux")]
+        {
+            let mut c = explicit(&[("nproc", "2048")], LimitSource::Cli);
+            c.lockdown = Some(true);
+            assert_eq!(pair(&c, "nproc"), (1024, 1024), "lockdown nproc=2048");
+        }
         // A trusted layer's value is clamped the same way, and so is a
         // value under --no-rlimits: lockdown only tightens.
         let mut global = explicit(&[("nofile", "8192")], LimitSource::Global);
@@ -1178,6 +1220,7 @@ mod rlimit_gatefix_tests {
         assert_eq!(pair(&global, "nofile"), (4096, 4096));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn gatefix_lockdown_clamp_warns_once_naming_limit_requested_and_applied() {
         let warnings = child_warnings("lockdown");
@@ -1197,6 +1240,7 @@ mod rlimit_gatefix_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn gatefix_cpu_grace_kept_at_five_seconds_does_not_warn() {
         // Hostile half first: host hard 100, cpu=95 leaves exactly the
@@ -1210,6 +1254,7 @@ mod rlimit_gatefix_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn gatefix_cpu_grace_below_five_seconds_warns_naming_soft_and_hard() {
         // Host hard 100, cpu=98: soft 98, hard 100 — 2 seconds of grace.
@@ -1224,6 +1269,7 @@ mod rlimit_gatefix_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn gatefix_child() {
@@ -1258,5 +1304,258 @@ mod rlimit_gatefix_tests {
             }
             other => panic!("unknown child case {other:?}"),
         }
+    }
+}
+
+// Task 6.3 — the supervisor keeps its `core` and `nofile` defaults whatever
+// explicit values are given (R3.19), and the README says `--lockdown`
+// clamps with a warning instead of refusing (R3.7). Appended to
+// `src/sandbox/rlimits.rs`.
+//
+// Contract the implementation must meet:
+// - `supervisor_limits(config: &Config) -> Vec<EffectiveLimit>` is the pure
+//   seam that computes the limits `apply` sets on the supervisor (the
+//   ai-jail process that holds the PTY loop, the egress proxy and its secret
+//   substitution, and the audit writer). `apply` applies exactly that set.
+//   The seam does not exist at c1929f0: `apply` decides inline, and skips a
+//   default whenever an explicit value of the same name exists.
+// - With the default set on, the supervisor set holds `core` 0 and the
+//   `nofile` default (65536; 4096 under `--lockdown`), each with hard ==
+//   soft, whatever explicit `core`/`nofile` values are given. An explicit
+//   value for those names reaches the sandbox only.
+// - It never holds `nproc` (counted against bwrap's clone()) nor an
+//   explicit `cpu`, `data` or `as`, which would kill or cap the supervisor.
+// - Under `--no-rlimits` it is empty: an explicit value never moves onto
+//   the supervisor.
+// Expected values are the literals the README and design state (65536,
+// 4096, 0), never recomputed from `default_limits`.
+#[cfg(test)]
+mod rlimit_supervisor_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    const CHILD_ENV: &str = "AI_JAIL_SUPERVISOR_CHILD";
+
+    fn explicit(pairs: &[(&str, &str)]) -> Config {
+        Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _)| (k.to_string(), LimitSource::Cli))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    /// The supervisor set as `(name, soft, hard)`, sorted by name.
+    fn supervisor_set(config: &Config) -> Vec<(RlimitName, u64, u64)> {
+        let mut set: Vec<(RlimitName, u64, u64)> = supervisor_limits(config)
+            .iter()
+            .map(|l| (l.name, l.soft, l.hard))
+            .collect();
+        set.sort();
+        set
+    }
+
+    fn entry(
+        set: &[(RlimitName, u64, u64)],
+        name: RlimitName,
+    ) -> Option<(u64, u64)> {
+        set.iter()
+            .find(|(n, ..)| *n == name)
+            .map(|(_, soft, hard)| (*soft, *hard))
+    }
+
+    #[test]
+    fn supervisor_set_never_holds_an_explicit_cpu_data_or_as() {
+        // Guard first: keeping the core/nofile defaults must not drag the
+        // other explicit values onto the supervisor.
+        for pairs in [
+            &[("cpu", "10")][..],
+            &[("cpu", "10"), ("data", "8G"), ("as", "16G")][..],
+            &[("cpu", "10"), ("core", "0"), ("nofile", "65536")][..],
+        ] {
+            let set = supervisor_set(&explicit(pairs));
+            for name in [
+                RlimitName::Cpu,
+                RlimitName::Data,
+                RlimitName::As,
+                RlimitName::Nproc,
+            ] {
+                assert_eq!(
+                    entry(&set, name),
+                    None,
+                    "{pairs:?}: the supervisor must not hold {}: {set:?}",
+                    name.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_set_is_empty_under_no_rlimits_even_with_explicit_core() {
+        // Guard: with the default set off, an explicit value is the
+        // sandbox's alone and never becomes a supervisor limit.
+        let mut config = explicit(&[("core", "0"), ("nofile", "65536")]);
+        config.no_rlimits = Some(true);
+        let set = supervisor_set(&config);
+        assert!(set.is_empty(), "--no-rlimits: {set:?}");
+    }
+
+    #[test]
+    fn supervisor_set_keeps_core_and_nofile_defaults_given_explicitly() {
+        // The gate's reproduction: asking for the default values removed
+        // them from the supervisor (core unlimited, nofile the host's).
+        let set =
+            supervisor_set(&explicit(&[("core", "0"), ("nofile", "65536")]));
+        assert_eq!(entry(&set, RlimitName::Core), Some((0, 0)), "{set:?}");
+        assert_eq!(
+            entry(&set, RlimitName::Nofile),
+            Some((65536, 65536)),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_set_keeps_defaults_when_explicit_core_nofile_differ() {
+        // A different explicit value is the sandbox's, not the
+        // supervisor's: a looser core does not make the supervisor
+        // dumpable, and a tighter nofile does not starve the proxy.
+        let set =
+            supervisor_set(&explicit(&[("core", "1024"), ("nofile", "1024")]));
+        assert_eq!(entry(&set, RlimitName::Core), Some((0, 0)), "{set:?}");
+        assert_eq!(
+            entry(&set, RlimitName::Nofile),
+            Some((65536, 65536)),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_set_keeps_lockdown_defaults_given_explicit_values() {
+        let mut config = explicit(&[("core", "0"), ("nofile", "1024")]);
+        config.lockdown = Some(true);
+        let set = supervisor_set(&config);
+        assert_eq!(entry(&set, RlimitName::Core), Some((0, 0)), "{set:?}");
+        assert_eq!(
+            entry(&set, RlimitName::Nofile),
+            Some((4096, 4096)),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_apply_sets_core_and_nofile_defaults_despite_explicit() {
+        // Through `apply` itself, in a child test process: lowering a hard
+        // limit cannot be undone.
+        let output = std::process::Command::new(
+            std::env::current_exe().unwrap(),
+        )
+        .arg("--exact")
+        .arg("sandbox::rlimits::rlimit_supervisor_tests::supervisor_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn child supervisor test");
+        assert!(
+            output.status.success(),
+            "child supervisor test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn supervisor_child() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        // Start as the gate measured: a dumpable process with a host
+        // `nofile` soft limit below the default.
+        let (_, core_hard) = getrlimit(Resource::RLIMIT_CORE).expect("core");
+        setrlimit(Resource::RLIMIT_CORE, core_hard, core_hard)
+            .expect("raise core soft to hard");
+        let (_, nofile_hard) =
+            getrlimit(Resource::RLIMIT_NOFILE).expect("nofile");
+        assert!(nofile_hard >= 65536, "test needs NOFILE hard >= 65536");
+        setrlimit(Resource::RLIMIT_NOFILE, 1024, nofile_hard)
+            .expect("lower nofile soft");
+
+        apply(&explicit(&[("core", "0"), ("nofile", "65536")]), false)
+            .expect("apply");
+
+        assert_eq!(
+            getrlimit(Resource::RLIMIT_CORE).expect("core"),
+            (0, 0),
+            "the supervisor's core size after --rlimit core=0"
+        );
+        assert_eq!(
+            getrlimit(Resource::RLIMIT_NOFILE).expect("nofile"),
+            (65536, 65536),
+            "the supervisor's nofile after --rlimit nofile=65536"
+        );
+    }
+
+    /// The `--lockdown` clauses of the bullets in the README's
+    /// resource-limits section (the intro paragraph lists the lockdown
+    /// defaults, not what happens to an explicit value).
+    fn readme_lockdown_clauses() -> Vec<String> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let start = readme
+            .find("### Resource limits without root")
+            .expect("README has the resource-limits section");
+        let section = &readme[start..];
+        let body_start = section.find('\n').map_or(section.len(), |i| i + 1);
+        let end = section[body_start..]
+            .find("\n#")
+            .map_or(section.len(), |i| body_start + i);
+        section[body_start..end]
+            .split("\n- ")
+            .skip(1)
+            .map(|bullet| {
+                bullet.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .flat_map(|bullet| {
+                bullet
+                    .split("; ")
+                    .flat_map(|c| c.split(". "))
+                    .map(|c| c.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|c| c.contains("`--lockdown`"))
+            .collect()
+    }
+
+    #[test]
+    fn supervisor_readme_lockdown_clause_clamps_with_a_warning() {
+        // R3.7: a value above a lockdown default runs at that default with
+        // a warning; the launch is not refused.
+        let clauses = readme_lockdown_clauses();
+        assert!(
+            !clauses.is_empty(),
+            "the section still says what --lockdown does to an explicit value"
+        );
+        for clause in &clauses {
+            assert!(
+                !clause.to_ascii_lowercase().contains("refus"),
+                "README says --lockdown refuses: {clause:?}"
+            );
+        }
+        assert!(
+            clauses
+                .iter()
+                .any(|c| c.to_ascii_lowercase().contains("warn")),
+            "README names the warning: {clauses:?}"
+        );
     }
 }
