@@ -67,7 +67,7 @@ or integration rather than saved sandbox authority.
   `--prompt-hosts`, `--no-prompt-hosts`
 - Port bridges: `--forward-port`, `--publish-port`
 - Whole-sandbox resource limits (tighten only): `--memory`, `--max-tasks`,
-  `--cpu-quota`, `--cpus`
+  `--cpu-quota`
 - Environment/secret sources: `--env-from-file`, `--secret`
 - Harness-specific path override: `--claude-dir`
 - Browser command/profile mode: `--browser`, `--no-browser` (command-specific;
