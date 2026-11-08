@@ -321,7 +321,9 @@ pub fn widens(candidate: &Config, baseline: &Config) -> bool {
 /// Apply one limit. A default limit that cannot be read or set keeps
 /// upstream's warn-and-skip; an explicit one is an error, because the
 /// operator asked for it and silently running without it fails open.
-fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<(), String> {
+/// Returns whether the limit was set (false: a default skipped with a
+/// warning).
+fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<bool, String> {
     let explicit = limit.source != LimitSource::Default;
     let label = format!("RLIMIT_{}", limit.name.as_str().to_uppercase());
     let fail = |msg: String| {
@@ -329,7 +331,7 @@ fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<(), String> {
             Err(msg)
         } else {
             output::warn(&format!("{msg}, skipping"));
-            Ok(())
+            Ok(false)
         }
     };
     let current_hard = match getrlimit(limit.name.resource()) {
@@ -352,7 +354,7 @@ fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<(), String> {
     if verbose {
         output::verbose(&format!("{label}: {soft} (hard: {hard})"));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Apply the supervisor's limits before spawning the sandbox. Limits are
@@ -363,13 +365,20 @@ fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<(), String> {
 /// `data` or `as` on the supervisor would kill or cap the PTY loop, the
 /// proxy and the audit writer and orphan the sandbox; explicit values are
 /// applied inside the sandbox by `apply_sandbox` instead.
-pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
+///
+/// Returns whether this process set RLIMIT_FSIZE (the lockdown default),
+/// so a later explanation of a SIGXFSZ death only quotes a value ai-jail
+/// actually put in force (story 046). An explicit `fsize` is applied
+/// inside the sandbox instead and reaches that explanation through
+/// `exit_reason::LimitsInForce::with_sandbox_file_size`.
+pub fn apply(config: &Config, verbose: bool) -> Result<bool, String> {
     if !config.rlimits_enabled() {
         if verbose {
             output::verbose("Resource limits: disabled");
         }
-        return Ok(());
+        return Ok(false);
     }
+    let mut file_size_set = false;
     for (name, soft) in default_limits(config) {
         // NPROC counts against bwrap's own clone(); see `apply_sandbox`.
         if name == RlimitName::Nproc
@@ -383,9 +392,11 @@ pub fn apply(config: &Config, verbose: bool) -> Result<(), String> {
             hard: soft,
             source: LimitSource::Default,
         };
-        apply_one(&limit, verbose)?;
+        if apply_one(&limit, verbose)? && name == RlimitName::Fsize {
+            file_size_set = true;
+        }
     }
-    Ok(())
+    Ok(file_size_set)
 }
 
 /// Apply the full effective set — defaults and explicit values, NPROC
@@ -417,6 +428,51 @@ mod tests {
 
         let (soft, _) = getrlimit(Resource::RLIMIT_CORE).unwrap();
         assert_eq!(soft, 0);
+    }
+
+    #[test]
+    fn apply_reports_no_file_size_limit_unless_lockdown_sets_one() {
+        // Only --lockdown asks for RLIMIT_FSIZE, and disabled rlimits
+        // set nothing even under it: neither may report a value in
+        // force. The lockdown case lowers a hard limit for good, so it
+        // runs in a child process (exit_reason's read-back tests).
+        assert!(!apply(&Config::default(), false).unwrap());
+        let lockdown_no_rlimits = Config {
+            lockdown: Some(true),
+            no_rlimits: Some(true),
+            ..Config::default()
+        };
+        assert!(!apply(&lockdown_no_rlimits, false).unwrap());
+    }
+
+    #[test]
+    fn apply_reports_the_file_size_limit_it_sets() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(
+                "sandbox::rlimits::tests::apply_reports_the_file_size_limit_it_sets_child",
+            )
+            .arg("--ignored")
+            .env("AI_JAIL_RLIMIT_CHILD", "1")
+            .output()
+            .expect("spawn child rlimit test");
+        assert!(output.status.success(), "child rlimit test failed");
+    }
+
+    #[test]
+    #[ignore]
+    fn apply_reports_the_file_size_limit_it_sets_child() {
+        if std::env::var_os("AI_JAIL_RLIMIT_CHILD").is_none() {
+            return;
+        }
+        let lockdown = Config {
+            lockdown: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            apply(&lockdown, false).unwrap(),
+            "lockdown sets RLIMIT_FSIZE"
+        );
     }
 
     #[test]

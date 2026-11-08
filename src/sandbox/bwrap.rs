@@ -1326,6 +1326,7 @@ fn resolv_has_tailscale_magicdns_domain(contents: &[u8]) -> bool {
 
 fn resolve_landlock_wrapper(
     config: &Config,
+    teardown_report: bool,
 ) -> Result<Option<PathBuf>, String> {
     if !config.landlock_enabled()
         && !config.seccomp_enabled()
@@ -1338,6 +1339,8 @@ fn resolve_landlock_wrapper(
         // bridges.
         && config.forward_ports().is_empty()
         && config.publish_ports().is_empty()
+        // A teardown report needs the wrapper as the command's sub-reaper.
+        && !teardown_report
     {
         return Ok(None);
     }
@@ -1355,6 +1358,7 @@ fn landlock_wrapper_args(
     config: &Config,
     map_args: &[String],
     verbose: bool,
+    teardown_report_fd: Option<String>,
 ) -> Vec<String> {
     let mut args = vec![
         LANDLOCK_WRAPPER_DEST.into(),
@@ -1500,6 +1504,13 @@ fn landlock_wrapper_args(
         args.push("--publish-port".into());
         args.push(port.to_string());
     }
+    // Teardown report: the descriptor number the supervisor
+    // makes inheritable right before the spawn. Internal, so it always
+    // follows --landlock-exec, which the wrapper's parser requires first.
+    if let Some(fd) = teardown_report_fd {
+        args.push("--teardown-report-fd".into());
+        args.push(fd);
+    }
 
     if config.browser_profile().is_none() {
         args.extend_from_slice(map_args);
@@ -1525,6 +1536,11 @@ fn landlock_wrapper_args(
     args
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one value per launch input (the fork's transparent egress \
+              and the teardown fd included); mirrors sandbox::build"
+)]
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -1533,6 +1549,7 @@ pub fn build(
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
     transparent: Option<super::TransparentFds<'_>>,
+    teardown_report_fd: Option<std::os::fd::RawFd>,
 ) -> Result<Command, String> {
     let mut sources = MountSources::from_guard(guard);
     if let Some(t) = &transparent {
@@ -1547,7 +1564,8 @@ pub fn build(
 
     // Landlock wrapper: bind-mount ai-jail into /tmp inside the
     // sandbox so it can apply Landlock after bwrap namespace setup.
-    let wrapper = resolve_landlock_wrapper(config)?;
+    let wrapper =
+        resolve_landlock_wrapper(config, teardown_report_fd.is_some())?;
 
     // #147: bwrap OPTIONS (which include every `--setenv NAME VALUE` pair,
     // and therefore all `--env`/`--env-from-file` values) go into a memfd
@@ -1624,7 +1642,12 @@ pub fn build(
     // accept the command from the fd).
     cmd.arg("--");
     if wrapper.is_some() {
-        for arg in landlock_wrapper_args(config, &map_args, verbose) {
+        for arg in landlock_wrapper_args(
+            config,
+            &map_args,
+            verbose,
+            teardown_report_fd.map(|fd| fd.to_string()),
+        ) {
             cmd.arg(arg);
         }
     }
@@ -1775,6 +1798,10 @@ fn bridge_socket_mount_args(
     Ok(args)
 }
 
+/// Stands in for the teardown report descriptor in a dry run, which
+/// opens no pipe: the real launch picks the number at spawn.
+const TEARDOWN_FD_PLACEHOLDER: &str = "<fd>";
+
 pub fn dry_run(
     guard: &SandboxGuard,
     config: &Config,
@@ -1782,6 +1809,7 @@ pub fn dry_run(
     verbose: bool,
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
+    teardown_report: bool,
 ) -> Result<String, String> {
     let sources = MountSources {
         create_dirs: false,
@@ -1794,6 +1822,7 @@ pub fn dry_run(
         verbose,
         proxy_socket,
         bridge_sockets,
+        teardown_report,
     )?;
     Ok(format_dry_run_args(&args))
 }
@@ -1826,6 +1855,7 @@ fn build_dry_run_args_full(
         verbose,
         proxy_socket,
         &super::BridgeSockets::default(),
+        false,
     )
 }
 
@@ -1836,6 +1866,7 @@ fn build_dry_run_args_forwarded(
     verbose: bool,
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
+    teardown_report: bool,
 ) -> Result<Vec<String>, String> {
     let mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
@@ -1847,8 +1878,10 @@ fn build_dry_run_args_forwarded(
 
     args.extend(mount_set.all_mount_args());
 
-    // Self binary mount for Landlock wrapper
-    let wrapper = resolve_landlock_wrapper(config)?;
+    // Self binary mount for Landlock wrapper. A dry run opens no teardown
+    // report pipe: it shows the wrapper the launch would run, with a
+    // placeholder where the launch puts the descriptor number.
+    let wrapper = resolve_landlock_wrapper(config, teardown_report)?;
     if let Some(ref self_bin) = wrapper {
         let m = Mount::FileRoBind {
             src: self_bin.clone(),
@@ -1871,7 +1904,12 @@ fn build_dry_run_args_forwarded(
     args.push("--".into());
 
     if wrapper.is_some() {
-        args.extend(landlock_wrapper_args(config, &map_args, verbose));
+        args.extend(landlock_wrapper_args(
+            config,
+            &map_args,
+            verbose,
+            teardown_report.then(|| TEARDOWN_FD_PLACEHOLDER.to_string()),
+        ));
     }
 
     args.push(launch.program);
@@ -5056,6 +5094,7 @@ mod tests {
                 forward: vec![(49374, sock.clone())],
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
 
@@ -5113,6 +5152,7 @@ mod tests {
                 )],
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
 
@@ -5151,6 +5191,7 @@ mod tests {
                 forward: vec![(49374, PathBuf::from("/tmp/only-one.sock"))],
                 ..Default::default()
             },
+            false,
         );
         assert!(result.unwrap_err().contains("--forward-port 8080"));
     }
@@ -5175,6 +5216,7 @@ mod tests {
                 publish: vec![(4096, sock.clone())],
                 ..Default::default()
             },
+            false,
         )
         .unwrap();
 
@@ -5223,6 +5265,7 @@ mod tests {
             false,
             None,
             &crate::sandbox::BridgeSockets::default(),
+            false,
         );
         assert!(result.unwrap_err().contains("--publish-port 4096"));
     }
@@ -5451,6 +5494,7 @@ mod tests {
             false,
             None,
             &crate::sandbox::BridgeSockets::default(),
+            false,
         )
         .unwrap();
 
@@ -7070,6 +7114,7 @@ mod tests {
             false,
             None,
             &crate::sandbox::BridgeSockets::default(),
+            false,
         )
         .unwrap();
 
@@ -7417,6 +7462,7 @@ mod tests {
             None,
             &crate::sandbox::BridgeSockets::default(),
             None,
+            None,
         )
         .unwrap();
         let argv: Vec<String> = cmd
@@ -7448,7 +7494,7 @@ mod tests {
         config.lockdown = Some(true);
         config.allow_tcp_ports = vec![32000, 8080];
 
-        let wrapper_args = landlock_wrapper_args(&config, &[], false);
+        let wrapper_args = landlock_wrapper_args(&config, &[], false, None);
         let port_args: Vec<_> = wrapper_args
             .windows(2)
             .filter(|w| w[0] == "--allow-tcp-port")
@@ -7569,7 +7615,7 @@ mod tests {
         config.rw_maps = vec![PathBuf::from("/tmp/browser-rw")];
         config.ro_maps = vec![PathBuf::from("/tmp/browser-ro")];
 
-        let wrapper_args = landlock_wrapper_args(&config, &[], false);
+        let wrapper_args = landlock_wrapper_args(&config, &[], false, None);
 
         assert!(!wrapper_args.contains(&"--rw-map".into()));
         assert!(!wrapper_args.contains(&"--map".into()));
@@ -7581,7 +7627,7 @@ mod tests {
         // The inner wrapper rebuilds its config from forwarded flags, so
         // its Landlock /dev/kvm rule only exists if --kvm reaches it.
         let wrapper_args =
-            landlock_wrapper_args(&minimal_test_config(), &[], false);
+            landlock_wrapper_args(&minimal_test_config(), &[], false, None);
         assert!(wrapper_args.contains(&"--no-kvm".into()));
         assert!(!wrapper_args.contains(&"--kvm".into()));
 
@@ -7589,9 +7635,90 @@ mod tests {
             kvm: Some(true),
             ..minimal_test_config()
         };
-        let wrapper_args = landlock_wrapper_args(&config, &[], false);
+        let wrapper_args = landlock_wrapper_args(&config, &[], false, None);
         assert!(wrapper_args.contains(&"--kvm".into()));
         assert!(!wrapper_args.contains(&"--no-kvm".into()));
+    }
+
+    #[test]
+    fn teardown_report_forces_the_wrapper() {
+        // Every restriction control off, network off, no bridges: the
+        // wrapper is only there for the teardown report.
+        let config = Config {
+            no_landlock: Some(true),
+            no_seccomp: Some(true),
+            no_rlimits: Some(true),
+            network: Some(false),
+            ..minimal_test_config()
+        };
+        assert_eq!(resolve_landlock_wrapper(&config, false), Ok(None));
+        assert!(matches!(
+            resolve_landlock_wrapper(&config, true),
+            Ok(Some(_))
+        ));
+    }
+
+    #[test]
+    fn build_puts_the_teardown_report_fd_on_the_wrapper_argv() {
+        // The wrapper's arguments stay on bwrap's real argv, after `--`
+        // (only bwrap OPTIONS go through the --args memfd).
+        let config = Config {
+            no_landlock: Some(true),
+            no_seccomp: Some(true),
+            no_rlimits: Some(true),
+            network: Some(false),
+            ..minimal_test_config()
+        };
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let project = PathBuf::from("/home/user/project");
+        let argv = |fd| -> Vec<String> {
+            build(
+                &guard,
+                &config,
+                &project,
+                false,
+                None,
+                &crate::sandbox::BridgeSockets::default(),
+                None,
+                fd,
+            )
+            .unwrap()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let with = argv(Some(23));
+        let end = with.iter().position(|a| a == "--").unwrap();
+        let after = &with[end..];
+        assert!(after.contains(&"--landlock-exec".to_string()), "{with:?}");
+        assert!(
+            after
+                .windows(2)
+                .any(|w| w[0] == "--teardown-report-fd" && w[1] == "23"),
+            "{with:?}"
+        );
+        assert!(!argv(None).contains(&"--teardown-report-fd".to_string()));
+    }
+
+    #[test]
+    fn landlock_wrapper_forwards_the_teardown_report_fd() {
+        let config = minimal_test_config();
+        let without = landlock_wrapper_args(&config, &[], false, None);
+        assert!(!without.contains(&"--teardown-report-fd".into()));
+
+        let with =
+            landlock_wrapper_args(&config, &[], false, Some("17".into()));
+        let at = with
+            .windows(2)
+            .position(|w| w[0] == "--teardown-report-fd" && w[1] == "17")
+            .expect("the fd flag and its number are adjacent");
+        // The wrapper's parser accepts it only after --landlock-exec, and
+        // everything after `--` is the command.
+        let exec_at = with.iter().position(|a| a == "--landlock-exec");
+        let end_at = with.iter().position(|a| a == "--");
+        assert!(exec_at.is_some_and(|e| e < at), "{with:?}");
+        assert!(end_at.is_some_and(|e| at < e), "{with:?}");
     }
 
     #[test]

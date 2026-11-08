@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ai-jail:run-summary/v1.json",
+  "title": "ai-jail run summary",
+  "description": "One document per launch, written by --run-summary. Uses only properties/type/enum/required/items. Adding an optional field keeps schema_version; removing, renaming, retyping or re-meaning one increments it.",
+  "type": "object",
+  "required": ["schema", "schema_version", "run_id", "ai_jail_version", "started_at", "ended_at", "duration_ms", "program", "exit", "resources", "network", "filesystem", "teardown"],
+  "properties": {
+    "schema": { "type": "string", "enum": ["ai-jail.run-summary"] },
+    "schema_version": { "type": "integer", "enum": [1] },
+    "run_id": { "type": "string", "description": "32 hex characters, shared with the --egress-log lines of the same launch" },
+    "ai_jail_version": { "type": "string" },
+    "started_at": { "type": "string", "description": "RFC 3339 UTC" },
+    "ended_at": { "type": "string", "description": "RFC 3339 UTC" },
+    "duration_ms": { "type": "integer", "description": "monotonic clock, never negative" },
+    "program": { "type": ["string", "null"], "description": "basename of the command only; null when there is none" },
+    "exit": {
+      "type": "object",
+      "required": ["code", "signal", "core_dumped", "reason", "limit", "evidence", "status_source", "error"],
+      "properties": {
+        "code": { "type": "integer" },
+        "signal": { "type": ["string", "null"] },
+        "core_dumped": { "type": "boolean" },
+        "reason": { "type": "string", "enum": ["exited", "signaled", "limit", "start-failed"] },
+        "limit": { "type": ["string", "null"], "enum": ["memory", "processes", "cpu-time", "file-size", null], "description": "memory and processes are reserved for a whole-sandbox limit source such as a cgroup and are not written" },
+        "evidence": { "type": ["string", "null"] },
+        "status_source": { "type": "string", "enum": ["reported", "inferred", "direct", "exit-code", "none"], "description": "reported: the in-sandbox wrapper's report; inferred: decoded from a 128+N exit code; direct: waitpid saw a signal; exit-code: an exit code taken as it is; none: the command never started, so no end was observed" },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "required": ["cpu_user_ms", "cpu_system_ms", "peak_rss_kib", "peak_rss_scope", "source"],
+      "properties": {
+        "cpu_user_ms": { "type": ["integer", "null"], "description": "CPU time in user mode of the command and every process it left behind; processes the kernel ends after the wrapper exits (an incomplete teardown) are not counted; null when unavailable" },
+        "cpu_system_ms": { "type": ["integer", "null"], "description": "CPU time in kernel mode, same scope and the same exclusion; null when unavailable" },
+        "peak_rss_kib": { "type": ["integer", "null"], "description": "peak resident set of the largest single process, in KiB; null when unavailable" },
+        "peak_rss_scope": { "type": "string", "enum": ["largest-process", "whole-sandbox"], "description": "whole-sandbox is reserved for a whole-sandbox source such as a cgroup and is not written" },
+        "source": { "type": "string", "enum": ["sandbox-wrapper", "getrusage", "unavailable", "cgroup"], "description": "sandbox-wrapper: measured inside the sandbox on Linux; getrusage: on macOS, every process ai-jail waited for (the command and its own helpers), not what the command left behind; unavailable: no measurement, the figures are null; cgroup is reserved and not written" }
+      }
+    },
+    "network": {
+      "type": "object",
+      "required": ["mode", "connections_allowed", "connections_denied", "connections_errored", "bytes_up", "bytes_down"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["off", "filtered", "full"] },
+        "connections_allowed": { "type": ["integer", "null"], "description": "null unless mode is filtered" },
+        "connections_denied": { "type": ["integer", "null"] },
+        "connections_errored": { "type": ["integer", "null"] },
+        "bytes_up": { "type": ["integer", "null"] },
+        "bytes_down": { "type": ["integer", "null"] }
+      }
+    },
+    "filesystem": {
+      "type": "object",
+      "required": ["denied_accesses", "denied_accesses_source"],
+      "properties": {
+        "denied_accesses": { "type": ["integer", "null"], "description": "reserved: no source counts them yet" },
+        "denied_accesses_source": { "type": "string", "enum": ["unavailable"] }
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "required": ["supported", "active", "complete", "incomplete_reason", "grace_ms", "survivors"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "complete": { "type": ["boolean", "null"], "description": "null when teardown was not active" },
+        "incomplete_reason": { "type": ["string", "null"] },
+        "grace_ms": { "type": ["integer", "null"] },
+        "survivors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pid", "ppid", "comm", "age_s", "ended_by"],
+            "properties": {
+              "pid": { "type": "integer" },
+              "ppid": { "type": "integer" },
+              "comm": { "type": "string" },
+              "age_s": { "type": "integer" },
+              "ended_by": { "type": "string", "enum": ["sigterm", "sigkill", "already-gone"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -287,7 +287,7 @@ fn serve_listener(
                 return;
             };
             if let Ok(upstream) = open_tunnel(&proxy, &name, local.port()) {
-                crate::proxy::relay(client, upstream);
+                crate::proxy::relay(client, upstream, None);
             }
         });
     }

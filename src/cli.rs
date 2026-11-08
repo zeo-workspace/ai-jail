@@ -149,6 +149,15 @@ OPTIONS:
                                     (default: off; repository policy cannot enable)
     --audit-show                   Show the local audit log and exit
     --audit-verify                 Verify the audit log's hash chain and exit
+    --egress-log <PATH>            Append one JSON line per egress-proxy
+                                   connection to PATH (mode 0600; needs
+                                   filtered networking)
+    --teardown-report              Stop processes that outlive the command
+                                   (SIGTERM, SIGKILL after 2000 ms) and name
+                                   them on stderr (Linux)
+    --run-summary <PATH>           Write one versioned JSON summary of the
+                                   run to PATH, atomically, when it ends
+                                   (implies --teardown-report)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache
@@ -277,8 +286,18 @@ pub struct CliArgs {
     pub inherit_env: Option<bool>,
     pub update_check: Option<bool>,
     pub audit_log: Option<bool>,
+    /// `--egress-log <path>`: one JSON line per
+    /// connection the filtered-egress proxy accepts. CLI-only, never a
+    /// config key.
+    pub egress_log: Option<PathBuf>,
     pub audit_verify: bool,
     pub audit_show: bool,
+    /// `--teardown-report`: stop what outlives the command
+    /// and name it on stderr. CLI-only, never a config key.
+    pub teardown_report: bool,
+    /// `--run-summary <path>`: one versioned JSON document
+    /// per launch. CLI-only, never a config key; implies teardown.
+    pub run_summary: Option<PathBuf>,
     pub env_from_file: Vec<PathBuf>,
     /// Phantom credential bindings (`--secret KEY=host`, repeatable):
     /// the sandbox sees a placeholder; the proxy substitutes the real
@@ -312,6 +331,9 @@ pub struct CliArgs {
     /// Internal: loopback port the wrapper's proxy bridge should listen
     /// on; only valid with --landlock-exec.
     pub proxy_bridge_port: Option<u16>,
+    /// Internal: descriptor the --landlock-exec wrapper writes its one-line
+    /// teardown report to; only valid with --landlock-exec.
+    pub teardown_report_fd: Option<i32>,
     /// Internal: opaque read-write mount destinations for Landlock.
     pub landlock_rw_paths: Vec<PathBuf>,
     /// Internal: opaque read-only mount destinations for Landlock.
@@ -679,7 +701,27 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 args.audit_log = Some(s == "audit-log");
             }
             Long("audit-verify") => args.audit_verify = true,
+            Long("egress-log") => {
+                // Kept as an OsString path: a non-UTF-8 name must reach
+                // open(2) unchanged, not lossily rewritten.
+                let val = parser.value().map_err(|e| e.to_string())?;
+                if val.is_empty() {
+                    return Err("--egress-log requires a non-empty path".into());
+                }
+                args.egress_log = Some(PathBuf::from(val));
+            }
             Long("audit-show") => args.audit_show = true,
+            Long("teardown-report") => args.teardown_report = true,
+            Long("run-summary") => {
+                // An OsString path for the same reason as --egress-log.
+                let val = parser.value().map_err(|e| e.to_string())?;
+                if val.is_empty() {
+                    return Err(
+                        "--run-summary requires a non-empty path".into()
+                    );
+                }
+                args.run_summary = Some(PathBuf::from(val));
+            }
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -817,6 +859,20 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                     format!("invalid proxy bridge port: {port_text}")
                 })?;
                 args.proxy_bridge_port = Some(port);
+            }
+            Long("teardown-report-fd") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--teardown-report-fd is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let fd_text = val.to_string_lossy();
+                let fd: i32 = fd_text.parse().map_err(|_| {
+                    format!("invalid teardown report fd: {fd_text}")
+                })?;
+                args.teardown_report_fd = Some(fd);
             }
             Long("landlock-rw-path") => {
                 if !args.landlock_exec {
@@ -1208,6 +1264,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-agent-state",
     "--forward-port",
     "--publish-port",
+    "--teardown-report",
+    "--run-summary",
     "--inherit-env",
     "--no-inherit-env",
     "--update-check",
@@ -1215,6 +1273,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--audit-log",
     "--no-audit-log",
     "--audit-verify",
+    "--egress-log",
     "--env",
     "--env-from-file",
     "--secret",
@@ -2671,6 +2730,41 @@ mod tests {
         );
         assert!(parse_test(&["--publish-bridge", "nope", "/tmp/s"]).is_err());
         assert!(parse_test(&["--publish-bridge", "4096"]).is_err());
+    }
+
+    #[test]
+    fn parse_teardown_report_fd_requires_landlock_exec() {
+        assert!(parse_test(&["--teardown-report-fd", "9"]).is_err());
+        assert!(
+            parse_test(&["--landlock-exec", "--teardown-report-fd", "x"])
+                .is_err()
+        );
+        let args = parse_test(&[
+            "--landlock-exec",
+            "--teardown-report-fd",
+            "9",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(args.teardown_report_fd, Some(9));
+        // Without the flag the wrapper keeps its exec path.
+        let args = parse_test(&["--landlock-exec", "--", "bash"]).unwrap();
+        assert_eq!(args.teardown_report_fd, None);
+    }
+
+    #[test]
+    fn parse_teardown_report_flag() {
+        let args = parse_test(&["--teardown-report", "bash"]).unwrap();
+        assert!(args.teardown_report);
+        assert!(!parse_test(&["bash"]).unwrap().teardown_report);
+        // No `--no-` form: it is not a toggle.
+        assert!(parse_test(&["--no-teardown-report", "bash"]).is_err());
+        // A sandbox flag after the command is refused, like the others.
+        let error = parse_test(&["bash", "--teardown-report"]).unwrap_err();
+        assert!(error.contains("--teardown-report"), "{error}");
+        // It takes no value.
+        assert!(parse_test(&["--teardown-report=yes", "bash"]).is_err());
     }
 
     #[test]

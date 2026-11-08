@@ -522,6 +522,55 @@ for <launch dir> is ignored`. Restrictions saved only in that per-directory
 
 The setting is global only. A repository file cannot enable it.
 
+## Run observability
+
+When the command dies of a signal, ai-jail prints one stderr line naming the
+signal and the limit behind it when one is known (the file-size rlimit under
+`--lockdown`, with the value actually in force), even under `--exec`. Ordinary
+exits and deliberate signals print nothing, and the exit code is unchanged.
+There is no setting for it.
+
+Onboarding has no control for `--egress-log PATH`, by design: it records a run,
+it grants nothing, and it is never saved to a profile. Pass it on each launch
+that should be observed. It needs filtered networking (`--allow-host`, or the
+filtered default a known agent gets); with the network off or full, ai-jail
+refuses to start rather than log nothing. Each connection through the egress
+proxy becomes one JSON line in `PATH` (mode 0600, an existing file narrowed to
+it, appended across runs) with its host, port, verdict, reason, byte counts and
+duration, and never any request content. A file that cannot be opened is a
+warning, not a launch failure. The README's `Run observability` section
+describes every field.
+
+`--teardown-report` is a per-launch CLI flag, not a saved setting, so the
+onboarding screens do not offer it. On Linux, when the command exits,
+ai-jail stops every process the command left behind in the sandbox: SIGTERM
+(with SIGCONT, for a stopped one) first, then SIGKILL to whatever is still
+alive after 2000 ms. It lists the sandbox again afterwards and stops what
+appeared meanwhile, for at most three more rounds. If any were stopped, one
+stderr line gives their count and names (at most ten, then `+N more`), even
+under `--exec`. A report that could not be completed prints one
+`Teardown report incomplete: <reason>` line instead of passing for a clean
+teardown. Survivors are named by their kernel command
+name (`comm`) only; their command lines and environments are never read.
+The exit code is the command's own. On macOS the flag is accepted and
+changes nothing.
+
+`--run-summary PATH` is a per-launch CLI flag too, never saved, so onboarding
+does not offer it. When the run ends, on every path once the launch is under
+way, including a sandbox that failed to start, ai-jail writes one JSON document
+to `PATH`. An invocation that ends earlier exits with its error and writes
+none, for example an argument error, a missing `bwrap`, a project config that
+cannot be read, a restricted SSH agent or a secret that fails to start, or a
+cancel (Ctrl-C) before the launch; a dry run writes none either. The document
+holds the run id (the same as the egress log's), start and end times, the
+program's basename, how the command ended and why, the command's CPU time and
+peak memory (measured inside the sandbox on Linux; `null` when not measured),
+the egress counts in filtered mode, and the teardown result. The file is written
+to a temporary name and renamed, so a reader sees the previous document or the
+new one, never a torn one. A symlink at `PATH`, or a missing directory, is a
+warning at startup and the run goes on without a summary. It implies
+`--teardown-report`. The format is versioned by `docs/run-summary.schema.json`.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
