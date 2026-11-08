@@ -49,6 +49,8 @@ OPTIONS:
                                    NAME: nproc, nofile, core, cpu, fsize, data, as.
                                    VALUE: integer, K/M/G/T for fsize/data/as, or unlimited.
                                    cpu is CPU seconds and ends the process; it does not throttle
+    --cpus <LIST>                  Run only on these CPUs (e.g. 8,24 or 0-3); locked
+                                   by seccomp so the sandbox cannot widen it (Linux)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -209,6 +211,8 @@ pub struct CliArgs {
     pub rlimits: Option<bool>,
     /// `--rlimit NAME=VALUE`, validated at parse time, in order given.
     pub rlimit: Vec<(String, String)>,
+    /// `--cpus LIST`, normalized (`0-1,3`).
+    pub cpus: Option<String>,
     pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
@@ -434,6 +438,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long("cpus") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy();
+                let set = crate::sandbox::affinity::parse_cpu_list(&text)
+                    .map_err(|e| format!("--cpus: {e}"))?;
+                // Stored normalized so saved configs and the inner
+                // wrapper see one canonical spelling.
+                args.cpus =
+                    Some(crate::sandbox::affinity::format_cpu_list(&set));
             }
             Long("rlimit") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -1094,6 +1108,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--rlimits",
     "--no-rlimits",
     "--rlimit",
+    "--cpus",
     "--ssh",
     "--no-ssh",
     "--pictures",

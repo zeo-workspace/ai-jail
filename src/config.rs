@@ -352,6 +352,11 @@ pub struct Config {
     /// audit record. Runtime only: never read from or written to a file.
     #[serde(skip)]
     pub rlimit_source: BTreeMap<String, crate::sandbox::rlimits::LimitSource>,
+    /// CPUs the sandbox may run on (`8,24`, `0-3`), applied as CPU
+    /// affinity and locked by seccomp. The project `.ai-jail` may only
+    /// narrow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub systemd_user: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1321,6 +1326,7 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(no_landlock);
     take!(no_seccomp);
     take!(no_rlimits);
+    take!(cpus);
     for (name, value) in local.rlimit {
         c.rlimit_source
             .insert(name.clone(), crate::sandbox::rlimits::LimitSource::Global);
@@ -1694,6 +1700,17 @@ pub fn merge_with_global_report(
     monotonic!(no_landlock, |config: &Config| !config.landlock_enabled());
     monotonic!(no_seccomp, |config: &Config| !config.seccomp_enabled());
     monotonic!(no_rlimits, |config: &Config| !config.rlimits_enabled());
+    // Project CPUs narrow the trusted set; a set sharing no CPU with it
+    // becomes the empty list, which the launch refuses (R4.5).
+    let (cpus, dropped) =
+        crate::sandbox::affinity::tighten_cpus(c.cpus.take(), local.cpus);
+    c.cpus = cpus;
+    if dropped {
+        warnings.push(
+            "project .ai-jail cpus ignored because it weakens the baseline sandbox"
+                .into(),
+        );
+    }
     // Per limit, the project may only tighten: its value is kept when it
     // is at or below what the trusted layers (or the default) give.
     // Compared as numbers, so "4G" tightens a trusted 8589934592.
@@ -2336,6 +2353,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     }
     invert!(status_bar, no_status_bar);
     clone_into!(status_bar_style);
+    clone_into!(cpus);
 
     config
         .allow_tcp_ports
@@ -4143,6 +4161,18 @@ no_landlock = false
     }
 
     #[test]
+    fn regression_v3_3_0_config_without_cpus() {
+        let cfg =
+            parse_toml("command = [\"claude\"]\nno_rlimits = false\n").unwrap();
+        assert_eq!(cfg.cpus, None);
+        assert!(
+            !toml::to_string(&Config::default())
+                .unwrap()
+                .contains("cpus")
+        );
+    }
+
+    #[test]
     fn regression_v0_5_3_config_without_seccomp_rlimits() {
         // v0.5.3 configs don't have no_seccomp or no_rlimits fields.
         // They must still parse and default to both enabled.
@@ -4454,6 +4484,7 @@ no_gpu = true
             no_rlimits: None,
             rlimit: BTreeMap::from([("nofile".into(), "1024".into())]),
             rlimit_source: BTreeMap::new(),
+            cpus: Some("0-3,8".into()),
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
             allow_hosts: vec!["api.anthropic.com".into()],
@@ -7831,6 +7862,7 @@ hide_dotdirs = [".my_secrets"]
             no_rlimits: None,
             rlimit: BTreeMap::new(),
             rlimit_source: BTreeMap::new(),
+            cpus: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
             allow_hosts: vec![],

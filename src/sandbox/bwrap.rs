@@ -1390,6 +1390,12 @@ fn landlock_wrapper_args(
         args.push("--rlimit".into());
         args.push(format!("{name}={value}"));
     }
+    // --cpus: the wrapper pins itself to these CPUs right before its
+    // seccomp filter, which then refuses sched_setaffinity.
+    if let Some(cpus) = &config.cpus {
+        args.push("--cpus".into());
+        args.push(cpus.clone());
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
