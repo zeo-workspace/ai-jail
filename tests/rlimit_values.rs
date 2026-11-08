@@ -1,5 +1,5 @@
 // Story 047 — adjustable per-process limits and CPU affinity, observed
-// through the built binary (Tasks 1.4, 2.1, 2.2, 2.3, 5.1).
+// through the built binary (Tasks 1.4, 2.1, 2.2, 2.3, 4.1).
 //
 // Launch-refusal and --dry-run tests need no sandbox. Tests that look
 // inside the jail need bwrap with user + network namespaces and skip with
@@ -565,7 +565,7 @@ fn audit_record_carries_effective_rlimits_and_cpus() {
     assert_eq!(record["cpus"], cpu.as_str());
 }
 
-// ── Task 5.1 — supervisor and wrapper agree (round trip) ─────────────
+// ── Task 4.1 — supervisor and wrapper agree (round trip) ─────────────
 
 /// What the supervisor reports (--dry-run) is what the wrapper applies
 /// (/proc/self/limits inside), for every name and through every value
