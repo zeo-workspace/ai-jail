@@ -162,6 +162,9 @@ pub enum LimitSource {
     Default,
     Cli,
     Global,
+    /// A `--profile` table (integration only: profiles and rlimits live
+    /// on separate upstream branches).
+    Profile,
     Project,
 }
 
@@ -171,6 +174,7 @@ impl LimitSource {
             LimitSource::Default => "default",
             LimitSource::Cli => "cli",
             LimitSource::Global => "global",
+            LimitSource::Profile => "profile",
             LimitSource::Project => "project",
         }
     }

@@ -1531,7 +1531,16 @@ pub(crate) fn global_config_for_command_report(
                 &project_dir,
                 &format!("profile '{name}'"),
             );
+            let profile_limits: Vec<String> =
+                layer.rlimit.keys().cloned().collect();
             base = merge_trusted(base, layer);
+            // merge_trusted labels every trusted rlimit `global`; these
+            // came from the profile, and the dry run and the audit record
+            // must say so.
+            for key in profile_limits {
+                base.rlimit_source
+                    .insert(key, crate::sandbox::rlimits::LimitSource::Profile);
+            }
             Some(ProfileReport {
                 name: name.to_string(),
                 widenings: refusals
@@ -9828,6 +9837,8 @@ mod profile_story047_field_coverage_tests {
     /// cannot come from a file at all.
     const NEVER_WIDENS: &[&str] = &[
         "runtime_harnesses",
+        // Runtime-only provenance of each rlimit (`serde(skip)`).
+        "rlimit_source",
         "command",
         "hide_dotdirs",
         "mask",
@@ -9867,6 +9878,16 @@ mod profile_story047_field_coverage_tests {
             "[\"x.example\"]",
             "[4242]",
             "{ AJ047 = \"x.example\" }",
+            // Fields other fork branches add on integration: CPU lists,
+            // sizes, counts and the per-process rlimit table.
+            "\"0\"",
+            "\"0-1\"",
+            "\"1G\"",
+            "\"2G\"",
+            "1",
+            "2",
+            "{ nofile = \"1024\" }",
+            "{ nofile = \"unlimited\" }",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");

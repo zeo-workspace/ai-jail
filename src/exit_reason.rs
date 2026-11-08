@@ -130,6 +130,23 @@ impl LimitsInForce {
             ..LimitsInForce::default()
         }
     }
+
+    /// An explicit `--rlimit fsize` (story 047) is applied by the
+    /// in-sandbox wrapper, not by this process, so `read_back` cannot see
+    /// it. The wrapper inherits this process's hard limit and clamps to it
+    /// the same way (`rlimits::apply_one`), and an explicit limit it cannot
+    /// set fails the launch, so the value in force is the requested one
+    /// capped at that hard limit.
+    pub fn with_sandbox_file_size(mut self, requested: Option<u64>) -> Self {
+        if let Some(soft) = requested {
+            let hard = getrlimit(Resource::RLIMIT_FSIZE)
+                .map_or(nix::sys::resource::RLIM_INFINITY, |(_, hard)| hard);
+            let in_force = soft.min(hard);
+            self.file_size = (in_force != nix::sys::resource::RLIM_INFINITY)
+                .then_some(in_force);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1076,6 +1076,48 @@ $ ai-jail --profile agent-test --dry-run claude
 ⚠ profile=agent-test widens=allow_hosts granted="registry.npmjs.org"
 ```
 
+A profile also carries `cpus` and per-process `rlimit` values, and the
+dry run labels each limit it sets `source=profile`:
+
+```toml
+# ~/.config/ai-jail/config.toml
+allow_hosts = ["platform.claude.com"]
+
+[commands.claude]
+agent_state = true
+
+[profiles.agent-test]
+profile_version = 1
+allow_hosts = ["registry.npmjs.org", "api.example.com"]
+mask = ["/usr/bin/ssh", "/usr/bin/scp"]
+publish_ports = [8000]
+cpus = "8,24"
+[profiles.agent-test.rlimit]
+nproc = 2048
+nofile = 4096
+cpu = 600
+data = "8G"
+fsize = "1G"
+```
+
+```text
+$ ai-jail --profile agent-test --dry-run claude
+⚠ profile=agent-test widens=allow_hosts granted="registry.npmjs.org,api.example.com"
+⚠ profile=agent-test widens=publish_ports granted="8000"
+rlimit name=nproc soft=2048 hard=2048 source=profile
+rlimit name=nofile soft=4096 hard=4096 source=profile
+rlimit name=core soft=0 hard=0 source=default
+rlimit name=cpu soft=600 hard=605 source=profile
+rlimit name=fsize soft=1073741824 hard=1073741824 source=profile
+rlimit name=data soft=8589934592 hard=8589934592 source=profile
+cpus=8,24
+```
+
+`nofile = 4096` is below the default of 65536, so it tightens and prints no
+widening line; `cpus` narrows a base that set none. A profile `rlimit` above
+a default, or `cpus` outside a base set, prints `widens=rlimit` or
+`widens=cpus` like any other grant.
+
 Order: global base, then the command table, then the profile, then CLI flags,
 then the project's saved policy. Trust rules:
 

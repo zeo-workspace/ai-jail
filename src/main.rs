@@ -2444,6 +2444,15 @@ fn run(
         // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
         // internal clone() calls for namespace creation.
         let file_size_set = sandbox::rlimits::apply(config, cli.verbose)?;
+        // An explicit fsize is applied inside the sandbox, where the
+        // supervisor cannot read it back; the exit explanation gets it here.
+        let explicit_file_size = effective_limits
+            .iter()
+            .find(|l| {
+                l.name == sandbox::rlimits::RlimitName::Fsize
+                    && l.source != sandbox::rlimits::LimitSource::Default
+            })
+            .map(|l| l.soft);
 
         // Both spawn paths arm the report descriptor right before the fork
         // and close it right after.
@@ -2597,8 +2606,10 @@ fn run(
         // Also under --exec, where a harness otherwise sees only "137".
         let reason = exit_reason::classify_counted(
             &classified_status,
-            &resource_limits
-                .in_force(exit_reason::LimitsInForce::read_back(file_size_set)),
+            &resource_limits.in_force(
+                exit_reason::LimitsInForce::read_back(file_size_set)
+                    .with_sandbox_file_size(explicit_file_size),
+            ),
             counters.as_ref(),
         );
         if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT)
