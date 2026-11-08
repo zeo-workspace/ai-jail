@@ -2802,6 +2802,37 @@ mod tests {
         assert!(!response.contains(&placeholder), "{response}");
     }
 
+    /// The fixture's self-signed root is not in webpki-roots, so without
+    /// danger_extra_roots the handshake must fail and surface as a 502.
+    /// Guards the trust store across rustls/webpki bumps: a resolution
+    /// that silently accepted any chain would turn this into a 200.
+    #[test]
+    fn e2e_http_termination_rejects_an_unbundled_root_with_502() {
+        let fixture = tls_fixture();
+        let binding = crate::secret::SecretBinding::new(
+            "X_KEY",
+            "real-secret",
+            "127.0.0.1",
+        );
+        let placeholder = binding.placeholder.clone();
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        let proxy = Proxy::start(config, None).unwrap();
+
+        let request = format!(
+            "GET http://127.0.0.1:{fixture}/v1/test HTTP/1.1\r\n\
+             Host: 127.0.0.1:{fixture}\r\n\
+             x-test-key: {placeholder}\r\n\
+             \r\n"
+        );
+        let stream = connect_and_send(proxy.port(), request.as_bytes());
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(!response.contains("real-secret"), "{response}");
+    }
+
     #[test]
     fn e2e_http_termination_substitutes_only_the_matched_host_binding() {
         // Two bindings, KEY_A -> host A (the fixture) and KEY_B ->
