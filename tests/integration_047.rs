@@ -124,7 +124,10 @@ fn profile_widening_lines_name_every_new_field() {
         .lines()
         .find(|l| l.starts_with("rlimit name=nofile "))
         .unwrap_or_else(|| panic!("no nofile dry-run line: {all}"));
-    assert!(nofile.ends_with("source=profile"), "{nofile}");
+    // `unlimited` sits above the supervisor's own `nofile`, so the line
+    // also carries `ceiling=supervisor` after the source.
+    assert!(nofile.contains(" source=profile"), "{nofile}");
+    assert!(nofile.ends_with(" ceiling=supervisor"), "{nofile}");
 }
 
 #[test]
