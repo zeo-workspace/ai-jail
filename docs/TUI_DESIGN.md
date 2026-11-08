@@ -209,6 +209,9 @@ must still appear in the final `Complete effective access` review.
   the five-second `cpu` grace). Defaults are not listed there.
 - `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
   review shows it as `cpus=LIST`.
+- `--memory`, `--max-tasks` and `--cpu-quota` (`memory_max`, `max_tasks`,
+  `cpu_quota`): whole-sandbox cgroup limits, tighten-only, shown by
+  `--dry-run`.
 
 ## Plain-terminal fallback
 
