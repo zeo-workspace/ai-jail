@@ -86,6 +86,11 @@ pub(crate) struct ProxyConfig {
     /// tests can CONNECT to loopback fixture servers. Must never become
     /// settable from config or CLI in later phases.
     pub danger_allow_private: bool,
+    /// Test-only: resolve exactly this name to loopback instead of asking
+    /// the system resolver (tests/transparent_egress.rs needs a name that
+    /// no NSS module answers inside the sandbox). Same rule as
+    /// `danger_allow_private`: never config- or CLI-exposable.
+    pub danger_loopback_name: Option<String>,
     /// Shared audit-log handle (phase 5): when the launch audit log is
     /// on, each CONNECT appends a verdict record. The file is
     /// supervisor-side; the sandbox never sees it.
@@ -115,6 +120,7 @@ impl ProxyConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
             danger_allow_private: false,
+            danger_loopback_name: None,
             audit: None,
             secrets: Vec::new(),
             danger_extra_roots: Vec::new(),
@@ -498,7 +504,7 @@ fn handle_conn<S: ClientStream>(mut client: S, shared: Arc<Shared>) {
 
     // One resolution serves both the prompt and the dial (DNS pinning):
     // the addresses the user approves are the ones dialed.
-    let addrs = match resolve(&host, port) {
+    let addrs = match resolve_upstream(&host, port, &shared.config) {
         Ok(addrs) => addrs,
         Err(why) => {
             reject(&mut client, &why);
@@ -850,7 +856,25 @@ fn connect_upstream(
     port: u16,
     config: &ProxyConfig,
 ) -> Result<TcpStream, Reject> {
-    dial_resolved(host, &resolve(host, port)?, config, false)
+    dial_resolved(host, &resolve_upstream(host, port, config)?, config, false)
+}
+
+/// [`resolve`], except that the test-hooks fixture hostname resolves to
+/// loopback (tests/transparent_egress.rs). `danger_loopback_name` is
+/// `None` outside `test-hooks` and never config- or CLI-exposable.
+fn resolve_upstream(
+    host: &str,
+    port: u16,
+    config: &ProxyConfig,
+) -> Result<Vec<SocketAddr>, Reject> {
+    if config
+        .danger_loopback_name
+        .as_deref()
+        .is_some_and(|name| normalize_host(name) == normalize_host(host))
+    {
+        return Ok(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+    }
+    resolve(host, port)
 }
 
 fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, Reject> {

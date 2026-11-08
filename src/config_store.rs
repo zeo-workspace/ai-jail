@@ -1306,6 +1306,7 @@ enum DirectionalAuthority {
     DockerConfig,
     Kvm,
     PromptHosts,
+    TransparentEgress,
     Network,
     MacosHostIpc,
     MacosChromium,
@@ -1432,6 +1433,11 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     directional_policy!("docker_config", DockerConfig, "docker-credentials"),
     directional_policy!("kvm", Kvm, "kvm"),
     directional_policy!("prompt_hosts", PromptHosts, "interactive-host-prompt"),
+    directional_policy!(
+        "transparent_egress",
+        TransparentEgress,
+        "transparent-egress"
+    ),
     directional_policy!("network", Network, "unrestricted-network"),
     directional_policy!("macos_host_ipc", MacosHostIpc, "macos-host-ipc"),
     directional_policy!("macos_chromium", MacosChromium, "macos-chromium-ipc"),
@@ -1516,6 +1522,10 @@ impl DirectionalAuthority {
             Self::Kvm => c.kvm == Some(true) && b.kvm != Some(true),
             Self::PromptHosts => {
                 c.prompt_hosts == Some(true) && b.prompt_hosts != Some(true)
+            }
+            Self::TransparentEgress => {
+                c.transparent_egress == Some(true)
+                    && b.transparent_egress != Some(true)
             }
             Self::Network => c.network == Some(true) && b.network != Some(true),
             Self::MacosHostIpc => {
@@ -2439,6 +2449,7 @@ mod tests {
             docker_config: Some(false),
             kvm: Some(false),
             prompt_hosts: Some(false),
+            transparent_egress: Some(false),
             network: Some(false),
             macos_host_ipc: Some(false),
             macos_chromium: Some(false),
@@ -2482,6 +2493,7 @@ mod tests {
             docker_config: Some(true),
             kvm: Some(true),
             prompt_hosts: Some(true),
+            transparent_egress: Some(true),
             network: Some(true),
             macos_host_ipc: Some(true),
             macos_chromium: Some(true),

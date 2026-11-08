@@ -65,6 +65,8 @@ or integration rather than saved sandbox authority.
   by `--dry-run` as `rlimit name=… soft=… hard=… source=…`)
 - Filtered egress policy: `--allow-host`, `--allow-private-host`,
   `--prompt-hosts`, `--no-prompt-hosts`
+- Transparent egress for proxy-ignoring clients (Linux, fork-only):
+  `--transparent-egress`, `--no-transparent-egress`
 - Port bridges: `--forward-port`, `--publish-port`
 - Whole-sandbox resource limits (tighten only): `--memory`, `--max-tasks`,
   `--cpu-quota`
