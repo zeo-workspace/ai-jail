@@ -1910,8 +1910,10 @@ fn run(
     }
 
     // Every limit the sandbox will run under, computed once here so an
-    // impossible combination (e.g. above a --lockdown default) stops the
-    // launch before anything starts, dry run included.
+    // impossible combination (an explicit limit off Linux, a CPU set
+    // with no CPU left) stops the launch before anything starts, dry run
+    // included.
+    sandbox::rlimits::check_platform(config, cfg!(target_os = "linux"))?;
     let effective_limits = sandbox::rlimits::effective(config)?;
     sandbox::affinity::check_launch(
         config.cpus.as_deref(),
@@ -1927,6 +1929,15 @@ fn run(
                 limit.soft,
                 limit.hard,
                 limit.source.as_str()
+            ));
+        }
+        for (name, requested, ceiling) in
+            sandbox::rlimits::lockdown_clamps(config)
+        {
+            output::dry_run_line(&format!(
+                "rlimit name={} requested={requested} \
+                 lockdown_ceiling={ceiling}",
+                name.as_str()
             ));
         }
         if let Some(cpus) = &config.cpus {

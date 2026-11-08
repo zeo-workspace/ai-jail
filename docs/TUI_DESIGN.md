@@ -195,6 +195,21 @@ The interface is dense, restrained, and optimized for careful review.
 - Cancellation writes no onboarding grants and starts no harness. Terminal
   state is restored on success, cancellation, validation failure, and panic.
 
+## Advanced CLI/config-only controls
+
+Some controls deliberately have no onboarding control. They are advanced
+CLI/config-only options: precise numeric or per-host primitives where a
+checklist row would invite guessing a number, and where the right value
+depends on the machine rather than on the access being granted. Their effect
+must still appear in the final `Complete effective access` review.
+
+- `--rlimit NAME=VALUE` and the `[rlimit]` table: per-process resource limits.
+  The review lists each explicit limit as `rlimit NAME=SOFT/HARD (SOURCE)`,
+  with the values the sandbox applies (after a `--lockdown` clamp, and with
+  the five-second `cpu` grace). Defaults are not listed there.
+- `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
+  review shows it as `cpus=LIST`.
+
 ## Plain-terminal fallback
 
 `TERM=dumb` keeps the sequential text interface. Noninteractive execution

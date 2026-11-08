@@ -1324,6 +1324,11 @@ fn resolve_landlock_wrapper(
         // bridges.
         && config.forward_ports().is_empty()
         && config.publish_ports().is_empty()
+        // Explicit limits and the CPU set are applied only by the
+        // wrapper; skipping it would drop them while `--dry-run` and the
+        // audit record still report them.
+        && config.rlimit.is_empty()
+        && config.cpus.is_none()
     {
         return Ok(None);
     }
@@ -9047,21 +9052,16 @@ nameserver 8.8.8.8
     }
 }
 
-// Story 047, Task 4.1 — the limits the supervisor computes are the limits
-// the in-sandbox wrapper re-computes from its forwarded arguments (R8.1
-// producer/consumer shapes; design.md "Integration Points", rlimits).
+// The limits the supervisor computes are the limits the in-sandbox
+// wrapper re-computes from its forwarded arguments.
 //
-// Materialization: append this whole file to the end of
-// `src/sandbox/bwrap.rs` on `feat/adjustable-rlimits` (and keep it on
-// `integration`). Test names contain `roundtrip`.
-//
-// Contract: the wrapper builds its config as
+// The wrapper builds its config as
 // `config::merge(&cli, Config::default())` from the arguments after
 // `--landlock-exec` (as `run_landlock_exec` does today), so feeding those
 // arguments back through `cli::parse_from` must give the same
 // `rlimits::effective()` (name, soft, hard) as the supervisor's config.
 #[cfg(test)]
-mod story047_roundtrip_rlimits_tests {
+mod roundtrip_rlimits_tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -9158,5 +9158,66 @@ mod story047_roundtrip_rlimits_tests {
         let mut outer = base_config(&[("nofile", "1024")], false);
         outer.lockdown = Some(true);
         assert_eq!(triples(&reparsed(&outer)), triples(&outer));
+    }
+}
+
+// Explicit limits and `cpus` keep the in-sandbox wrapper.
+//
+// Explicit limits and the CPU set are applied only by the wrapper, so it
+// must run while any is set, even with Landlock, seccomp, the default
+// limits and the network all off; otherwise they are applied nowhere
+// while `--dry-run` and the audit record report them.
+#[cfg(test)]
+mod wrapper_gatefix_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Every control that keeps the wrapper on its own, turned off.
+    fn all_off() -> Config {
+        Config {
+            no_landlock: Some(true),
+            no_seccomp: Some(true),
+            no_rlimits: Some(true),
+            network: Some(false),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn gatefix_wrapper_still_skipped_when_nothing_needs_it() {
+        // Hostile half first: the fix must not keep the wrapper for a
+        // launch that has nothing for it to do.
+        let wrapper = resolve_landlock_wrapper(&all_off()).unwrap();
+        assert!(wrapper.is_none(), "{wrapper:?}");
+    }
+
+    #[test]
+    fn gatefix_wrapper_kept_for_an_explicit_limit_with_every_control_off() {
+        let config = Config {
+            rlimit: BTreeMap::from([("nofile".to_string(), "64".to_string())]),
+            ..all_off()
+        };
+        let wrapper = resolve_landlock_wrapper(&config).unwrap();
+        assert!(
+            wrapper.is_some(),
+            "--rlimit nofile=64 with every control off must keep the wrapper"
+        );
+        let args = landlock_wrapper_args(&config, &[], false);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--rlimit" && w[1] == "nofile=64"),
+            "the wrapper receives the limit: {args:?}"
+        );
+    }
+
+    #[test]
+    fn gatefix_wrapper_kept_for_cpus_with_every_control_off() {
+        let config = Config {
+            cpus: Some("0".into()),
+            ..all_off()
+        };
+        let wrapper = resolve_landlock_wrapper(&config).unwrap();
+        assert!(wrapper.is_some(), "--cpus 0 must keep the wrapper");
     }
 }

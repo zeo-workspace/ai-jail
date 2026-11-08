@@ -2707,6 +2707,28 @@ pub(crate) fn render_effective_access(
             lines.push(format!("- [WARN] ALLOWED: {label} {}; TCP access; exact listed ports; {effect}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")));
         }
     }
+    // `--rlimit` and `--cpus` have no onboarding control (advanced
+    // CLI/config-only, docs/TUI_DESIGN.md), so this review is where their
+    // effect is shown: the values the sandbox applies, not the text typed.
+    let explicit: Vec<_> = crate::sandbox::rlimits::effective(config)?
+        .into_iter()
+        .filter(|l| l.source != crate::sandbox::rlimits::LimitSource::Default)
+        .collect();
+    if !explicit.is_empty() || config.cpus.is_some() {
+        lines.push("Explicit resource limits and CPU set:".into());
+        for limit in explicit {
+            lines.push(format!(
+                "- rlimit {}={}/{} ({})",
+                limit.name.as_str(),
+                limit.soft,
+                limit.hard,
+                limit.source.as_str()
+            ));
+        }
+        if let Some(cpus) = &config.cpus {
+            lines.push(format!("- cpus={}", escape_control_bytes(cpus)));
+        }
+    }
     if config.env_pass.is_empty() {
         lines.push(
             "Environment names: none beyond the built-in safe allowlist".into(),

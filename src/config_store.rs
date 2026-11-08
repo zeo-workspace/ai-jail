@@ -1406,6 +1406,19 @@ macro_rules! directional_policy {
     };
 }
 
+/// Every `Config` field by its config name, from the exhaustive policy
+/// table, for the interface drift test.
+#[cfg(test)]
+pub(crate) fn config_field_names() -> Vec<&'static str> {
+    CONFIG_FIELD_POLICY
+        .iter()
+        .map(|item| match item {
+            ConfigFieldPolicy::Static { field, .. }
+            | ConfigFieldPolicy::Directional { field, .. } => *field,
+        })
+        .collect()
+}
+
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
     static_policy!("command", Authority, Command),
@@ -1860,7 +1873,13 @@ fn write_project_document(
     durable_write(path, body.as_bytes())?;
     let identity = &doc.project;
     let checked = read_project_document(path, identity)?;
-    if checked != *doc {
+    // `rlimit_source` is runtime-only (`#[serde(skip)]`): it is never
+    // written, so the read-back cannot carry it and must not be compared
+    // on it, or every policy holding an `rlimit` fails to verify.
+    let mut written = doc.clone();
+    written.grants.rlimit_source.clear();
+    written.constraints.rlimit_source.clear();
+    if checked != written {
         return Err(format!("Failed to verify {}", path.display()));
     }
     Ok(())
