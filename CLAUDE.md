@@ -29,6 +29,7 @@ src/
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
   command.rs      -- harness/ai-memory wrapper detection, effective command names
   fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
+  limits.rs       -- whole-sandbox limits (systemd user scope, CPU affinity) + exit report
 ```
 
 The onboarding UI contract is documented in `docs/TUI_DESIGN.md`. Keep its
