@@ -459,7 +459,8 @@ host user manager to run services.
 ai-jail always applies a few per-process limits (`nofile` 65536, `core` 0,
 `nproc` 4096; `nofile` 4096, `nproc` 1024 and `fsize` 1 GiB under
 `--lockdown`). `--rlimit NAME=VALUE` replaces one of them or adds another, and
-needs no privilege:
+needs no privilege. Explicit limits are Linux only: on other platforms the
+launch is refused rather than run without them.
 
 ```bash
 ai-jail --rlimit nofile=1024 --rlimit cpu=600 --dry-run claude
@@ -491,7 +492,10 @@ ai-jail --cpus 0-3 --dry-run claude
   value stops the launch.
 - `--dry-run` prints every effective limit as
   `rlimit name=<n> soft=<s> hard=<h> source=<default|cli|global|project>`, and
-  the audit log records the same set.
+  the audit log records the same set. These are the values the sandbox gets:
+  an explicit `core` or `nofile` above ai-jail's own default (`core` 0,
+  `nofile` 65536) cannot be raised past it, so the line shows the default and
+  adds `ceiling=supervisor`.
 
 `--cpus LIST` (`8,24`, `0-3`) pins the sandbox to those CPUs with CPU affinity,
 and the seccomp filter then refuses `sched_setaffinity`, so nothing inside can

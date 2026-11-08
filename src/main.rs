@@ -831,9 +831,9 @@ fn build_noninteractive_onboarding_effective(
     restrictions.trust_project_config.clear();
     restrictions.browser_profile = None;
     // `monotonic_project_constraints` keeps a stored project's limits as
-    // written (R3.17); this layer is the trusted global one, so only the
-    // limits that tighten the built-in defaults restrict the first run. A
-    // raised or `unlimited` global value is not a restriction (6.2 review).
+    // written; this layer is the trusted global one, so only the limits
+    // that tighten the built-in defaults restrict the first run. A raised
+    // or `unlimited` global value is not a restriction.
     // Compared against the defaults this launch runs under, lockdown's
     // included, so a value between the two defaults stays `default`.
     let defaults = config::Config {
@@ -1949,11 +1949,15 @@ fn run(
     // Handle dry run
     if cli.dry_run {
         for limit in &effective_limits {
+            let ceiling = limit
+                .ceiling
+                .map(|c| format!(" ceiling={}", c.as_str()))
+                .unwrap_or_default();
             output::dry_run_line(&format!(
-                "rlimit name={} soft={} hard={} source={}",
+                "rlimit name={} soft={} hard={} source={}{ceiling}",
                 limit.name.as_str(),
-                limit.soft,
-                limit.hard,
+                sandbox::rlimits::fmt_rlim(limit.soft),
+                sandbox::rlimits::fmt_rlim(limit.hard),
                 limit.source.as_str()
             ));
         }
@@ -1962,8 +1966,9 @@ fn run(
         {
             output::dry_run_line(&format!(
                 "rlimit name={} requested={requested} \
-                 lockdown_ceiling={ceiling}",
-                name.as_str()
+                 lockdown_ceiling={}",
+                name.as_str(),
+                sandbox::rlimits::fmt_rlim(ceiling)
             ));
         }
         if let Some(cpus) = &config.cpus {
@@ -3123,7 +3128,7 @@ mod tests {
 
     #[test]
     fn noninteractive_onboarding_drops_global_limits_that_raise_the_defaults() {
-        // 6.2 tech review: the global layer is trusted, not a restriction,
+        // The global layer is trusted, not a restriction,
         // so a raised or `unlimited` global limit must not become a
         // first-run project restriction; one that tightens still does.
         let global = Config {

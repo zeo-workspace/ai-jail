@@ -340,7 +340,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_rlimits: Option<bool>,
     /// Explicit per-process limits, `NAME = VALUE` in the `--rlimit`
-    /// grammar (story 047). A TOML integer is accepted and stored as its
+    /// grammar. A TOML integer is accepted and stored as its
     /// decimal string so every layer compares one representation.
     #[serde(
         default,
@@ -1921,9 +1921,9 @@ pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
 
 /// The well-formed `rlimit` entries of a stored policy, values verbatim.
 /// Storing does not judge a value against the built-in defaults: the
-/// launch merge applies it only where it tightens the trusted value
-/// (R3.9, R3.17). A malformed or unknown entry is dropped, as the launch
-/// merge would refuse it anyway.
+/// launch merge applies it only where it tightens the trusted value. A
+/// malformed or unknown entry is dropped, as the launch merge would
+/// refuse it anyway.
 pub(crate) fn well_formed_rlimits(
     rlimit: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
@@ -1939,7 +1939,7 @@ pub(crate) fn well_formed_rlimits(
 }
 
 /// Two stored project policies combined: per name, the smaller of the two
-/// well-formed values (R3.18). Merging one stored policy over another with
+/// well-formed values. Merging one stored policy over another with
 /// [`merge_with_global_report`] would compare against the built-in
 /// defaults and drop a value between the default and the trusted value.
 pub(crate) fn tighter_project_rlimits(
@@ -1969,7 +1969,7 @@ pub(crate) fn tighter_project_rlimits(
 /// merge itself keeps auto-save and loading from drifting apart when a
 /// capability is added. `rlimit` is the exception: the default baseline
 /// would drop a value above the built-in default that the launch merge,
-/// against the trusted value, applies (R3.18).
+/// against the trusted value, applies.
 pub(crate) fn monotonic_project_constraints(
     config: &Config,
     project_dir: &Path,
@@ -2571,9 +2571,8 @@ pub fn project_config_for_auto_save(
 
     // The project's own limits are saved as they are. Filtering them
     // against the built-in defaults erased a value between the default and
-    // a raised trusted value, which the launch merge had just applied
-    // (second upstream gate, R3.17); that merge stays the only
-    // tighten-only decision (R3.9).
+    // a raised trusted value, which the launch merge had just applied.
+    // That merge stays the only tighten-only decision.
     to_save.rlimit = well_formed_rlimits(&to_save.rlimit);
     to_save.rlimit_source.clear();
 
@@ -8716,7 +8715,7 @@ mod rlimit_auto_save_tests {
 // The merge report is read through `Debug`, so these tests hold for
 // `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
 #[cfg(test)]
-mod config_gatefix_rlimit_tests {
+mod config_explicit_rlimit_tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -8741,7 +8740,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_auto_save_never_writes_cli_rlimit_or_cpus() {
+    fn auto_save_never_writes_cli_rlimit_or_cpus() {
         let args = cli(&["--rlimit", "nofile=1024", "--cpus", "0", "bash"]);
         let saved = auto_save(&args, Config::default());
         assert!(saved.rlimit.is_empty(), "{:?}", saved.rlimit);
@@ -8750,7 +8749,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_auto_save_keeps_only_the_project_policy_own_rlimit_and_cpus() {
+    fn auto_save_keeps_only_the_project_policy_own_rlimit_and_cpus() {
         let project = Config {
             rlimit: rl(&[("nofile", "512")]),
             cpus: Some("0-3".into()),
@@ -8770,7 +8769,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_trusted_cpus_that_parses_loads() {
+    fn trusted_cpus_that_parses_loads() {
         // Hostile half first: valid lists in the base and in a command
         // table are not refused.
         let global = parse_global_toml(
@@ -8781,7 +8780,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_malformed_trusted_cpus_is_refused_at_load_naming_the_layer() {
+    fn malformed_trusted_cpus_is_refused_at_load_naming_the_layer() {
         let base = parse_global_toml("cpus = \"0-3x\"\n");
         let err = base.expect_err("a malformed global cpus must not load");
         assert!(err.contains("cpus") && err.contains("0-3x"), "{err}");
@@ -8792,7 +8791,7 @@ mod config_gatefix_rlimit_tests {
         assert!(err.contains("cpus") && err.contains("8-x"), "{err}");
 
         let dir = std::env::temp_dir()
-            .join(format!("ai-jail-gatefix-cpus-{}", std::process::id()));
+            .join(format!("ai-jail-explicit-cpus-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -8805,7 +8804,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_tighten_cpus_keeps_a_malformed_trusted_value() {
+    fn tighten_cpus_keeps_a_malformed_trusted_value() {
         use crate::sandbox::affinity::{check_launch, tighten_cpus};
         // A valid project list must not replace a trusted list that does
         // not parse: the launch has to fail closed on the trusted text.
@@ -8817,7 +8816,7 @@ mod config_gatefix_rlimit_tests {
     }
 
     #[test]
-    fn gatefix_project_cpus_overlap_is_reported_as_narrowed_to_the_set() {
+    fn project_cpus_overlap_is_reported_as_narrowed_to_the_set() {
         let trusted = Config {
             cpus: Some("0-7".into()),
             ..Config::default()
@@ -8844,25 +8843,24 @@ mod config_gatefix_rlimit_tests {
     }
 }
 
-// Task 6.2 — the project's own limit survives save and migration
-// (R3.17, R3.18, R3.9). Appended to `src/config.rs`.
+// The project's own limit survives save and migration.
 //
-// The case the second upstream gate measured (6.1 tech review, finding 2):
+// The case that used to fail:
 // a trusted `nproc = 8192` raised above the built-in default (4096) and a
 // project `nproc = 6000` between the two. The launch merge applies 6000;
 // saving or migrating the project policy must keep it, or the next launch
 // silently runs at 8192.
 //
 // - Auto-save keeps every well-formed project `rlimit` entry, including a
-//   value above the built-in default (R3.17).
-// - The legacy-file migration projection keeps it too (R3.18).
+//   value above the built-in default.
+// - The legacy-file migration projection keeps it too.
 // - Keeping a value is not applying it: a project value that raises the
 //   trusted limit is still stored, and still ignored, with a warning, at
-//   launch (R3.9). The launch merge stays the only tighten-only decision.
+//   launch. The launch merge stays the only tighten-only decision.
 // The merge report is read through `Debug`, so these tests hold for
 // `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
 #[cfg(test)]
-mod config_gatefix2_rlimit_tests {
+mod config_project_rlimit_save_tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -8883,7 +8881,7 @@ mod config_gatefix2_rlimit_tests {
         }
     }
 
-    /// The trusted layer the gate used: `nproc` raised above the default.
+    /// The trusted layer of the failing case: `nproc` raised above the default.
     fn trusted() -> Config {
         nproc("8192")
     }
@@ -8920,7 +8918,7 @@ mod config_gatefix2_rlimit_tests {
     }
 
     #[test]
-    fn gatefix2_auto_save_keeps_a_project_nproc_between_default_and_trusted() {
+    fn auto_save_keeps_a_project_nproc_between_default_and_trusted() {
         // The launch applies the project's 6000 under the trusted 8192.
         let (first, _) = launch(nproc("6000"));
         assert_project_nproc(&first, "6000", "first launch");
@@ -8940,7 +8938,7 @@ mod config_gatefix2_rlimit_tests {
     }
 
     #[test]
-    fn gatefix2_migration_keeps_a_project_nproc_between_default_and_trusted() {
+    fn migration_keeps_a_project_nproc_between_default_and_trusted() {
         // What the legacy-file migration writes as the project constraints.
         let projected = monotonic_project_constraints(
             &nproc("6000"),
@@ -8958,8 +8956,8 @@ mod config_gatefix2_rlimit_tests {
     }
 
     #[test]
-    fn gatefix2_auto_save_still_stores_a_raising_project_nproc() {
-        // R3.17 keeps every well-formed entry: the save does not judge
+    fn auto_save_still_stores_a_raising_project_nproc() {
+        // Saving keeps every well-formed entry: the save does not judge
         // the value, the launch does (next test).
         let saved = auto_save(nproc("9000"));
         assert_eq!(
@@ -8971,7 +8969,7 @@ mod config_gatefix2_rlimit_tests {
     }
 
     #[test]
-    fn gatefix2_raising_project_nproc_is_still_ignored_at_launch() {
+    fn raising_project_nproc_is_still_ignored_at_launch() {
         // Guard: keeping a raising value on disk must never let it apply.
         let (merged, warnings) = launch(nproc("9000"));
         assert_eq!(
