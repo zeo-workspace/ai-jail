@@ -214,6 +214,8 @@ fn announce(section: &TeardownSection) {
             ));
         }
         TeardownSection::Inactive => {}
+        #[cfg(test)]
+        TeardownSection::Unsupported => {}
     }
 }
 

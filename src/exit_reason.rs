@@ -35,13 +35,31 @@ pub enum Termination {
     Signaled { signal: i32, core: bool },
 }
 
-/// How the status was learned: an exit code taken as it is, a 128+N
+/// How the status was learned: an exit code taken as it is, the
+/// in-sandbox wrapper's report of the command's own status, a 128+N
 /// decode of an exit code, or `waitpid` itself seeing a signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusSource {
     ExitCode,
+    /// The wrapper reported it from inside the sandbox; nothing else
+    /// builds this.
+    Reported,
     Inferred,
     Direct,
+    /// Nothing observed an end: the command never started.
+    Unobserved,
+}
+
+impl StatusSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            StatusSource::ExitCode => "exit-code",
+            StatusSource::Reported => "reported",
+            StatusSource::Inferred => "inferred",
+            StatusSource::Direct => "direct",
+            StatusSource::Unobserved => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,11 +128,31 @@ pub enum Limit {
     FileSize,
 }
 
+impl Limit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Limit::FileSize => "file-size",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonKind {
     Exited,
     Signaled,
     Limit,
+    StartFailed,
+}
+
+impl ReasonKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReasonKind::Exited => "exited",
+            ReasonKind::Signaled => "signaled",
+            ReasonKind::Limit => "limit",
+            ReasonKind::StartFailed => "start-failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +164,8 @@ pub struct ExitReason {
     pub limit: Option<Limit>,
     pub evidence: Option<String>,
     pub source: StatusSource,
+    /// The startup error of a sandbox that never ran.
+    pub error: Option<String>,
 }
 
 /// Decode 129..=192 as `128 + signal`, marked inferred, where the host
@@ -168,6 +208,22 @@ pub fn classify(status: &ChildStatus, limits: &LimitsInForce) -> ExitReason {
         limit,
         evidence,
         source: status.source,
+        error: None,
+    }
+}
+
+/// A sandbox that never started. The code is the one `main` returns for
+/// that error, so the summary and the process agree.
+pub fn start_failed(error: &str) -> ExitReason {
+    ExitReason {
+        code: crate::error_exit_code(error),
+        signal: None,
+        core_dumped: false,
+        kind: ReasonKind::StartFailed,
+        limit: None,
+        evidence: None,
+        source: StatusSource::Unobserved,
+        error: Some(error.to_string()),
     }
 }
 
@@ -175,7 +231,10 @@ impl ExitReason {
     /// The one stderr line, or `None` when there is nothing to say: a
     /// normal exit, or a deliberate signal no limit explains.
     pub fn explanation(&self) -> Option<String> {
-        if self.kind == ReasonKind::Exited || self.is_deliberate_signal() {
+        // A start failure is already reported by `main`'s error path.
+        if matches!(self.kind, ReasonKind::Exited | ReasonKind::StartFailed)
+            || self.is_deliberate_signal()
+        {
             return None;
         }
         let signal = self.signal.map(|s| {
@@ -208,6 +267,20 @@ impl ExitReason {
             "sandbox exited with {}: {detail}{core}{inferred}",
             self.code
         ))
+    }
+
+    /// The `exit` section of the run summary.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": self.code,
+            "signal": self.signal.map(signal_name),
+            "core_dumped": self.core_dumped,
+            "reason": self.kind.as_str(),
+            "limit": self.limit.map(Limit::as_str),
+            "evidence": self.evidence,
+            "status_source": self.source.as_str(),
+            "error": self.error,
+        })
     }
 
     /// A signal a limit explains is never silenced, whatever it is.
@@ -896,5 +969,120 @@ mod tests {
         if hard_before >= GIB {
             assert!(mentions_one_gib(&line), "the lockdown value: {line}");
         }
+    }
+
+    // ── the run summary's exit section ──────────────────────────
+
+    #[test]
+    fn inferred_status_is_marked_inferred_in_json() {
+        let reason = classify(&from_exit_code(137, LINUX), &no_limits());
+        let json = reason.to_json();
+        assert_eq!(json["status_source"], "inferred", "{json}");
+        assert_eq!(json["signal"], "SIGKILL", "{json}");
+    }
+
+    #[test]
+    fn sigxcpu_names_no_limit_in_json() {
+        // ai-jail sets no CPU-time limit: the summary names the signal and
+        // leaves `limit` and `evidence` null.
+        let r = classify(&signaled(24, StatusSource::Inferred), &no_limits());
+        let json = r.to_json();
+        assert_eq!(json["reason"], "signaled", "{json}");
+        assert_eq!(json["signal"], "SIGXCPU", "{json}");
+        assert!(json["limit"].is_null(), "{json}");
+        assert!(json["evidence"].is_null(), "{json}");
+        assert_eq!(r.code, 152);
+    }
+
+    #[test]
+    fn sigxfsz_without_the_ceiling_names_no_limit_in_json() {
+        // With no file-size limit in force (no --lockdown, or rlimits off)
+        // neither the line nor the summary claims one.
+        let r = classify(&signaled(25, StatusSource::Inferred), &no_limits());
+        let json = r.to_json();
+        assert!(json["limit"].is_null(), "{json}");
+        assert!(json["evidence"].is_null(), "{json}");
+        let line = r.explanation().expect("explained");
+        assert!(line.contains("SIGXFSZ"), "{line}");
+        assert!(!mentions_one_gib(&line), "value not in force: {line}");
+    }
+
+    #[test]
+    fn sigxfsz_names_the_file_size_value_in_force() {
+        let limits = LimitsInForce {
+            file_size: Some(GIB),
+        };
+        let r = classify(&signaled(25, StatusSource::Reported), &limits);
+        assert!(matches!(r.limit, Some(Limit::FileSize)));
+        let line = r.explanation().expect("explained");
+        assert!(line.contains("SIGXFSZ"), "{line}");
+        assert!(mentions_one_gib(&line), "names the value: {line}");
+        let json = r.to_json();
+        assert_eq!(json["limit"], "file-size");
+        // #247: the value is the one ai-jail configured, not a limit
+        // the status proves was reached.
+        let evidence = json["evidence"].as_str().unwrap_or_default();
+        assert!(evidence.contains("set by ai-jail"), "{json}");
+        assert!(!evidence.contains("reached"), "{json}");
+        assert_eq!(r.code, 153);
+    }
+
+    #[test]
+    fn to_json_has_exactly_the_exit_section_fields() {
+        let status = ChildStatus {
+            termination: Termination::Signaled {
+                signal: 11,
+                core: true,
+            },
+            source: StatusSource::Direct,
+        };
+        let json = classify(&status, &no_limits()).to_json();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "code",
+                "core_dumped",
+                "error",
+                "evidence",
+                "limit",
+                "reason",
+                "signal",
+                "status_source"
+            ]
+        );
+        assert_eq!(json["code"], 139);
+        assert_eq!(json["core_dumped"], true);
+        assert_eq!(json["signal"], "SIGSEGV");
+        assert_eq!(json["reason"], "signaled");
+        assert_eq!(json["status_source"], "direct");
+        assert!(json["limit"].is_null());
+        assert!(json["error"].is_null());
+
+        let clean = classify(&exited(0), &no_limits()).to_json();
+        assert_eq!(clean["reason"], "exited");
+        assert_eq!(clean["status_source"], "exit-code");
+        assert!(clean["signal"].is_null());
+        assert_eq!(clean["core_dumped"], false);
+    }
+
+    #[test]
+    fn start_failed_carries_the_startup_error() {
+        let r = start_failed("Failed to start sandbox: boom");
+        assert!(matches!(r.kind, ReasonKind::StartFailed));
+        let json = r.to_json();
+        assert_eq!(json["reason"], "start-failed");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Failed to start sandbox: boom")),
+            "{json}"
+        );
     }
 }
