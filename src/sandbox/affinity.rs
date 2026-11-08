@@ -83,9 +83,15 @@ pub fn tighten_cpus(
                 let dropped = both != ls;
                 (Some(format_cpu_list(&both)), dropped)
             }
-            // A value that does not parse is kept so the launch fails
-            // closed at `check_launch` instead of dropping policy.
-            _ => (Some(l), false),
+            // A trusted value that does not parse is kept so the launch
+            // fails closed at `check_launch`: a valid project value must
+            // never stand in for it.
+            // Not the project's fault: `check_launch` names the trusted
+            // value when it refuses.
+            (Err(_), _) => (Some(b), false),
+            // A project value that does not parse is kept for the same
+            // reason: dropping it would silently widen its own policy.
+            (Ok(_), Err(_)) => (Some(l), false),
         },
     }
 }
@@ -168,22 +174,17 @@ pub fn apply_cpus(cpus: &BTreeSet<usize>) -> Result<(), String> {
         .map_err(|e| format!("cannot set CPU affinity: {e}"))
 }
 
-// Story 047, Task 2.1 — `--cpus` moved into `src/sandbox/affinity.rs`
-// (R4.1, R4.3, R4.5, R4.6).
+// `--cpus`: parsing, formatting, validation and project narrowing.
 //
-// Materialization: append this whole file to the end of the new
-// `src/sandbox/affinity.rs` on `feat/adjustable-rlimits`.
-//
-// Contract: the functions move verbatim from `feat/resource-limits`
-// `src/limits.rs` (design.md §C7), so their signatures are the contract:
+// The signatures are shared with `feat/resource-limits`' `src/limits.rs`:
 // `parse_cpu_list(&str) -> Result<BTreeSet<usize>, String>`,
 // `format_cpu_list(&BTreeSet<usize>) -> String`,
 // `validate_cpus(&BTreeSet<usize>) -> Result<(), String>`,
 // `tighten_cpus(Option<String>, Option<String>) -> (Option<String>, bool)`.
-// The empty-intersection refusal of R4.5 is asserted at launch level in
+// The empty-intersection refusal is asserted at launch level in
 // `tests/rlimit_values.rs`, not here.
 #[cfg(test)]
-mod story047_affinity_tests {
+mod affinity_tests {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -245,11 +246,11 @@ mod story047_affinity_tests {
 
     #[test]
     fn affinity_code_carries_no_privileged_path() {
-        // R4.6: no systemd-run, sudo, setuid helper or cgroup write.
+        // no systemd-run, sudo, setuid helper or cgroup write.
         let src = include_str!("affinity.rs");
         let code: String = src
             .lines()
-            .take_while(|l| !l.contains("mod story047_affinity_tests"))
+            .take_while(|l| !l.contains("mod affinity_tests"))
             .collect::<Vec<_>>()
             .join("\n");
         for needle in ["systemd-run", "\"sudo\"", "/sys/fs/cgroup", "setuid("] {

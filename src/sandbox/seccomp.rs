@@ -471,17 +471,13 @@ mod tests {
     }
 }
 
-// Story 047, Task 2.1 — the seccomp lock that makes `--cpus` binding
-// (R4.2; design.md Security Considerations, "Affinity lock").
+// The seccomp lock that makes `--cpus` binding.
 //
-// Materialization: append this whole file to the end of
-// `src/sandbox/seccomp.rs` on `feat/adjustable-rlimits`.
-//
-// Contract: `Config.cpus: Option<String>`; `compile_filter(&Config)`
+// `Config.cpus: Option<String>`; `compile_filter(&Config)`
 // (existing) denies `sched_setaffinity` only when `cpus` is set, never
 // denies `sched_getaffinity`, and keeps every io_uring syscall denied.
 #[cfg(test)]
-mod story047_seccomp_tests {
+mod seccomp_tests {
     use super::*;
 
     fn filter_names(config: &Config, nr: i64) -> bool {
