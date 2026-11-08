@@ -351,7 +351,7 @@ pub(crate) struct LaunchRecord<'a> {
     pub profile: Option<&'a crate::config::ProfileReport>,
     pub exit_code: i32,
     pub duration: std::time::Duration,
-    /// Every limit the sandbox ran under (story 047); omitted when empty.
+    /// Every limit the sandbox ran under; omitted when empty.
     pub rlimits: &'a [crate::sandbox::rlimits::EffectiveLimit],
     /// The `--cpus` set, when one was given; omitted otherwise.
     pub cpus: Option<&'a str>,
@@ -1049,6 +1049,7 @@ mod tests {
             soft: 60,
             hard: 65,
             source: LimitSource::Cli,
+            ceiling: None,
         }];
         let new = launch_record(&base(&limits, Some("0-3")));
         assert_eq!(new["rlimits"][0]["name"], "cpu");

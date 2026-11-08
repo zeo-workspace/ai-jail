@@ -55,15 +55,23 @@ impl RlimitName {
         }
     }
 
-    pub fn resource(self) -> Resource {
+    /// `None` where the platform has no such resource: nix defines
+    /// `RLIMIT_NPROC` for Linux and the BSDs but not for macOS. Off Linux
+    /// nothing reaches it anyway — the `nproc` default is Linux-only and
+    /// explicit limits are refused there — so `None` is a failure path,
+    /// never a silent skip.
+    pub fn resource(self) -> Option<Resource> {
         match self {
-            RlimitName::Nproc => Resource::RLIMIT_NPROC,
-            RlimitName::Nofile => Resource::RLIMIT_NOFILE,
-            RlimitName::Core => Resource::RLIMIT_CORE,
-            RlimitName::Cpu => Resource::RLIMIT_CPU,
-            RlimitName::Fsize => Resource::RLIMIT_FSIZE,
-            RlimitName::Data => Resource::RLIMIT_DATA,
-            RlimitName::As => Resource::RLIMIT_AS,
+            #[cfg(target_os = "linux")]
+            RlimitName::Nproc => Some(Resource::RLIMIT_NPROC),
+            #[cfg(not(target_os = "linux"))]
+            RlimitName::Nproc => None,
+            RlimitName::Nofile => Some(Resource::RLIMIT_NOFILE),
+            RlimitName::Core => Some(Resource::RLIMIT_CORE),
+            RlimitName::Cpu => Some(Resource::RLIMIT_CPU),
+            RlimitName::Fsize => Some(Resource::RLIMIT_FSIZE),
+            RlimitName::Data => Some(Resource::RLIMIT_DATA),
+            RlimitName::As => Some(Resource::RLIMIT_AS),
         }
     }
 
@@ -180,12 +188,37 @@ impl LimitSource {
     }
 }
 
+/// What lowered an explicit value below the one asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitCeiling {
+    Supervisor,
+}
+
+impl LimitCeiling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LimitCeiling::Supervisor => "supervisor",
+        }
+    }
+}
+
+/// A limit value as the operator types it: `RLIM_INFINITY` is
+/// `unlimited`, which `--rlimit` accepts back; a 20-digit number is not.
+pub fn fmt_rlim(v: u64) -> String {
+    if v == nix::libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
 /// One limit as it will be applied inside the sandbox.
 pub struct EffectiveLimit {
     pub name: RlimitName,
     pub soft: u64,
     pub hard: u64,
     pub source: LimitSource,
+    pub ceiling: Option<LimitCeiling>,
 }
 
 /// The defaults ai-jail has always applied. `nproc` is applied only
@@ -275,14 +308,39 @@ pub fn check_platform(config: &Config, linux: bool) -> Result<(), String> {
     Err("explicit limits (--rlimit, rlimit) are Linux only".into())
 }
 
+/// The hard limit the sandbox inherits from the supervisor for `name`.
+/// `apply` pins the supervisor's `core` and `nofile` defaults with hard
+/// equal to soft, and an unprivileged process cannot raise a hard limit,
+/// so an explicit value above them can never take effect in the sandbox.
+fn supervisor_ceiling(config: &Config, name: RlimitName) -> Option<u64> {
+    if !matches!(name, RlimitName::Core | RlimitName::Nofile) {
+        return None;
+    }
+    supervisor_limits(config)
+        .into_iter()
+        .find(|limit| limit.name == name)
+        .map(|limit| limit.hard)
+}
+
+/// The value an explicit entry asked for, before any clamp. Only the
+/// in-sandbox wrapper reports clamps, and it exists on Linux alone.
+#[cfg(target_os = "linux")]
+fn requested_value(config: &Config, name: RlimitName) -> Option<u64> {
+    let text = config.rlimit.get(name.as_str())?;
+    RlimitValue::parse(name, text).ok().map(RlimitValue::as_raw)
+}
+
 /// Every limit that applies inside the sandbox: the defaults (unless
 /// `--no-rlimits`), each replaced by an explicit value of the same name,
 /// plus the explicit values that have no default.
 pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
-    let mut chosen: BTreeMap<RlimitName, (u64, LimitSource)> = BTreeMap::new();
+    let mut chosen: BTreeMap<
+        RlimitName,
+        (u64, LimitSource, Option<LimitCeiling>),
+    > = BTreeMap::new();
     if config.rlimits_enabled() {
         for (name, soft) in default_limits(config) {
-            chosen.insert(name, (soft, LimitSource::Default));
+            chosen.insert(name, (soft, LimitSource::Default, None));
         }
     }
     for (key, text) in &config.rlimit {
@@ -296,16 +354,24 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
             Some(ceiling) => ceiling,
             None => value,
         };
+        // Report what the sandbox gets, not what was asked: the dry run
+        // and the audit record must agree with the launch.
+        let (value, ceiling) = match supervisor_ceiling(config, name) {
+            Some(ceiling) if value > ceiling => {
+                (ceiling, Some(LimitCeiling::Supervisor))
+            }
+            _ => (value, None),
+        };
         let source = config
             .rlimit_source
             .get(key)
             .copied()
             .unwrap_or(LimitSource::Cli);
-        chosen.insert(name, (value, source));
+        chosen.insert(name, (value, source, ceiling));
     }
     Ok(chosen
         .into_iter()
-        .map(|(name, (soft, source))| EffectiveLimit {
+        .map(|(name, (soft, source, ceiling))| EffectiveLimit {
             name,
             soft,
             // RLIMIT_CPU: at the soft limit the kernel sends SIGXCPU, at
@@ -318,6 +384,7 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
                 soft
             },
             source,
+            ceiling,
         })
         .collect())
 }
@@ -382,7 +449,10 @@ fn apply_one(
             Ok(false)
         }
     };
-    let current_hard = match getrlimit(limit.name.resource()) {
+    let Some(resource) = limit.name.resource() else {
+        return fail(format!("{label} is not available on this platform"));
+    };
+    let current_hard = match getrlimit(resource) {
         Ok((_, hard)) => hard,
         Err(e) => return fail(format!("Failed to read {label}: {e}")),
     };
@@ -401,8 +471,10 @@ fn apply_one(
             String::new()
         };
         output::warn(&format!(
-            "{label}: requested {}, hard limit {current_hard}, applied {soft}{grace}",
-            limit.soft
+            "{label}: requested {}, hard limit {}, applied {}{grace}",
+            fmt_rlim(limit.soft),
+            fmt_rlim(current_hard),
+            fmt_rlim(soft)
         ));
     } else if explicit
         && limit.name == RlimitName::Cpu
@@ -412,16 +484,22 @@ fn apply_one(
         // The soft limit fits, but the host hard limit eats the grace that
         // keeps SIGXCPU ahead of SIGKILL.
         output::warn(&format!(
-            "{label}: requested soft {soft}, hard limit {current_hard} \
+            "{label}: requested soft {}, hard limit {} \
              leaves {} s of the 5 s grace before SIGKILL",
+            fmt_rlim(soft),
+            fmt_rlim(current_hard),
             hard.saturating_sub(soft)
         ));
     }
-    if let Err(e) = setrlimit(limit.name.resource(), soft, hard) {
+    if let Err(e) = setrlimit(resource, soft, hard) {
         return fail(format!("Failed to set {label}: {e}"));
     }
     if verbose {
-        output::verbose(&format!("{label}: {soft} (hard: {hard})"));
+        output::verbose(&format!(
+            "{label}: {} (hard: {})",
+            fmt_rlim(soft),
+            fmt_rlim(hard)
+        ));
     }
     Ok(true)
 }
@@ -430,13 +508,16 @@ fn apply_one(
 /// holds the PTY loop, the egress proxy with its secret substitution, and
 /// the audit writer. Only defaults, with hard pinned to soft:
 ///
-/// - `core` and `nofile` always: an explicit value for them is the
-///   sandbox's alone. Skipping them let `--rlimit core=0` leave the
-///   supervisor dumpable, with the proxy's secrets in a core file (second
-///   upstream gate, R3.19).
-/// - `fsize` (lockdown) only when no explicit value replaces it; an
-///   explicit `cpu`, `fsize`, `data` or `as` on the supervisor would kill
-///   or cap it and orphan the sandbox.
+/// - `core`, `nofile` and lockdown's `fsize` always: an explicit value for
+///   them is the sandbox's alone. Dropping a default because an explicit
+///   value exists would loosen the supervisor — `--rlimit core=0` left it
+///   dumpable, with the proxy's secrets in a core file, and any explicit
+///   `fsize` removed lockdown's 1 GiB. Keeping them never caps the
+///   wrapper: an explicit value is at most the default (lockdown clamps
+///   it), and a process can always lower its own limit.
+/// - never an explicit `cpu`, `data` or `as`, and no default exists for
+///   them: on the supervisor they would kill or cap it and orphan the
+///   sandbox.
 /// - never `nproc`, which counts against bwrap's own clone(); see
 ///   `apply_sandbox`.
 pub fn supervisor_limits(config: &Config) -> Vec<EffectiveLimit> {
@@ -446,18 +527,18 @@ pub fn supervisor_limits(config: &Config) -> Vec<EffectiveLimit> {
     default_limits(config)
         .into_iter()
         .filter(|(name, _)| match name {
-            RlimitName::Core | RlimitName::Nofile => true,
+            RlimitName::Core | RlimitName::Nofile | RlimitName::Fsize => true,
             RlimitName::Nproc => false,
-            RlimitName::Cpu
-            | RlimitName::Fsize
-            | RlimitName::Data
-            | RlimitName::As => !config.rlimit.contains_key(name.as_str()),
+            RlimitName::Cpu | RlimitName::Data | RlimitName::As => {
+                !config.rlimit.contains_key(name.as_str())
+            }
         })
         .map(|(name, soft)| EffectiveLimit {
             name,
             soft,
             hard: soft,
             source: LimitSource::Default,
+            ceiling: None,
         })
         .collect()
 }
@@ -480,9 +561,9 @@ pub fn apply(config: &Config, verbose: bool) -> Result<bool, String> {
     }
     let mut file_size_set = false;
     for limit in supervisor_limits(config) {
-        // A `core`/`nofile` default kept under an explicit value of the
-        // same name is clamped silently here: the wrapper reports that
-        // name's clamp, once per launch (R3.15).
+        // A default kept under an explicit value of the same name is
+        // clamped silently here: the wrapper reports that name's clamp, so
+        // each clamp is reported once per launch.
         let shadowed = config.rlimit.contains_key(limit.name.as_str());
         if apply_one(&limit, !shadowed, verbose)?
             && limit.name == RlimitName::Fsize
@@ -512,18 +593,44 @@ pub fn apply_sandbox(config: &Config, verbose: bool) -> Result<(), String> {
         if let Some((_, requested, ceiling)) =
             clamps.iter().find(|(name, ..)| *name == limit.name)
         {
-            let host = getrlimit(limit.name.resource())
+            let host = limit
+                .name
+                .resource()
+                .and_then(|r| getrlimit(r).ok())
                 .map_or(*ceiling, |(_, hard)| hard);
             let applied = (*ceiling).min(host);
             let note = if applied < *ceiling {
-                format!(", hard limit {host}")
+                format!(", hard limit {}", fmt_rlim(host))
             } else {
                 String::new()
             };
             output::warn(&format!(
                 "RLIMIT_{}: requested {requested}, --lockdown allows \
-                 {ceiling}{note}, applied {applied}",
-                limit.name.as_str().to_uppercase()
+                 {}{note}, applied {}",
+                limit.name.as_str().to_uppercase(),
+                fmt_rlim(*ceiling),
+                fmt_rlim(applied)
+            ));
+            apply_one(&limit, false, verbose)?;
+            continue;
+        }
+        // `effective` already lowered this value to the supervisor's hard
+        // limit, so `apply_one` would see nothing to clamp: name the value
+        // the operator asked for here, once.
+        if limit.ceiling.is_some() {
+            let requested =
+                requested_value(config, limit.name).unwrap_or(limit.soft);
+            let host = limit
+                .name
+                .resource()
+                .and_then(|r| getrlimit(r).ok())
+                .map_or(limit.hard, |(_, hard)| hard);
+            output::warn(&format!(
+                "RLIMIT_{}: requested {}, hard limit {}, applied {}",
+                limit.name.as_str().to_uppercase(),
+                fmt_rlim(requested),
+                fmt_rlim(host),
+                fmt_rlim(limit.soft.min(host))
             ));
             apply_one(&limit, false, verbose)?;
             continue;
@@ -771,7 +878,7 @@ mod grammar_tests {
     #[test]
     fn names_outside_the_set_are_refused() {
         // Near misses first: each looks like a limit but is not one of
-        // the seven the story offers.
+        // the seven `--rlimit` accepts.
         for text in ["nprocs", "rss", "stack", "memlock", "nice", "", " nofile"]
         {
             assert!(
@@ -1119,7 +1226,7 @@ mod effective_tests {
 // Warnings are read from a child test process, because lowering a hard
 // limit cannot be undone (the pattern of `clamping_child`).
 #[cfg(test)]
-mod rlimit_gatefix_tests {
+mod rlimit_explicit_tests {
     use std::collections::BTreeMap;
 
     use super::*;
@@ -1127,7 +1234,7 @@ mod rlimit_gatefix_tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     // The child-process cases drive `apply_sandbox`, which is Linux only.
     #[cfg(target_os = "linux")]
-    const CHILD_ENV: &str = "AI_JAIL_GATEFIX_CHILD";
+    const CHILD_ENV: &str = "AI_JAIL_EXPLICIT_LIMIT_CHILD";
 
     fn explicit(pairs: &[(&str, &str)], source: LimitSource) -> Config {
         Config {
@@ -1155,14 +1262,14 @@ mod rlimit_gatefix_tests {
         (l.soft, l.hard)
     }
 
-    /// Run `gatefix_child` in a fresh test process for `case`; return its
+    /// Run `explicit_child` in a fresh test process for `case`; return its
     /// warning lines (`⚠ ...` on a non-terminal stderr).
     #[cfg(target_os = "linux")]
     fn child_warnings(case: &str) -> Vec<String> {
         let output =
             std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
-                .arg("sandbox::rlimits::rlimit_gatefix_tests::gatefix_child")
+                .arg("sandbox::rlimits::rlimit_explicit_tests::explicit_child")
                 .arg("--ignored")
                 .arg("--nocapture")
                 .arg("--test-threads=1")
@@ -1184,7 +1291,7 @@ mod rlimit_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_non_linux_launch_without_explicit_limits_is_not_refused() {
+    fn non_linux_launch_without_explicit_limits_is_not_refused() {
         // Hostile half first: the refusal must not catch a launch that
         // only runs the defaults, or none at all.
         for config in [
@@ -1206,7 +1313,7 @@ mod rlimit_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_non_linux_refuses_any_explicit_limit_saying_linux_only() {
+    fn non_linux_refuses_any_explicit_limit_saying_linux_only() {
         for source in [LimitSource::Cli, LimitSource::Global] {
             let config = explicit(&[("nofile", "1024")], source);
             let err = match check_platform(&config, false) {
@@ -1232,7 +1339,7 @@ mod rlimit_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_lockdown_keeps_values_at_or_below_its_ceiling() {
+    fn lockdown_keeps_values_at_or_below_its_ceiling() {
         // Hostile half first: a value that already tightens must not be
         // raised to the ceiling.
         for (name, value, want) in [
@@ -1251,7 +1358,7 @@ mod rlimit_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_lockdown_clamps_a_value_above_its_ceiling() {
+    fn lockdown_clamps_a_value_above_its_ceiling() {
         for (name, value, ceiling) in [
             ("nofile", "8192", 4096),
             ("nofile", "unlimited", 4096),
@@ -1284,7 +1391,7 @@ mod rlimit_gatefix_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn gatefix_lockdown_clamp_warns_once_naming_limit_requested_and_applied() {
+    fn lockdown_clamp_warns_once_naming_limit_requested_and_applied() {
         let warnings = child_warnings("lockdown");
         let named: Vec<&String> = warnings
             .iter()
@@ -1304,7 +1411,7 @@ mod rlimit_gatefix_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn gatefix_cpu_grace_kept_at_five_seconds_does_not_warn() {
+    fn cpu_grace_kept_at_five_seconds_does_not_warn() {
         // Hostile half first: host hard 100, cpu=95 leaves exactly the
         // 5-second grace, which is not a loss.
         let warnings = child_warnings("cpu-exact");
@@ -1318,7 +1425,7 @@ mod rlimit_gatefix_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn gatefix_cpu_grace_below_five_seconds_warns_naming_soft_and_hard() {
+    fn cpu_grace_below_five_seconds_warns_naming_soft_and_hard() {
         // Host hard 100, cpu=98: soft 98, hard 100 — 2 seconds of grace.
         let warnings = child_warnings("cpu-short");
         let hit = warnings
@@ -1334,7 +1441,7 @@ mod rlimit_gatefix_tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
-    fn gatefix_child() {
+    fn explicit_child() {
         let Some(case) = std::env::var_os(CHILD_ENV) else {
             return;
         };
@@ -1369,10 +1476,9 @@ mod rlimit_gatefix_tests {
     }
 }
 
-// Task 6.3 — the supervisor keeps its `core` and `nofile` defaults whatever
-// explicit values are given (R3.19), and the README says `--lockdown`
-// clamps with a warning instead of refusing (R3.7). Appended to
-// `src/sandbox/rlimits.rs`.
+// The supervisor keeps its `core` and `nofile` defaults whatever explicit
+// values are given, and the README says `--lockdown` clamps with a
+// warning instead of refusing.
 //
 // Contract the implementation must meet:
 // - `supervisor_limits(config: &Config) -> Vec<EffectiveLimit>` is the pure
@@ -1470,7 +1576,7 @@ mod rlimit_supervisor_tests {
 
     #[test]
     fn supervisor_set_keeps_core_and_nofile_defaults_given_explicitly() {
-        // The gate's reproduction: asking for the default values removed
+        // The case that used to fail: asking for the default values removed
         // them from the supervisor (core unlimited, nofile the host's).
         let set =
             supervisor_set(&explicit(&[("core", "0"), ("nofile", "65536")]));
@@ -1539,7 +1645,7 @@ mod rlimit_supervisor_tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             return;
         }
-        // Start as the gate measured: a dumpable process with a host
+        // Start from the case that used to fail: a dumpable process with a host
         // `nofile` soft limit below the default.
         let (_, core_hard) = getrlimit(Resource::RLIMIT_CORE).expect("core");
         setrlimit(Resource::RLIMIT_CORE, core_hard, core_hard)
@@ -1600,7 +1706,7 @@ mod rlimit_supervisor_tests {
 
     #[test]
     fn supervisor_readme_lockdown_clause_clamps_with_a_warning() {
-        // R3.7: a value above a lockdown default runs at that default with
+        // A value above a lockdown default runs at that default with
         // a warning; the launch is not refused.
         let clauses = readme_lockdown_clauses();
         assert!(
@@ -1619,5 +1725,376 @@ mod rlimit_supervisor_tests {
                 .any(|c| c.to_ascii_lowercase().contains("warn")),
             "README names the warning: {clauses:?}"
         );
+    }
+}
+
+// Under `--lockdown` the supervisor keeps the 1 GiB `fsize` default
+// whatever explicit `fsize` is given, from the CLI or from a project
+// policy the operator never reviewed. Appended to `src/sandbox/rlimits.rs`.
+//
+// Keeping the default never constrains the sandbox: under `--lockdown` an
+// explicit `fsize` is clamped to at most 1 GiB, and a process can always
+// lower its own hard limit, so the wrapper still applies the smaller
+// explicit value. Dropping the default, on the other hand, leaves the
+// supervisor (the PTY loop, the egress proxy and the audit writer) with no
+// file-size limit at all.
+//
+// `cpu`, `data` and `as` have no supervisor default; an explicit value for
+// them stays the sandbox's alone, since on the supervisor it would kill or
+// cap it and orphan the sandbox.
+//
+// Expected values are the literals lockdown documents (1 GiB, 512 MiB),
+// never recomputed from `default_limits`.
+#[cfg(test)]
+mod supervisor_fsize_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    const ONE_GIB: u64 = 1_073_741_824;
+    const CHILD_ENV: &str = "AI_JAIL_SUPERVISOR_FSIZE_CHILD";
+
+    fn config_with(pairs: &[(&str, &str)], source: LimitSource) -> Config {
+        Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _)| (k.to_string(), source))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    fn lockdown_with(pairs: &[(&str, &str)], source: LimitSource) -> Config {
+        let mut config = config_with(pairs, source);
+        config.lockdown = Some(true);
+        config
+    }
+
+    /// The supervisor set as `(name, soft, hard, source)`, sorted by name.
+    fn supervisor_set(
+        config: &Config,
+    ) -> Vec<(RlimitName, u64, u64, LimitSource)> {
+        let mut set: Vec<_> = supervisor_limits(config)
+            .iter()
+            .map(|l| (l.name, l.soft, l.hard, l.source))
+            .collect();
+        set.sort_by_key(|(name, ..)| *name);
+        set
+    }
+
+    /// The supervisor's `fsize` entry as `(soft, hard, source)`.
+    fn fsize_entry(config: &Config) -> Option<(u64, u64, LimitSource)> {
+        supervisor_limits(config)
+            .into_iter()
+            .find(|l| l.name == RlimitName::Fsize)
+            .map(|l| (l.soft, l.hard, l.source))
+    }
+
+    #[test]
+    fn supervisor_fsize_holds_no_fsize_without_lockdown() {
+        // Guard, green by design: only lockdown has an `fsize` default, so
+        // keeping that default must not invent one for a normal launch,
+        // and an explicit value never moves onto the supervisor.
+        for pairs in [&[][..], &[("fsize", "512M")][..]] {
+            let config = config_with(pairs, LimitSource::Cli);
+            assert_eq!(
+                fsize_entry(&config),
+                None,
+                "{pairs:?} without --lockdown: {:?}",
+                supervisor_set(&config)
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_fsize_keeps_cpu_data_as_off_under_lockdown() {
+        // Guard, green by design: `cpu`, `data` and `as` have no default,
+        // and an explicit value for them on the supervisor would kill or
+        // cap it. Keeping `fsize` must not drag them along.
+        let config = lockdown_with(
+            &[
+                ("cpu", "10"),
+                ("data", "8G"),
+                ("as", "16G"),
+                ("fsize", "512M"),
+            ],
+            LimitSource::Cli,
+        );
+        let set = supervisor_set(&config);
+        for name in [
+            RlimitName::Cpu,
+            RlimitName::Data,
+            RlimitName::As,
+            RlimitName::Nproc,
+        ] {
+            assert!(
+                set.iter().all(|(n, ..)| *n != name),
+                "the supervisor must not hold {}: {set:?}",
+                name.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_fsize_is_empty_under_no_rlimits() {
+        // Guard, green by design: with the default set off, an explicit
+        // `fsize` is the sandbox's alone.
+        let mut config = lockdown_with(&[("fsize", "512M")], LimitSource::Cli);
+        config.no_rlimits = Some(true);
+        let set = supervisor_set(&config);
+        assert!(set.is_empty(), "--no-rlimits: {set:?}");
+    }
+
+    #[test]
+    fn supervisor_fsize_keeps_lockdown_default_under_cli_fsize() {
+        // `--lockdown --rlimit fsize=512M` used to leave the supervisor
+        // with an unlimited file size. The 512 MiB is the sandbox's: the
+        // supervisor holds the default, not the explicit value.
+        let config = lockdown_with(&[("fsize", "512M")], LimitSource::Cli);
+        assert_eq!(
+            fsize_entry(&config),
+            Some((ONE_GIB, ONE_GIB, LimitSource::Default)),
+            "{:?}",
+            supervisor_set(&config)
+        );
+    }
+
+    #[test]
+    fn supervisor_fsize_keeps_lockdown_default_under_project_fsize() {
+        // A project policy is untrusted input: its `fsize` must not
+        // loosen the process that holds the proxy's secrets.
+        let config = lockdown_with(&[("fsize", "512M")], LimitSource::Project);
+        assert_eq!(
+            fsize_entry(&config),
+            Some((ONE_GIB, ONE_GIB, LimitSource::Default)),
+            "{:?}",
+            supervisor_set(&config)
+        );
+    }
+
+    #[test]
+    fn supervisor_fsize_keeps_lockdown_default_given_the_default_value() {
+        // Asking for exactly the default must not remove it either.
+        let config = lockdown_with(&[("fsize", "1G")], LimitSource::Cli);
+        assert_eq!(
+            fsize_entry(&config),
+            Some((ONE_GIB, ONE_GIB, LimitSource::Default)),
+            "{:?}",
+            supervisor_set(&config)
+        );
+    }
+
+    #[test]
+    fn supervisor_fsize_apply_sets_lockdown_default_despite_explicit() {
+        // Through `apply` itself, in a child test process: lowering a hard
+        // limit cannot be undone in this one.
+        let output = std::process::Command::new(
+            std::env::current_exe().unwrap(),
+        )
+        .arg("--exact")
+        .arg("sandbox::rlimits::supervisor_fsize_tests::supervisor_fsize_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn child supervisor test");
+        assert!(
+            output.status.success(),
+            "child supervisor test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn supervisor_fsize_child() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        let (_, hard) = getrlimit(Resource::RLIMIT_FSIZE).expect("fsize");
+        assert!(hard > ONE_GIB, "test needs FSIZE hard above 1 GiB");
+
+        apply(
+            &lockdown_with(&[("fsize", "512M")], LimitSource::Cli),
+            false,
+        )
+        .expect("apply");
+
+        assert_eq!(
+            getrlimit(Resource::RLIMIT_FSIZE).expect("fsize"),
+            (ONE_GIB, ONE_GIB),
+            "the supervisor's file size after --lockdown --rlimit fsize=512M"
+        );
+    }
+}
+
+// The effective view reports the value the sandbox actually receives, and
+// every printed limit spells `RLIM_INFINITY` as `unlimited`.
+//
+// Materialization: append this whole file to the end of
+// `src/sandbox/rlimits.rs`.
+//
+// Why a ceiling exists: the supervisor always applies its `core` and
+// `nofile` defaults with hard pinned to soft, and the sandbox inherits that
+// hard limit, so an explicit value above it can never be reached. The
+// effective view must say so instead of repeating the request.
+//
+// Seam the fix provides:
+// - `EffectiveLimit.ceiling: Option<LimitCeiling>`, `Some` only when the
+//   supervisor ceiling changed the value;
+// - `LimitCeiling::Supervisor`, with `as_str()` == "supervisor" (the text
+//   of `ceiling=` on the dry-run line);
+// - `pub fn fmt_rlim(v: u64) -> String`.
+// `unlimited` is RLIM_INFINITY, which is u64::MAX on Linux.
+#[cfg(test)]
+mod effective_ceiling_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> Config {
+        let rlimit: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let rlimit_source: BTreeMap<String, LimitSource> = pairs
+            .iter()
+            .map(|(k, _)| (k.to_string(), LimitSource::Cli))
+            .collect();
+        Config {
+            rlimit,
+            rlimit_source,
+            ..Config::default()
+        }
+    }
+
+    fn limits(config: &Config) -> Vec<EffectiveLimit> {
+        match effective(config) {
+            Ok(v) => v,
+            Err(e) => panic!("effective() must succeed, got Err({e})"),
+        }
+    }
+
+    fn find<'a>(
+        limits: &'a [EffectiveLimit],
+        name: &str,
+    ) -> &'a EffectiveLimit {
+        limits
+            .iter()
+            .find(|l| l.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no effective limit named {name}"))
+    }
+
+    fn pair(limits: &[EffectiveLimit], name: &str) -> (u64, u64) {
+        let l = find(limits, name);
+        (l.soft, l.hard)
+    }
+
+    fn marker(limits: &[EffectiveLimit], name: &str) -> Option<&'static str> {
+        find(limits, name).ceiling.map(LimitCeiling::as_str)
+    }
+
+    #[test]
+    fn effective_leaves_values_within_the_ceiling_unmarked() {
+        // The marker must not fire where the ceiling changed nothing: a
+        // value equal to the supervisor default or below it is what the
+        // sandbox gets, as asked.
+        for (nofile, core) in [("65536", "0"), ("1024", "0")] {
+            let got = limits(&config(&[("nofile", nofile), ("core", core)]));
+            let want: u64 = nofile.parse().unwrap();
+            assert_eq!(pair(&got, "nofile"), (want, want), "nofile={nofile}");
+            assert_eq!(pair(&got, "core"), (0, 0));
+            assert_eq!(marker(&got, "nofile"), None, "nofile={nofile}");
+            assert_eq!(marker(&got, "core"), None);
+            assert!(matches!(find(&got, "nofile").source, LimitSource::Cli));
+        }
+        // Defaults are never marked: they are the ceiling.
+        for l in limits(&Config::default()) {
+            assert!(l.ceiling.is_none(), "{} marked", l.name.as_str());
+        }
+    }
+
+    #[test]
+    fn effective_clamps_core_and_nofile_to_the_supervisor_default() {
+        let got =
+            limits(&config(&[("nofile", "100000"), ("core", "unlimited")]));
+        assert_eq!(pair(&got, "nofile"), (65536, 65536));
+        assert_eq!(pair(&got, "core"), (0, 0));
+        assert_eq!(marker(&got, "nofile"), Some("supervisor"));
+        assert_eq!(marker(&got, "core"), Some("supervisor"));
+        // The layer that asked is still the one reported.
+        assert!(matches!(find(&got, "nofile").source, LimitSource::Cli));
+        assert!(matches!(find(&got, "core").source, LimitSource::Cli));
+    }
+
+    #[test]
+    fn effective_ceiling_reaches_only_limits_the_supervisor_holds() {
+        // Limits with no supervisor default are not capped by it: the
+        // supervisor never applies an explicit `data`, `as`, `fsize` or
+        // `cpu`, so the sandbox can be given any of them.
+        let got = limits(&config(&[
+            ("nofile", "100000"),
+            ("data", "unlimited"),
+            ("as", "unlimited"),
+            ("fsize", "unlimited"),
+            ("cpu", "600"),
+        ]));
+        assert_eq!(pair(&got, "nofile"), (65536, 65536));
+        for name in ["data", "as", "fsize"] {
+            assert_eq!(pair(&got, name), (u64::MAX, u64::MAX), "{name}");
+            assert_eq!(marker(&got, name), None, "{name}");
+        }
+        assert_eq!(pair(&got, "cpu"), (600, 605));
+        assert_eq!(marker(&got, "cpu"), None);
+    }
+
+    #[test]
+    fn effective_without_the_default_set_reports_the_request_unmarked() {
+        // `--no-rlimits` leaves the supervisor without its defaults, so
+        // there is no ceiling and the request is what the sandbox gets.
+        let mut c = config(&[("nofile", "100000"), ("core", "unlimited")]);
+        c.no_rlimits = Some(true);
+        let got = limits(&c);
+        assert_eq!(pair(&got, "nofile"), (100000, 100000));
+        assert_eq!(pair(&got, "core"), (u64::MAX, u64::MAX));
+        assert_eq!(marker(&got, "nofile"), None);
+        assert_eq!(marker(&got, "core"), None);
+    }
+
+    #[test]
+    fn effective_under_lockdown_reports_the_lockdown_supervisor_value() {
+        // Under lockdown the supervisor holds `nofile` at 4096, so the
+        // value reported is 4096 whatever was asked above it.
+        let mut c = config(&[("nofile", "100000"), ("core", "unlimited")]);
+        c.lockdown = Some(true);
+        let got = limits(&c);
+        assert_eq!(pair(&got, "nofile"), (4096, 4096));
+        assert_eq!(pair(&got, "core"), (0, 0));
+    }
+
+    #[test]
+    fn fmt_rlim_spells_infinity_as_unlimited() {
+        assert_eq!(fmt_rlim(nix::libc::RLIM_INFINITY), "unlimited");
+        assert_eq!(fmt_rlim(4096), "4096");
+    }
+
+    #[test]
+    fn fmt_rlim_keeps_every_finite_value_a_plain_number() {
+        // Only RLIM_INFINITY itself is `unlimited`: the largest finite
+        // value and zero must not collide with it, and no digit grouping
+        // is added, since the dry-run line is read by scripts.
+        assert_eq!(
+            fmt_rlim(nix::libc::RLIM_INFINITY - 1),
+            "18446744073709551614"
+        );
+        assert_eq!(fmt_rlim(0), "0");
+        assert_eq!(fmt_rlim(65536), "65536");
+        assert_eq!(fmt_rlim(1073741824), "1073741824");
     }
 }

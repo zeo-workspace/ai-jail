@@ -1,12 +1,12 @@
-// Task 6.3 — an explicit `core` or `nofile` never loosens ai-jail's own
-// supervisor (R3.19), measured on the running processes: the supervisor's
+// An explicit `core` or `nofile` never loosens ai-jail's own supervisor,
+// measured on the running processes: the supervisor's
 // `/proc/<pid>/limits` while the sandbox sleeps, and the sandbox's own
 // `/proc/self/limits`.
 //
 // The supervisor is the spawned ai-jail process itself (it applies its
 // limits, then forks bwrap). The launching shell first makes itself
-// dumpable (core soft = hard) and lowers its `nofile` soft limit, as the
-// second upstream gate measured: a supervisor that inherits instead of
+// dumpable (core soft = hard) and lowers its `nofile` soft limit, so a
+// supervisor that inherits instead of
 // applying its defaults then shows `unlimited` / the low value.
 //
 // Each test runs with a temporary HOME, XDG_CONFIG_HOME and project
@@ -187,7 +187,7 @@ fn supervisor_without_explicit_limits_runs_at_the_defaults() {
 
 #[test]
 fn supervisor_keeps_core_zero_when_core_zero_is_explicit() {
-    // The gate's reproduction: `--rlimit core=0` left the supervisor —
+    // The case that used to fail: `--rlimit core=0` left the supervisor —
     // which holds the egress proxy and its secret substitution — with an
     // unlimited core size.
     require_bwrap!();

@@ -1120,7 +1120,7 @@ fn migrate_project(
     )
     .0;
     // The merge above compares against the built-in defaults; the stored
-    // limits are combined by value instead (R3.18).
+    // limits are combined by value instead.
     doc.constraints.rlimit = rlimit;
     doc.migration = Some(MigrationProvenance {
         migration_version: MIGRATION_VERSION,
@@ -1952,7 +1952,7 @@ pub(crate) fn save_project_constraints(
                 &paths.canonical_project,
             )
             .0;
-            // As in the migration: stored limits combine by value (R3.18).
+            // As in the migration: stored limits combine by value.
             merged.rlimit = rlimit;
             merged
         }

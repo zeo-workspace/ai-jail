@@ -49,6 +49,7 @@ OPTIONS:
                                    NAME: nproc, nofile, core, cpu, fsize, data, as.
                                    VALUE: integer, K/M/G/T for fsize/data/as, or unlimited.
                                    cpu is CPU seconds and ends the process; it does not throttle
+                                   Linux only: refused on other platforms
     --memory <SIZE>                Cap the whole sandbox's memory (e.g. 8G, 512M;
                                    swap off). Linux + systemd user session
     --max-tasks <N>                Cap processes AND threads in the whole sandbox
@@ -1160,13 +1161,6 @@ fn parse_configure_tail(
     Ok(())
 }
 
-/// Long flags that configure the sandbox itself (as opposed to the wrapped
-/// command). Used to reject a sandbox flag that appears after the command
-/// with no `--` separator. Every entry MUST have a matching parse arm in
-/// `parse_from`, or it errors inconsistently (the `--ro-map` bug: "unknown
-/// option" before the command, "would be passed to the child" after it).
-/// The conformance test `every_guarded_sandbox_flag_is_parseable` enforces
-/// that invariant.
 /// Parse one `--rlimit NAME=VALUE`. The value is checked here, so a typo
 /// stops the launch instead of running without the limit.
 fn parse_rlimit_spec(spec: &str) -> Result<(String, String), String> {
@@ -1185,6 +1179,13 @@ fn parse_rlimit_spec(spec: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), value.to_string()))
 }
 
+/// Long flags that configure the sandbox itself (as opposed to the wrapped
+/// command). Used to reject a sandbox flag that appears after the command
+/// with no `--` separator. Every entry MUST have a matching parse arm in
+/// `parse_from`, or it errors inconsistently (the `--ro-map` bug: "unknown
+/// option" before the command, "would be passed to the child" after it).
+/// The conformance test `every_guarded_sandbox_flag_is_parseable` enforces
+/// that invariant.
 const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--harness",
     "--request-file",
@@ -3631,5 +3632,138 @@ mod interface_profile_tests {
                 "guide section {heading:?} is not a heading in USER_GUIDE.md"
             );
         }
+    }
+}
+
+// Explicit `--rlimit` values are refused off Linux, so both places a user
+// learns the flag from must say so before the launch does:
+// - the `--help` entry for `--rlimit` (its option line and the continuation
+//   lines under it) names Linux, the way `--cpus` already does;
+// - the README section "Resource limits without root" says "Linux only".
+// The neighbouring text already says Linux (`--cpus` in the help, "Linux
+// 5.14" and the next section's "**Linux only**" in the README), so each
+// check reads only its own entry or section, and the extractors are pinned
+// on fixtures where only a neighbour carries the word.
+#[cfg(test)]
+mod rlimit_platform_doc_tests {
+    use super::HELP;
+
+    const README: &str = include_str!("../README.md");
+    const SECTION: &str = "### Resource limits without root";
+
+    // The help entry of one option: its own line plus the continuation
+    // lines under it, up to the next line that starts another option.
+    fn help_entry<'a>(help: &'a str, option: &str) -> Vec<&'a str> {
+        let head = format!("{option} ");
+        let mut lines = help.lines();
+        let Some(first) =
+            lines.by_ref().find(|l| l.trim_start().starts_with(&head))
+        else {
+            return Vec::new();
+        };
+        let mut entry = vec![first];
+        entry.extend(lines.take_while(|l| {
+            !l.trim().is_empty() && !l.trim_start().starts_with('-')
+        }));
+        entry
+    }
+
+    // The README section under a heading, up to the next heading of level
+    // two or three. A `#` line inside a code fence is a shell comment, not
+    // a heading.
+    fn readme_section<'a>(readme: &'a str, heading: &str) -> Vec<&'a str> {
+        let mut lines = readme.lines();
+        if lines.by_ref().find(|l| l.starts_with(heading)).is_none() {
+            return Vec::new();
+        }
+        let mut in_fence = false;
+        let mut section = Vec::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+            }
+            if !in_fence
+                && (line.starts_with("## ") || line.starts_with("### "))
+            {
+                break;
+            }
+            section.push(line);
+        }
+        section
+    }
+
+    fn says_linux_only(lines: &[&str]) -> bool {
+        lines
+            .iter()
+            .any(|l| l.to_lowercase().contains("linux only"))
+    }
+
+    #[test]
+    fn linux_only_help_entry_ignores_a_neighbour_that_says_linux() {
+        // The `--rlimits` toggle shares the prefix and `--cpus` follows
+        // with "(Linux)"; neither belongs to the `--rlimit` entry.
+        let help = "\
+    --rlimits / --no-rlimits       Enable/disable (Linux)
+    --rlimit NAME=VALUE            Set one resource limit
+                                   (per process; repeatable).
+    --cpus <LIST>                  Run only on these CPUs (Linux)
+";
+        let entry = help_entry(help, "--rlimit");
+        assert_eq!(entry.len(), 2, "{entry:?}");
+        assert!(entry[0].contains("NAME=VALUE"), "{entry:?}");
+        assert!(!entry.iter().any(|l| l.contains("Linux")), "{entry:?}");
+    }
+
+    #[test]
+    fn linux_only_readme_section_ignores_the_next_section() {
+        // "Linux only" in the next section must not count, and a shell
+        // comment inside a fence must not end the section early.
+        let readme = "\
+### Resource limits without root: `--rlimit`
+
+```bash
+# a comment, not a heading
+ai-jail --rlimit nofile=1024 claude
+```
+
+Applies on Linux 5.14 and later.
+
+### Dev toolchains
+
+On by default, **Linux only**.
+";
+        let section = readme_section(readme, SECTION);
+        assert!(
+            section.iter().any(|l| l.contains("Linux 5.14")),
+            "{section:?}"
+        );
+        assert!(!says_linux_only(&section), "{section:?}");
+    }
+
+    #[test]
+    fn linux_only_rlimit_help_entry_names_linux() {
+        let entry = help_entry(HELP, "--rlimit");
+        assert!(
+            entry.first().is_some_and(|l| l.contains("NAME=VALUE")),
+            "no --rlimit entry in --help: {entry:?}"
+        );
+        assert!(
+            entry.iter().any(|l| l.contains("Linux")),
+            "--help entry for --rlimit does not say Linux:\n{}",
+            entry.join("\n")
+        );
+    }
+
+    #[test]
+    fn linux_only_readme_rlimit_section_says_linux_only() {
+        let section = readme_section(README, SECTION);
+        assert!(
+            section.iter().any(|l| l.contains("--rlimit NAME=VALUE")),
+            "README has no section {SECTION:?}"
+        );
+        assert!(
+            says_linux_only(&section),
+            "README section {SECTION:?} does not say Linux only"
+        );
     }
 }
