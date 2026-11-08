@@ -1109,12 +1109,19 @@ fn migrate_project(
             migration: None,
         }
     };
+    let rlimit = config::tighter_project_rlimits(
+        &doc.constraints.rlimit,
+        &projected.rlimit,
+    );
     doc.constraints = config::merge_with_global_report(
         doc.constraints,
         projected,
         &paths.canonical_project,
     )
     .0;
+    // The merge above compares against the built-in defaults; the stored
+    // limits are combined by value instead (R3.18).
+    doc.constraints.rlimit = rlimit;
     doc.migration = Some(MigrationProvenance {
         migration_version: MIGRATION_VERSION,
         source_kind: "project_legacy_file".into(),
@@ -1935,12 +1942,19 @@ pub(crate) fn save_project_constraints(
         // launch's checkout. Replacing would erase restrictions saved from
         // another checkout, so merge monotonically as migration does.
         ProjectStrategy::RepoRoot => {
-            config::merge_with_global_report(
+            let rlimit = config::tighter_project_rlimits(
+                &doc.constraints.rlimit,
+                &projected.rlimit,
+            );
+            let mut merged = config::merge_with_global_report(
                 doc.constraints,
                 projected,
                 &paths.canonical_project,
             )
-            .0
+            .0;
+            // As in the migration: stored limits combine by value (R3.18).
+            merged.rlimit = rlimit;
+            merged
         }
     };
     write_project_document(&paths.project, &doc)

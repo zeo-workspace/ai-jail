@@ -2530,10 +2530,57 @@ pub fn save_auto(config: &Config, project_trusted: bool, project_dir: &Path) {
     }
 }
 
+/// The well-formed `rlimit` entries of a stored policy, values verbatim.
+/// Storing does not judge a value against the built-in defaults: the
+/// launch merge applies it only where it tightens the trusted value
+/// (R3.9, R3.17). A malformed or unknown entry is dropped, as the launch
+/// merge would refuse it anyway.
+pub(crate) fn well_formed_rlimits(
+    rlimit: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    rlimit
+        .iter()
+        .filter(|(key, text)| {
+            key.parse::<RlimitName>()
+                .is_ok_and(|name| RlimitValue::parse(name, text).is_ok())
+        })
+        .map(|(key, text)| (key.clone(), text.clone()))
+        .collect()
+}
+
+/// Two stored project policies combined: per name, the smaller of the two
+/// well-formed values (R3.18). Merging one stored policy over another with
+/// [`merge_with_global_report`] would compare against the built-in
+/// defaults and drop a value between the default and the trusted value.
+pub(crate) fn tighter_project_rlimits(
+    stored: &BTreeMap<String, String>,
+    incoming: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    let raw = |key: &str, text: &str| -> Option<u64> {
+        let name = key.parse::<RlimitName>().ok()?;
+        RlimitValue::parse(name, text).ok().map(RlimitValue::as_raw)
+    };
+    let mut out = well_formed_rlimits(stored);
+    for (key, text) in well_formed_rlimits(incoming) {
+        let tighter = out
+            .get(&key)
+            .and_then(|old| Some((raw(&key, old)?, raw(&key, &text)?)))
+            .is_none_or(|(old, new)| new < old);
+        if tighter {
+            out.insert(key, text);
+        }
+    }
+    out
+}
+
 /// What an untrusted project `.ai-jail` keeps once loaded: the project
 /// layer of [`merge_with_global_report`] over a default baseline. Using the
 /// merge itself keeps auto-save and loading from drifting apart when a
-/// capability is added.
+/// capability is added. `rlimit` is the exception: the default baseline
+/// would drop a value above the built-in default that the launch merge,
+/// against the trusted value, applies (R3.18).
 pub(crate) fn monotonic_project_constraints(
     config: &Config,
     project_dir: &Path,
@@ -2544,6 +2591,12 @@ pub(crate) fn monotonic_project_constraints(
         project_dir,
     )
     .0;
+    projected.rlimit = well_formed_rlimits(&config.rlimit);
+    projected.rlimit_source = projected
+        .rlimit
+        .keys()
+        .map(|key| (key.clone(), crate::sandbox::rlimits::LimitSource::Project))
+        .collect();
     // Command selection is execution policy rather than a restriction. It is
     // deliberately not imported from repository-controlled legacy files.
     projected.command.clear();
@@ -3131,25 +3184,12 @@ pub fn project_config_for_auto_save(
         to_save.command = stored_project_command;
     }
 
-    // A project file is untrusted and may only tighten (see
-    // `merge_with_global_report`), so a limit it could not carry is not
-    // written into it: it would be refused with a warning on every launch.
-    let defaults = Config {
-        lockdown: to_save.lockdown,
-        no_rlimits: to_save.no_rlimits,
-        ..Config::default()
-    };
-    let entries = std::mem::take(&mut to_save.rlimit);
-    to_save.rlimit = entries
-        .into_iter()
-        .filter(|(key, value)| {
-            let single = Config {
-                rlimit: BTreeMap::from([(key.clone(), value.clone())]),
-                ..defaults.clone()
-            };
-            !crate::sandbox::rlimits::widens(&single, &defaults)
-        })
-        .collect();
+    // The project's own limits are saved as they are. Filtering them
+    // against the built-in defaults erased a value between the default and
+    // a raised trusted value, which the launch merge had just applied
+    // (second upstream gate, R3.17); that merge stays the only
+    // tighten-only decision (R3.9).
+    to_save.rlimit = well_formed_rlimits(&to_save.rlimit);
     to_save.rlimit_source.clear();
 
     drop_launch_only_fields(&mut to_save);
@@ -10784,5 +10824,168 @@ mod config_gatefix_rlimit_tests {
             cpus[0]
         );
         assert!(!cpus[0].contains("ignored"), "{}", cpus[0]);
+    }
+}
+
+// Task 6.2 — the project's own limit survives save and migration
+// (R3.17, R3.18, R3.9). Appended to `src/config.rs`.
+//
+// The case the second upstream gate measured (6.1 tech review, finding 2):
+// a trusted `nproc = 8192` raised above the built-in default (4096) and a
+// project `nproc = 6000` between the two. The launch merge applies 6000;
+// saving or migrating the project policy must keep it, or the next launch
+// silently runs at 8192.
+//
+// - Auto-save keeps every well-formed project `rlimit` entry, including a
+//   value above the built-in default (R3.17).
+// - The legacy-file migration projection keeps it too (R3.18).
+// - Keeping a value is not applying it: a project value that raises the
+//   trusted limit is still stored, and still ignored, with a warning, at
+//   launch (R3.9). The launch merge stays the only tighten-only decision.
+// The merge report is read through `Debug`, so these tests hold for
+// `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
+#[cfg(test)]
+mod config_gatefix2_rlimit_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+    use crate::sandbox::rlimits::LimitSource;
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .unwrap()
+    }
+
+    fn nproc(value: &str) -> Config {
+        Config {
+            rlimit: BTreeMap::from([("nproc".to_string(), value.to_string())]),
+            ..Config::default()
+        }
+    }
+
+    /// The trusted layer the gate used: `nproc` raised above the default.
+    fn trusted() -> Config {
+        nproc("8192")
+    }
+
+    /// The launch-time merge of the trusted layer and a project policy.
+    fn launch(project: Config) -> (Config, Vec<String>) {
+        let (merged, report) =
+            merge_with_global_report(trusted(), project, Path::new("/project"));
+        let warnings = report.iter().map(|w| format!("{w:?}")).collect();
+        (merged, warnings)
+    }
+
+    fn auto_save(project: Config) -> Config {
+        project_config_for_auto_save(
+            &cli(&["bash"]),
+            project,
+            Path::new("/project"),
+        )
+    }
+
+    fn assert_project_nproc(merged: &Config, value: &str, step: &str) {
+        assert_eq!(
+            merged.rlimit.get("nproc").map(String::as_str),
+            Some(value),
+            "{step}: {:?}",
+            merged.rlimit
+        );
+        assert_eq!(
+            merged.rlimit_source.get("nproc"),
+            Some(&LimitSource::Project),
+            "{step}: {:?}",
+            merged.rlimit_source
+        );
+    }
+
+    #[test]
+    fn gatefix2_auto_save_keeps_a_project_nproc_between_default_and_trusted() {
+        // The launch applies the project's 6000 under the trusted 8192.
+        let (first, _) = launch(nproc("6000"));
+        assert_project_nproc(&first, "6000", "first launch");
+
+        // Saving that project policy must keep 6000: dropping it because
+        // it is above the built-in 4096 loosens the next launch to 8192.
+        let saved = auto_save(nproc("6000"));
+        assert_eq!(
+            saved.rlimit.get("nproc").map(String::as_str),
+            Some("6000"),
+            "auto-save erased the project's own nproc: {:?}",
+            saved.rlimit
+        );
+
+        let (next, _) = launch(saved);
+        assert_project_nproc(&next, "6000", "launch from the saved policy");
+    }
+
+    #[test]
+    fn gatefix2_migration_keeps_a_project_nproc_between_default_and_trusted() {
+        // What the legacy-file migration writes as the project constraints.
+        let projected = monotonic_project_constraints(
+            &nproc("6000"),
+            Path::new("/project"),
+        );
+        assert_eq!(
+            projected.rlimit.get("nproc").map(String::as_str),
+            Some("6000"),
+            "migration dropped the project's own nproc: {:?}",
+            projected.rlimit
+        );
+
+        let (next, _) = launch(projected);
+        assert_project_nproc(&next, "6000", "launch from the migrated policy");
+    }
+
+    #[test]
+    fn gatefix2_auto_save_still_stores_a_raising_project_nproc() {
+        // R3.17 keeps every well-formed entry: the save does not judge
+        // the value, the launch does (next test).
+        let saved = auto_save(nproc("9000"));
+        assert_eq!(
+            saved.rlimit.get("nproc").map(String::as_str),
+            Some("9000"),
+            "{:?}",
+            saved.rlimit
+        );
+    }
+
+    #[test]
+    fn gatefix2_raising_project_nproc_is_still_ignored_at_launch() {
+        // Guard: keeping a raising value on disk must never let it apply.
+        let (merged, warnings) = launch(nproc("9000"));
+        assert_eq!(
+            merged.rlimit.get("nproc").map(String::as_str),
+            Some("8192"),
+            "{:?}",
+            merged.rlimit
+        );
+        assert_ne!(
+            merged.rlimit_source.get("nproc"),
+            Some(&LimitSource::Project),
+            "{:?}",
+            merged.rlimit_source
+        );
+        let named: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("rlimit.nproc") && w.contains("ignored"))
+            .collect();
+        assert_eq!(named.len(), 1, "{warnings:?}");
+
+        // The same holds for a raising value that came through migration.
+        let projected = monotonic_project_constraints(
+            &nproc("9000"),
+            Path::new("/project"),
+        );
+        let (merged, _) = launch(projected);
+        assert_eq!(
+            merged.rlimit.get("nproc").map(String::as_str),
+            Some("8192"),
+            "{:?}",
+            merged.rlimit
+        );
     }
 }

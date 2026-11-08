@@ -496,12 +496,15 @@ ai-jail --cpus 0-3 --dry-run claude
   later `SIGKILL`. It ends a runaway loop; it does not throttle.
 - Explicit values are applied inside the sandbox only, never to ai-jail's own
   supervisor, so the terminal proxy, the egress proxy and the audit writer keep
-  running when the agent hits a limit.
+  running when the agent hits a limit. The supervisor always keeps its own
+  `core` 0 and `nofile` default, so the sandbox cannot be given more than
+  those.
 - A limit can only be lowered from where the process starts: asking for more
   than the current hard limit applies the hard limit and prints
   `RLIMIT_<NAME>: requested …, hard limit …, applied …`.
-- `--lockdown` refuses a value above its own defaults; `--no-rlimits` drops the
-  defaults but keeps explicit values.
+- `--lockdown` runs a value above its own defaults at that default and prints a
+  warning naming both; `--no-rlimits` drops the defaults but keeps explicit
+  values.
 - In `config.toml`, `[rlimit]` takes the same names (`nofile = 4096`,
   `data = "8G"`). A project policy may only lower a limit: a higher or
   `unlimited` value is ignored with a warning. An unknown name or a malformed
