@@ -1007,6 +1007,15 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         cli.verbose,
     )?;
 
+    // --cpus: pin this process (and so the command it becomes) before
+    // seccomp below refuses sched_setaffinity for good. Order: bridges,
+    // Landlock, affinity, seccomp, rlimits, then the agent.
+    if let Some(cpus) = config.cpus.as_deref() {
+        sandbox::affinity::apply_cpus(&sandbox::affinity::parse_cpu_list(
+            cpus,
+        )?)?;
+    }
+
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits
     // the filter.
@@ -1994,6 +2003,10 @@ fn run(
     // impossible combination (e.g. above a --lockdown default) stops the
     // launch before anything starts, dry run included.
     let effective_limits = sandbox::rlimits::effective(config)?;
+    sandbox::affinity::check_launch(
+        config.cpus.as_deref(),
+        config.seccomp_enabled(),
+    )?;
 
     // Handle dry run
     if cli.dry_run {
@@ -2005,6 +2018,9 @@ fn run(
                 limit.hard,
                 limit.source.as_str()
             ));
+        }
+        if let Some(cpus) = &config.cpus {
+            output::dry_run_line(&format!("cpus={cpus}"));
         }
         let formatted = sandbox::dry_run(
             &guard,
@@ -2270,6 +2286,8 @@ fn run(
                     .is_some_and(|home| home.join(".ai-jail").exists()),
             exit_code,
             duration: launch_start.elapsed(),
+            rlimits: &effective_limits,
+            cpus: config.cpus.as_deref(),
         }));
     }
 

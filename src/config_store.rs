@@ -1568,6 +1568,8 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     // Runtime label of where each `rlimit` came from; never read from a
     // file (`#[serde(skip)]`).
     excluded_policy!("rlimit_source", Preference),
+    // A project may only narrow it (affinity::tighten_cpus).
+    excluded_policy!("cpus", Restriction),
     directional_policy!("systemd_user", Systemd, "systemd-user"),
     static_policy!("allow_tcp_ports", Authority, TcpPorts),
     static_policy!("allow_hosts", Authority, Hosts),
@@ -2316,6 +2318,7 @@ mod tests {
         expected_excluded!("status_bar_style", Preference),
         expected_excluded!("resize_redraw_key", Preference),
         expected_excluded!("rlimit_source", Preference),
+        expected_excluded!("cpus", Restriction),
         expected_authority!(
             "allow_tcp_ports",
             Authority,
@@ -2413,6 +2416,7 @@ mod tests {
             "resize_redraw_key" => {
                 config.resize_redraw_key = Some("top-secret".into());
             }
+            "cpus" => config.cpus = Some("0-1".into()),
             "rlimit_source" => {
                 config.rlimit_source.insert(
                     "nofile".into(),
