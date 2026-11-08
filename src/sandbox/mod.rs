@@ -71,6 +71,11 @@ mod seccomp;
 pub(crate) mod affinity;
 pub(crate) mod rlimits;
 
+// Story 047 (R3.20): proves the Linux-only limit and affinity calls are
+// compiled only on Linux. Its own file keeps affinity.rs under 500 lines.
+#[cfg(test)]
+mod affinity_story047_platforms;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 
