@@ -1,9 +1,8 @@
-// Task 6.2 — the project's own limit survives save and migration, through
-// the built binary (R3.17, R3.18, R3.21).
+// The project's own limit survives save and migration, through the built
+// binary.
 //
-// The second upstream gate's two reproductions (6.1 tech review, finding
-// 2): a trusted `nproc = 8192` above the built-in default (4096) and a
-// project `nproc = 6000` between the two.
+// Two cases that used to fail: a trusted `nproc = 8192` above the
+// built-in default (4096) and a project `nproc = 6000` between the two.
 //
 // - External project document: a real launch auto-saves the policy; the
 //   next `--dry-run` must still report the project's 6000.
@@ -41,7 +40,7 @@ impl Tree {
     fn new(name: &str) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "rlimit-gatefix2-{name}-{}-{id}",
+            "rlimit-project-save-{name}-{}-{id}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);

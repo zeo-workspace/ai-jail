@@ -9296,7 +9296,7 @@ mod roundtrip_rlimits_tests {
 // limits and the network all off; otherwise they are applied nowhere
 // while `--dry-run` and the audit record report them.
 #[cfg(test)]
-mod wrapper_gatefix_tests {
+mod wrapper_explicit_limit_tests {
     use std::collections::BTreeMap;
 
     use super::*;
@@ -9313,7 +9313,7 @@ mod wrapper_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_wrapper_still_skipped_when_nothing_needs_it() {
+    fn wrapper_still_skipped_when_nothing_needs_it() {
         // Hostile half first: the fix must not keep the wrapper for a
         // launch that has nothing for it to do.
         let wrapper = resolve_landlock_wrapper(&all_off()).unwrap();
@@ -9321,7 +9321,7 @@ mod wrapper_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_wrapper_kept_for_an_explicit_limit_with_every_control_off() {
+    fn wrapper_kept_for_an_explicit_limit_with_every_control_off() {
         let config = Config {
             rlimit: BTreeMap::from([("nofile".to_string(), "64".to_string())]),
             ..all_off()
@@ -9340,7 +9340,7 @@ mod wrapper_gatefix_tests {
     }
 
     #[test]
-    fn gatefix_wrapper_kept_for_cpus_with_every_control_off() {
+    fn wrapper_kept_for_cpus_with_every_control_off() {
         let config = Config {
             cpus: Some("0".into()),
             ..all_off()

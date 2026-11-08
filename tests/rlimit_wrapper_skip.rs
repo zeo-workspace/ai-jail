@@ -27,8 +27,10 @@ struct Tree {
 impl Tree {
     fn new(name: &str) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("rlimit-gatefix-{name}-{}-{id}", std::process::id()));
+        let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "rlimit-explicit-{name}-{}-{id}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let project = root.join("project");
         let home = root.join("home");
