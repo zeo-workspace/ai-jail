@@ -212,6 +212,14 @@ must still appear in the final `Complete effective access` review.
 - `--memory`, `--max-tasks` and `--cpu-quota` (`memory_max`, `max_tasks`,
   `cpu_quota`): whole-sandbox cgroup limits, tighten-only, shown by
   `--dry-run`.
+- `--profile NAME` selects a named profile, a `[profiles.NAME]` table in the
+  trusted global config. It is CLI/config-only because a profile is written
+  by hand in the global file and onboarding only edits per-project grants;
+  offering it there would let the onboarding screen select trusted authority
+  it cannot show in full. It is unrelated to the onboarding access profile
+  (the per-project grants these screens edit). The review shows
+  `Named profile: profile=NAME`, and every field it widens is printed as a
+  `profile=NAME widens=FIELD` line before the launch.
 
 ## Plain-terminal fallback
 
