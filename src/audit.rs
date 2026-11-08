@@ -348,6 +348,10 @@ pub(crate) struct LaunchRecord<'a> {
     pub global_config: bool,
     pub exit_code: i32,
     pub duration: std::time::Duration,
+    /// Every limit the sandbox ran under (story 047); omitted when empty.
+    pub rlimits: &'a [crate::sandbox::rlimits::EffectiveLimit],
+    /// The `--cpus` set, when one was given; omitted otherwise.
+    pub cpus: Option<&'a str>,
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -622,7 +626,7 @@ fn rfc3339(now: SystemTime) -> String {
 /// One launch record: who ran, with which effective capabilities, from
 /// which config sources, and how it ended.
 pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "ts": rfc3339(SystemTime::now()),
         "type": "launch",
         "command": record.command,
@@ -645,7 +649,30 @@ pub(crate) fn launch_record(record: &LaunchRecord<'_>) -> serde_json::Value {
         },
         "exit_code": record.exit_code,
         "duration_s": record.duration.as_millis() as f64 / 1000.0,
-    })
+    });
+    // Optional and additive: a reader of older records sees no new key,
+    // and existing keys are untouched.
+    if let Some(object) = value.as_object_mut() {
+        if !record.rlimits.is_empty() {
+            let limits: Vec<serde_json::Value> = record
+                .rlimits
+                .iter()
+                .map(|l| {
+                    serde_json::json!({
+                        "name": l.name.as_str(),
+                        "soft": l.soft,
+                        "hard": l.hard,
+                        "source": l.source.as_str(),
+                    })
+                })
+                .collect();
+            object.insert("rlimits".into(), limits.into());
+        }
+        if let Some(cpus) = record.cpus {
+            object.insert("cpus".into(), cpus.into());
+        }
+    }
+    value
 }
 
 /// One proxy CONNECT verdict record (filtered egress only).
@@ -867,6 +894,8 @@ mod tests {
             global_config: true,
             exit_code: 0,
             duration: std::time::Duration::from_millis(1500),
+            rlimits: &[],
+            cpus: None,
         };
         log.record(launch_record(&launch));
         log.record(connect_record(
@@ -894,6 +923,57 @@ mod tests {
         assert_eq!(lines[1]["host"], "api.anthropic.com");
         assert_eq!(lines[1]["verdict"], "allow");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn launch_record_adds_rlimits_and_cpus_only_when_present() {
+        use crate::sandbox::rlimits::{
+            EffectiveLimit, LimitSource, RlimitName,
+        };
+        let base = |rlimits, cpus| LaunchRecord {
+            command: &[],
+            network_mode: "off",
+            allow_hosts: &[],
+            lockdown: false,
+            agent_state: false,
+            gpu: false,
+            display: false,
+            audio: false,
+            kvm: false,
+            browser_profile: None,
+            project_config: false,
+            project_trusted: false,
+            project_source: "none",
+            project_grants: false,
+            project_constraints: false,
+            global_config: false,
+            exit_code: 0,
+            duration: std::time::Duration::ZERO,
+            rlimits,
+            cpus,
+        };
+        // An old-shaped record: no new key appears.
+        let old = launch_record(&base(&[], None));
+        assert!(old.get("rlimits").is_none());
+        assert!(old.get("cpus").is_none());
+        let limits = [EffectiveLimit {
+            name: RlimitName::Cpu,
+            soft: 60,
+            hard: 65,
+            source: LimitSource::Cli,
+        }];
+        let new = launch_record(&base(&limits, Some("0-3")));
+        assert_eq!(new["rlimits"][0]["name"], "cpu");
+        assert_eq!(new["rlimits"][0]["hard"], 65);
+        assert_eq!(new["rlimits"][0]["source"], "cli");
+        assert_eq!(new["cpus"], "0-3");
+        // Every pre-existing key is still there with the same value.
+        let old_keys: Vec<&String> = old.as_object().unwrap().keys().collect();
+        for key in old_keys {
+            if key != "ts" {
+                assert_eq!(old[key], new[key], "{key} changed");
+            }
+        }
     }
 
     fn probe(log: &AuditLog, n: u64) {

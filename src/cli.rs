@@ -44,6 +44,13 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
+    --rlimit NAME=VALUE            Set one resource limit, applied to each process on its own
+                                   (per process, not a total for the sandbox; repeatable).
+                                   NAME: nproc, nofile, core, cpu, fsize, data, as.
+                                   VALUE: integer, K/M/G/T for fsize/data/as, or unlimited.
+                                   cpu is CPU seconds and ends the process; it does not throttle
+    --cpus <LIST>                  Run only on these CPUs (e.g. 8,24 or 0-3); locked
+                                   by seccomp so the sandbox cannot widen it (Linux)
     --systemd-user / --no-systemd-user
                                    Expose host systemd --user bus (dangerous; default: off)
     --no-gpu / --gpu               Disable/enable GPU device passthrough (Linux only)
@@ -202,6 +209,10 @@ pub struct CliArgs {
     pub landlock: Option<bool>,
     pub seccomp: Option<bool>,
     pub rlimits: Option<bool>,
+    /// `--rlimit NAME=VALUE`, validated at parse time, in order given.
+    pub rlimit: Vec<(String, String)>,
+    /// `--cpus LIST`, normalized (`0-1,3`).
+    pub cpus: Option<String>,
     pub systemd_user: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
@@ -427,6 +438,20 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long(s @ ("rlimits" | "no-rlimits")) => {
                 args.rlimits = Some(s == "rlimits");
+            }
+            Long("cpus") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let text = val.to_string_lossy();
+                let set = crate::sandbox::affinity::parse_cpu_list(&text)
+                    .map_err(|e| format!("--cpus: {e}"))?;
+                // Stored normalized so saved configs and the inner
+                // wrapper see one canonical spelling.
+                args.cpus =
+                    Some(crate::sandbox::affinity::format_cpu_list(&set));
+            }
+            Long("rlimit") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.rlimit.push(parse_rlimit_spec(&val.to_string_lossy())?);
             }
             Long(s @ ("systemd-user" | "no-systemd-user")) => {
                 args.systemd_user = Some(s == "systemd-user");
@@ -1011,6 +1036,24 @@ fn parse_configure_tail(
 /// option" before the command, "would be passed to the child" after it).
 /// The conformance test `every_guarded_sandbox_flag_is_parseable` enforces
 /// that invariant.
+/// Parse one `--rlimit NAME=VALUE`. The value is checked here, so a typo
+/// stops the launch instead of running without the limit.
+fn parse_rlimit_spec(spec: &str) -> Result<(String, String), String> {
+    use crate::sandbox::rlimits::{RlimitName, RlimitValue};
+    let (name, value) = spec.split_once('=').ok_or_else(|| {
+        format!(
+            "invalid --rlimit {spec:?}: expected NAME=VALUE, NAME one of \
+             nproc, nofile, core, cpu, fsize, data, as"
+        )
+    })?;
+    let parsed: RlimitName = name
+        .parse()
+        .map_err(|e| format!("invalid --rlimit {spec:?}: {e}"))?;
+    RlimitValue::parse(parsed, value)
+        .map_err(|e| format!("invalid --rlimit {spec:?}: {e}"))?;
+    Ok((name.to_string(), value.to_string()))
+}
+
 const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--harness",
     "--request-file",
@@ -1064,6 +1107,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-seccomp",
     "--rlimits",
     "--no-rlimits",
+    "--rlimit",
+    "--cpus",
     "--ssh",
     "--no-ssh",
     "--pictures",

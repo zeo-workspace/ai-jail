@@ -937,18 +937,28 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         cli.verbose,
     )?;
 
+    // --cpus: pin this process (and so the command it becomes) before
+    // seccomp below refuses sched_setaffinity for good. Order: bridges,
+    // Landlock, affinity, seccomp, rlimits, then the agent.
+    if let Some(cpus) = config.cpus.as_deref() {
+        sandbox::affinity::apply_cpus(&sandbox::affinity::parse_cpu_list(
+            cpus,
+        )?)?;
+    }
+
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits
     // the filter.
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
-    // Apply NPROC here, inside the sandbox, after bwrap has finished
-    // setting up namespaces. RLIMIT_NPROC counts all processes owned
-    // by the real UID system-wide, so setting it on the outer ai-jail
-    // before bwrap's clone() calls would cause EAGAIN when Chrome or
-    // other heavy applications are running.
+    // Apply the full limit set here, inside the sandbox, after bwrap
+    // has finished setting up namespaces. RLIMIT_NPROC counts all
+    // processes owned by the real UID system-wide, so setting it on the
+    // outer ai-jail before bwrap's clone() calls would cause EAGAIN when
+    // Chrome or other heavy applications are running; explicit
+    // `--rlimit` values land here too, so they never cap the supervisor.
     #[cfg(target_os = "linux")]
-    sandbox::rlimits::apply_nproc(&config, cli.verbose);
+    sandbox::rlimits::apply_sandbox(&config, cli.verbose)?;
 
     // Drop PATH entries that do not exist in here.
     //
@@ -1899,8 +1909,29 @@ fn run(
         config_store::save_project_constraints(&store, to_save)?;
     }
 
+    // Every limit the sandbox will run under, computed once here so an
+    // impossible combination (e.g. above a --lockdown default) stops the
+    // launch before anything starts, dry run included.
+    let effective_limits = sandbox::rlimits::effective(config)?;
+    sandbox::affinity::check_launch(
+        config.cpus.as_deref(),
+        config.seccomp_enabled(),
+    )?;
+
     // Handle dry run
     if cli.dry_run {
+        for limit in &effective_limits {
+            output::dry_run_line(&format!(
+                "rlimit name={} soft={} hard={} source={}",
+                limit.name.as_str(),
+                limit.soft,
+                limit.hard,
+                limit.source.as_str()
+            ));
+        }
+        if let Some(cpus) = &config.cpus {
+            output::dry_run_line(&format!("cpus={cpus}"));
+        }
         let formatted = sandbox::dry_run(
             &guard,
             config,
@@ -2048,7 +2079,7 @@ fn run(
     // across fork+exec). NPROC is applied inside the sandbox instead
     // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
     // internal clone() calls for namespace creation.
-    sandbox::rlimits::apply(config, cli.verbose);
+    sandbox::rlimits::apply(config, cli.verbose)?;
 
     let exit_code = if use_pty {
         let resize_redraw_key =
@@ -2157,6 +2188,8 @@ fn run(
                     .is_some_and(|home| home.join(".ai-jail").exists()),
             exit_code,
             duration: launch_start.elapsed(),
+            rlimits: &effective_limits,
+            cpus: config.cpus.as_deref(),
         }));
     }
 

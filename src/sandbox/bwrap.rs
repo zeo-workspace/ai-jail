@@ -1384,6 +1384,18 @@ fn landlock_wrapper_args(
     } else {
         "--no-rlimits".into()
     });
+    // Explicit limits travel to the wrapper, which recomputes the same
+    // `rlimits::effective()` set and applies it inside the sandbox.
+    for (name, value) in &config.rlimit {
+        args.push("--rlimit".into());
+        args.push(format!("{name}={value}"));
+    }
+    // --cpus: the wrapper pins itself to these CPUs right before its
+    // seccomp filter, which then refuses sched_setaffinity.
+    if let Some(cpus) = &config.cpus {
+        args.push("--cpus".into());
+        args.push(cpus.clone());
+    }
 
     args.push(if config.gpu_enabled() {
         "--gpu".into()
@@ -9172,5 +9184,119 @@ nameserver 8.8.8.8
             "CLAUDE_CONFIG_DIR must not appear when \
              claude_dir is None"
         );
+    }
+}
+
+// Story 047, Task 4.1 — the limits the supervisor computes are the limits
+// the in-sandbox wrapper re-computes from its forwarded arguments (R8.1
+// producer/consumer shapes; design.md "Integration Points", rlimits).
+//
+// Materialization: append this whole file to the end of
+// `src/sandbox/bwrap.rs` on `feat/adjustable-rlimits` (and keep it on
+// `integration`). Test names contain `roundtrip`.
+//
+// Contract: the wrapper builds its config as
+// `config::merge(&cli, Config::default())` from the arguments after
+// `--landlock-exec` (as `run_landlock_exec` does today), so feeding those
+// arguments back through `cli::parse_from` must give the same
+// `rlimits::effective()` (name, soft, hard) as the supervisor's config.
+#[cfg(test)]
+mod story047_roundtrip_rlimits_tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::sandbox::rlimits;
+
+    fn base_config(pairs: &[(&str, &str)], no_rlimits: bool) -> Config {
+        Config {
+            command: vec!["bash".into()],
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            no_display: Some(true),
+            no_mise: Some(true),
+            no_rlimits: no_rlimits.then_some(true),
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    /// The arguments the wrapper receives, between `--landlock-exec` and
+    /// the `--` that precedes the command.
+    fn wrapper_args(config: &Config) -> Vec<String> {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let args = build_dry_run_args(
+            config,
+            &PathBuf::from("/home/user/project"),
+            guard.hosts_mount(),
+            guard.resolv_mount(),
+            guard.empty_path(),
+            false,
+        )
+        .unwrap();
+        let start = args
+            .iter()
+            .position(|a| a == "--landlock-exec")
+            .expect("wrapper present");
+        let end = args[start..]
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| start + i)
+            .expect("separator after wrapper args");
+        args[start..end].to_vec()
+    }
+
+    fn triples(config: &Config) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = rlimits::effective(config)
+            .unwrap()
+            .iter()
+            .map(|l| (l.name.as_str().to_string(), l.soft, l.hard))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn reparsed(config: &Config) -> Config {
+        let mut args = wrapper_args(config);
+        args.push("true".into());
+        let cli = crate::cli::parse_from(lexopt::Parser::from_args(args))
+            .expect("wrapper args parse");
+        crate::config::merge(&cli, Config::default())
+    }
+
+    #[test]
+    fn roundtrip_wrapper_rlimit_args_give_the_same_effective_limits() {
+        let outer = base_config(
+            &[
+                ("nproc", "300"),
+                ("nofile", "512"),
+                ("cpu", "120"),
+                ("fsize", "64M"),
+                ("data", "8G"),
+                ("as", "unlimited"),
+                ("core", "0"),
+            ],
+            false,
+        );
+        assert_eq!(triples(&reparsed(&outer)), triples(&outer));
+    }
+
+    #[test]
+    fn roundtrip_no_rlimits_with_explicit_values_survives_forwarding() {
+        let outer = base_config(&[("nofile", "1024")], true);
+        let inner = reparsed(&outer);
+        assert_eq!(triples(&inner), triples(&outer));
+        assert_eq!(triples(&inner).len(), 1, "no default may reappear");
+    }
+
+    #[test]
+    fn roundtrip_lockdown_defaults_survive_forwarding() {
+        let mut outer = base_config(&[("nofile", "1024")], false);
+        outer.lockdown = Some(true);
+        assert_eq!(triples(&reparsed(&outer)), triples(&outer));
     }
 }
