@@ -83,6 +83,13 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn read_json(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
+        panic!("summary {} not written: {e}", path.display())
+    });
+    serde_json::from_slice(&bytes).expect("summary is JSON")
+}
+
 const CURL_UP: &str =
     "--retry 20 --retry-delay 0 --retry-connrefused --max-time 20";
 
@@ -99,6 +106,74 @@ fn is_rfc3339_utc(v: &serde_json::Value) -> bool {
         let b = s.as_bytes();
         b.len() == 20 && b[4] == b'-' && b[10] == b'T' && b[19] == b'Z'
     })
+}
+
+/// Minimal validator for docs/run-summary.schema.json: the
+/// properties/type/enum/required/items subset the schema file keeps to. Key
+/// sets must match `properties` exactly.
+fn schema_errors(doc: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+    fn ty(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(n) if n.is_u64() || n.is_i64() => "integer",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+    fn walk(d: &Value, s: &Value, at: &str, e: &mut Vec<String>) {
+        if let Some(t) = s.get("type") {
+            let allowed: Vec<&str> = match t {
+                Value::String(x) => vec![x.as_str()],
+                Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                _ => vec![],
+            };
+            let got = ty(d);
+            if !(allowed.contains(&got)
+                || (got == "integer" && allowed.contains(&"number")))
+            {
+                e.push(format!("{at}: {got} not in {allowed:?}"));
+                return;
+            }
+        }
+        if let Some(Value::Array(opts)) = s.get("enum")
+            && !opts.contains(d)
+        {
+            e.push(format!("{at}: {d} not in enum"));
+        }
+        if let (Value::Object(o), Some(Value::Object(p))) =
+            (d, s.get("properties"))
+        {
+            for k in o.keys() {
+                if !p.contains_key(k) {
+                    e.push(format!("{at}.{k}: not in schema"));
+                }
+            }
+            for (k, sub) in p {
+                match o.get(k) {
+                    Some(v) => walk(v, sub, &format!("{at}.{k}"), e),
+                    None => e.push(format!("{at}.{k}: missing")),
+                }
+            }
+        }
+        if let (Value::Array(items), Some(sub)) = (d, s.get("items")) {
+            for (i, it) in items.iter().enumerate() {
+                walk(it, sub, &format!("{at}[{i}]"), e);
+            }
+        }
+    }
+    let schema_path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/docs/run-summary.schema.json");
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(schema_path).expect("schema document ships"),
+    )
+    .expect("schema is JSON");
+    let mut e = Vec::new();
+    walk(doc, &schema, "$", &mut e);
+    e
 }
 
 // ── egress log: "egress_" ──────────────────────────────────────
@@ -742,5 +817,417 @@ fn teardown_dry_run_shows_the_wrapper_and_a_placeholder_fd() {
             && !fd.starts_with("--")
             && !fd.bytes().all(|b| b.is_ascii_digit()),
         "the fd is a placeholder, not a number no dry run opened: {fd:?}"
+    );
+}
+
+// ── run summary: "summary_" ────────────────────────────────────
+
+fn summary_run(
+    name: &str,
+    extra: &[&str],
+    cmd: &[&str],
+) -> (Output, serde_json::Value) {
+    let (project, home) = tree(name);
+    let path = project.join("summary.json");
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let out = command(&project, &home)
+        .arg("--run-summary")
+        .arg(&path)
+        .args(extra)
+        .arg("--exec")
+        .args(cmd)
+        .output()
+        .unwrap();
+    let doc = read_json(&path);
+    let errors = schema_errors(&doc);
+    assert!(errors.is_empty(), "schema, {name}: {errors:#?}\n{doc:#}");
+    (out, doc)
+}
+
+#[test]
+fn summary_clean_run_is_schema_v1() {
+    require_bwrap_net!();
+    // With no network flag, v3 default-allows the
+    // package registries (filtered mode), so ask for "off" explicitly.
+    let (out, doc) =
+        summary_run("sum-clean", &["--no-network"], &["sh", "-c", "exit 3"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(doc["schema"], "ai-jail.run-summary");
+    assert_eq!(doc["schema_version"], 1);
+    assert!(is_hex32(&doc["run_id"]), "{doc}");
+    assert_eq!(doc["ai_jail_version"], env!("CARGO_PKG_VERSION"));
+    assert!(is_rfc3339_utc(&doc["started_at"]));
+    assert!(is_rfc3339_utc(&doc["ended_at"]));
+    assert!(doc["duration_ms"].is_u64());
+    assert_eq!(doc["program"], "sh");
+    assert_eq!(doc["exit"]["code"], 3);
+    assert_eq!(doc["exit"]["reason"], "exited");
+    assert_eq!(
+        doc["exit"]["status_source"], "reported",
+        "the wrapper's report"
+    );
+    assert_eq!(doc["resources"]["peak_rss_scope"], "largest-process");
+    // On Linux the figures are measured inside the
+    // sandbox, by the wrapper.
+    assert_eq!(doc["resources"]["source"], "sandbox-wrapper");
+    assert!(doc["resources"]["peak_rss_kib"].as_u64().unwrap() > 0);
+    assert_eq!(doc["network"]["mode"], "off");
+    assert!(
+        doc["network"]["connections_denied"].is_null(),
+        "no proxy, no count"
+    );
+    assert!(doc["filesystem"]["denied_accesses"].is_null());
+    assert_eq!(doc["filesystem"]["denied_accesses_source"], "unavailable");
+    assert_eq!(doc["teardown"]["active"], true, "implied by --run-summary");
+    assert_eq!(doc["teardown"]["complete"], true);
+    assert_eq!(doc["teardown"]["survivors"], serde_json::json!([]));
+}
+
+#[test]
+fn summary_records_the_program_basename_only() {
+    require_bwrap_net!();
+    let (project, home) = tree("sum-basename");
+    let path = project.join("summary.json");
+    let out = command(&project, &home)
+        .env("AI_JAIL_SECRET_PROBE", "hunter2-env")
+        .arg("--run-summary")
+        .arg(&path)
+        .args(["--exec", "/bin/sh", "-c", "exit 0", "argv-hunter2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(doc["program"], "sh");
+    for needle in ["hunter2", "/bin/sh", "exit 0"] {
+        assert!(!raw.contains(needle), "{needle:?} leaked: {raw}");
+    }
+}
+
+#[test]
+fn summary_network_counts_follow_the_mode() {
+    require_bwrap_net!();
+    // Off/full are null, not 0 ...
+    for (name, flag, mode) in [
+        ("off", "--no-network", "off"),
+        ("full", "--network", "full"),
+    ] {
+        let (_, doc) =
+            summary_run(&format!("sum-net-{name}"), &[flag], &["true"]);
+        assert_eq!(doc["network"]["mode"], mode);
+        for k in [
+            "connections_allowed",
+            "connections_denied",
+            "connections_errored",
+            "bytes_up",
+            "bytes_down",
+        ] {
+            assert!(
+                doc["network"][k].is_null(),
+                "{mode}.{k}: {}",
+                doc["network"]
+            );
+        }
+    }
+    // ... and filtered with no traffic is 0, not null.
+    let (_, doc) = summary_run(
+        "sum-net-filtered",
+        &["--allow-host", "127.0.0.1"],
+        &["true"],
+    );
+    assert_eq!(doc["network"]["mode"], "filtered");
+    assert_eq!(doc["network"]["connections_denied"], 0);
+    assert_eq!(doc["network"]["connections_allowed"], 0);
+}
+
+#[test]
+fn summary_matches_egress_log() {
+    require_bwrap_net!();
+    require_curl!();
+    let fixture = http_fixture();
+    let (project, home) = tree("sum-egress");
+    let log = project.join("egress.jsonl");
+    // An earlier run already left a deny line in the same
+    // append-only log. The summary must count THIS run's lines only.
+    // Loopback is in no_proxy (see
+    // three_connections), so force the fixture through the proxy.
+    let earlier = format!(
+        "curl --noproxy '' -p -sS {CURL_UP} http://127.0.0.1:{fixture}/ >/dev/null; \
+         curl -p -sS --max-time 10 http://earlier.example:80/ >/dev/null 2>&1; exit 0"
+    );
+    egress_run("sum-egress-earlier", &log, &earlier);
+    let before = read_jsonl(&log).len();
+    assert_eq!(before, 2, "earlier run wrote its lines");
+
+    let script = format!(
+        // Three_connections already ends in "; ", so a
+        // second ";" was a bash syntax error.
+        "{} curl -p -sS --max-time 10 http://second.example:80/ >/dev/null 2>&1; \
+         sleep 300 & exit 0",
+        three_connections(fixture).trim_end_matches("exit 0")
+    );
+    let summary = project.join("summary.json");
+    let out = {
+        let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        command(&project, &home)
+            .args(["--exec", "--allow-host", "127.0.0.1", "--egress-log"])
+            .arg(&log)
+            .arg("--run-summary")
+            .arg(&summary)
+            .args(["bash", "-c", &script])
+            .output()
+            .unwrap()
+    };
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc = read_json(&summary);
+    assert!(schema_errors(&doc).is_empty(), "{:#?}", schema_errors(&doc));
+    let all = read_jsonl(&log);
+    let mine: Vec<_> = all
+        .iter()
+        .filter(|l| l["run_id"] == doc["run_id"])
+        .collect();
+    assert_eq!(mine.len(), 4, "this run opened four connections: {mine:#?}");
+    assert_ne!(all[0]["run_id"], doc["run_id"], "run ids never repeat");
+    let count =
+        |v: &str| mine.iter().filter(|l| l["verdict"] == v).count() as u64;
+    let sum =
+        |k: &str| mine.iter().map(|l| l[k].as_u64().unwrap()).sum::<u64>();
+    let net = &doc["network"];
+    assert_eq!(
+        net["connections_denied"],
+        count("deny"),
+        "denied = deny lines"
+    );
+    assert_eq!(net["connections_denied"], 2);
+    assert_eq!(net["connections_allowed"], count("allow"));
+    assert_eq!(net["connections_errored"], count("error"));
+    assert_eq!(net["bytes_up"], sum("bytes_up"));
+    assert_eq!(net["bytes_down"], sum("bytes_down"));
+    assert_eq!(doc["exit"]["status_source"], "reported");
+    let survivors = doc["teardown"]["survivors"].as_array().unwrap();
+    let sleep = survivors
+        .iter()
+        .find(|s| s["comm"] == "sleep")
+        .expect("sleep survivor");
+    assert_eq!(sleep["ended_by"], "sigterm");
+    for k in ["pid", "ppid", "age_s"] {
+        assert!(sleep[k].is_u64() || sleep[k].is_i64(), "{k}: {sleep}");
+    }
+    assert!(
+        survivors.iter().all(|s| s["comm"] != "ai-jail"),
+        "no phantom bridge survivor: {survivors:?}"
+    );
+}
+
+#[test]
+fn summary_names_the_sigkill_ending_of_a_stubborn_survivor() {
+    require_bwrap_net!();
+    let (_, doc) = summary_run(
+        "sum-stubborn",
+        &[],
+        &[
+            "sh",
+            "-c",
+            "sh -c 'trap \"\" TERM; exec sleep 300' & sleep 0.2; exit 0",
+        ],
+    );
+    let survivors = doc["teardown"]["survivors"].as_array().unwrap();
+    assert!(
+        survivors
+            .iter()
+            .any(|s| s["comm"] == "sleep" && s["ended_by"] == "sigkill"),
+        "{survivors:?}"
+    );
+    assert_eq!(doc["teardown"]["grace_ms"], 2000);
+}
+
+#[test]
+fn summary_teardown_incomplete_when_the_wrapper_dies() {
+    require_bwrap_net!();
+    // The command kills its parent (the wrapper): no report arrives.
+    let (out, doc) = summary_run(
+        "sum-wrapper-killed",
+        &[],
+        &["sh", "-c", "kill -9 $PPID; sleep 5"],
+    );
+    assert_eq!(doc["teardown"]["complete"], false, "{doc:#}");
+    assert!(doc["teardown"]["incomplete_reason"].is_string(), "{doc:#}");
+    assert_eq!(doc["exit"]["status_source"], "inferred", "falls back");
+    assert_eq!(
+        doc["exit"]["code"].as_i64(),
+        out.status.code().map(i64::from)
+    );
+}
+
+#[test]
+fn summary_invalid_target_warns_and_launches() {
+    require_bwrap_net!();
+    let (project, home) = tree("sum-invalid");
+    let victim = project.join("victim.json");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let link = project.join("link.json");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let missing = project.join("no-such-dir").join("s.json");
+    for (target, needle, code) in
+        [(&link, "link.json", "6"), (&missing, "no-such-dir", "4")]
+    {
+        let out = command(&project, &home)
+            .arg("--run-summary")
+            .arg(target)
+            .args(["--exec", "sh", "-c", &format!("exit {code}")])
+            .output()
+            .unwrap();
+        let stderr = text(&out.stderr);
+        assert_eq!(out.status.code(), Some(code.parse().unwrap()), "{stderr}");
+        assert!(stderr.contains(needle), "warns with the path: {stderr}");
+    }
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+}
+
+#[test]
+fn summary_write_failure_keeps_the_exit_code() {
+    require_bwrap_net!();
+    // The target directory sits in the project, which the command can
+    // write: it removes the directory, so the final write must fail.
+    let (project, home) = tree("sum-write-fail");
+    std::fs::create_dir_all(project.join("out")).unwrap();
+    let target = project.join("out").join("s.json");
+    let out = command(&project, &home)
+        .arg("--run-summary")
+        .arg(&target)
+        .args(["--exec", "sh", "-c", "rm -rf out; exit 9"])
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(9), "{stderr}");
+    assert!(
+        stderr.contains("s.json") || stderr.contains("out"),
+        "error names the path: {stderr}"
+    );
+}
+
+#[test]
+fn summary_reported_exit_137_is_silent() {
+    require_bwrap_net!();
+    // The fallback first: with no report, bwrap's 137 is indistinguishable
+    // from SIGKILL, so it is decoded (inferred) and explained.
+    let plain = run("sum-137-plain", &["--exec", "sh", "-c", "exit 137"]);
+    assert_eq!(plain.status.code(), Some(137));
+    assert!(text(&plain.stderr).contains("SIGKILL"), "inferred decode");
+    // With the wrapper's report, exit(137) is a normal exit: no line.
+    let (out, doc) = summary_run("sum-137", &[], &["sh", "-c", "exit 137"]);
+    assert_eq!(out.status.code(), Some(137), "code unchanged");
+    assert_eq!(text(&out.stderr), "", "a reported exit 137 is silent");
+    assert_eq!(doc["exit"]["reason"], "exited", "{doc:#}");
+    assert!(doc["exit"]["signal"].is_null(), "{doc:#}");
+    assert_eq!(doc["exit"]["status_source"], "reported");
+    assert_eq!(doc["exit"]["code"], 137);
+}
+
+#[test]
+fn summary_start_failed_is_recorded() {
+    require_bwrap_net!();
+    // TMPDIR names a missing directory: sandbox::prepare() cannot create
+    // its temporary hosts file, after the summary guard exists.
+    let (project, home) = tree("sum-start-failed");
+    let path = project.join("summary.json");
+    let out = command(&project, &home)
+        .env("TMPDIR", project.join("no-such-tmp"))
+        .arg("--run-summary")
+        .arg(&path)
+        .args(["--exec", "true"])
+        .output()
+        .unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "start failure: {stderr}");
+    let doc = read_json(&path);
+    let errors = schema_errors(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert_eq!(doc["exit"]["reason"], "start-failed", "{doc:#}");
+    assert!(
+        doc["exit"]["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the startup error is recorded: {doc:#}"
+    );
+}
+
+#[test]
+fn summary_resources_measure_the_command() {
+    require_bwrap_net!();
+    // The failure case first (units): a command that holds almost nothing
+    // reports a peak far below 64 MiB. A peak in bytes, or a fixed or
+    // summed figure, would not be.
+    let (out, doc) = summary_run(
+        "sum-res-small",
+        &["--no-network"],
+        &["sh", "-c", "exit 0"],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let r = &doc["resources"];
+    assert_eq!(r["source"], "sandbox-wrapper", "{r}");
+    let small = r["peak_rss_kib"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the peak is a figure: {r}"));
+    assert!(small < 65_536, "a trivial command's peak: {small} KiB");
+
+    // The command itself holds 64 MiB: bash reads it into one variable.
+    // Its peak must be the command's, not the launcher's (bwrap alone
+    // stays at a few MiB).
+    let script = "x=$(head -c 67108864 /dev/zero | tr '\\0' a); echo ${#x}";
+    let (out, doc) =
+        summary_run("sum-res-64m", &["--no-network"], &["bash", "-c", script]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout).trim(),
+        "67108864",
+        "setup: the command held 64 MiB"
+    );
+    let r = &doc["resources"];
+    assert_eq!(r["source"], "sandbox-wrapper", "{r}");
+    assert_eq!(r["peak_rss_scope"], "largest-process", "{r}");
+    let peak = r["peak_rss_kib"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the peak is a figure: {r}"));
+    assert!(
+        peak >= 65_536,
+        "the command's 64 MiB, not the launcher's: {peak} KiB"
+    );
+    assert!(
+        r["cpu_user_ms"].is_u64() && r["cpu_system_ms"].is_u64(),
+        "{r}"
+    );
+}
+
+#[test]
+fn summary_dry_run_shows_the_teardown_wrapper_it_implies() {
+    require_bwrap_net!();
+    // --run-summary implies --teardown-report, so the argv a dry run prints
+    // must carry the wrapper and its descriptor as the launch would. Every
+    // other reason for the wrapper is off.
+    let target = std::env::temp_dir()
+        .join(format!("ai-jail-summary-dry-{}.json", std::process::id()));
+    let target = target.to_str().unwrap();
+    let out = run(
+        "summary-dry",
+        &[
+            "--no-landlock",
+            "--no-seccomp",
+            "--no-rlimits",
+            "--no-network",
+            "--run-summary",
+            target,
+            "--dry-run",
+            "sh",
+            "-c",
+            "exit 0",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let words = dry_run_words(&out);
+    assert!(words.iter().any(|w| w == "--landlock-exec"), "{words:?}");
+    let fd = words.iter().position(|w| w == "--teardown-report-fd");
+    assert!(fd.is_some(), "the report descriptor is shown: {words:?}");
+    assert!(
+        !std::path::Path::new(target).exists(),
+        "a dry run writes no summary"
     );
 }

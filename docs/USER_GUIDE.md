@@ -555,6 +555,22 @@ name (`comm`) only; their command lines and environments are never read.
 The exit code is the command's own. On macOS the flag is accepted and
 changes nothing.
 
+`--run-summary PATH` is a per-launch CLI flag too, never saved, so onboarding
+does not offer it. When the run ends, on every path once the launch is under
+way, including a sandbox that failed to start, ai-jail writes one JSON document
+to `PATH`. An invocation that ends earlier exits with its error and writes
+none, for example an argument error, a missing `bwrap`, a project config that
+cannot be read, a restricted SSH agent or a secret that fails to start, or a
+cancel (Ctrl-C) before the launch; a dry run writes none either. The document
+holds the run id (the same as the egress log's), start and end times, the
+program's basename, how the command ended and why, the command's CPU time and
+peak memory (measured inside the sandbox on Linux; `null` when not measured),
+the egress counts in filtered mode, and the teardown result. The file is written
+to a temporary name and renamed, so a reader sees the previous document or the
+new one, never a torn one. A symlink at `PATH`, or a missing directory, is a
+warning at startup and the run goes on without a summary. It implies
+`--teardown-report`. The format is versioned by `docs/run-summary.schema.json`.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,

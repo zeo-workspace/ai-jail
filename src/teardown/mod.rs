@@ -2,24 +2,36 @@
 //! waits for the command, lists the processes that outlived it, stops
 //! them gracefully and reports them to the supervisor on a pipe.
 //!
-//! Linux-only: the module is compiled out on macOS, where the flag is
-//! accepted and changes nothing.
+//! The report types are shared with `run_summary` and stay on every
+//! platform; everything that reads `/proc` or sends signals is Linux-only
+//! (macOS records the section as `Unsupported`).
+
+// macOS only records the section as unsupported: the report types are
+// built and read by the Linux wrapper and supervisor alone.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+// The wrapper and the supervisor need prctl, pipe2 and the Linux wait
+// status; macOS builds only the report types.
+#[cfg(target_os = "linux")]
 mod reaper;
+#[cfg(target_os = "linux")]
 pub use reaper::{claim_report_fd, run_command_as_reaper};
+#[cfg(target_os = "linux")]
 mod supervisor;
+#[cfg(target_os = "linux")]
 pub use supervisor::TeardownRun;
 // The unit tests below reach these through
 // `use super::*`; production code goes through `TeardownRun`.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use supervisor::{read_report, stderr_line};
 
-/// Fixed grace between SIGTERM and SIGKILL.
-pub const GRACE: Duration = Duration::from_millis(2000);
+/// Fixed grace between SIGTERM and SIGKILL. Defined on every platform:
+/// the run summary reports it.
+pub const GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
 /// The only report version this build reads and writes.
 pub const REPORT_VERSION: u32 = 1;
@@ -143,12 +155,18 @@ pub struct WireUsage {
     pub peak_rss_kib: u64,
 }
 
-/// How the teardown of one run ended, as the supervisor learned it.
+/// How the teardown of one run ended, as the supervisor learned it, for
+/// the run summary on every platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TeardownSection {
+    /// macOS: the flag is accepted and nothing is stopped or reported.
+    #[cfg(any(test, not(target_os = "linux")))]
+    Unsupported,
     Inactive,
     Reported(TeardownReport),
-    Missing { reason: String },
+    Missing {
+        reason: String,
+    },
 }
 
 /// Parses one `/proc/<pid>/stat` line. `comm` sits in parentheses and is
@@ -536,7 +554,7 @@ pub fn age_seconds(start_ticks: u64, uptime_now_s: f64, clk_tck: u64) -> u64 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     // Listing survivors, the stderr line, the report's wire format and stopping
     // survivors. Assumes TeardownReport derives Serialize (the wrapper writes

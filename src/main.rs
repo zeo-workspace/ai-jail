@@ -20,12 +20,14 @@ mod onboarding;
 mod output;
 mod proxy;
 mod pty;
+mod run_summary;
 mod sandbox;
 mod secret;
 mod signals;
 mod ssh_restricted;
 mod statusbar;
-#[cfg(target_os = "linux")]
+// Cross-platform here: the run summary records the teardown section on
+// macOS too (as unsupported).
 mod teardown;
 
 #[cfg(test)]
@@ -351,15 +353,10 @@ fn validate_egress_log(
     ))
 }
 
-/// Open the `--egress-log` file for this run. Optional logging is
-/// best-effort, as `--audit-log` is (README `## Audit log`): an unreadable
-/// `/dev/urandom` falls back to a pid-and-time run id, and a file that
-/// cannot be opened is reported and the launch goes on without it.
-/// Both go through `output::security_warn`, so `--exec` does not hide them.
-fn open_egress_log(
-    path: &std::path::Path,
-) -> Option<std::sync::Arc<egress_log::EgressLog>> {
-    let run_id = egress_log::run_id().unwrap_or_else(|error| {
+/// One run id per launch, shared by the egress log and the run summary;
+/// the fallback when `/dev/urandom` cannot be read.
+fn launch_run_id() -> String {
+    egress_log::run_id().unwrap_or_else(|error| {
         output::security_warn(&format!(
             "{error}; using a run id from the pid and start time"
         ));
@@ -367,8 +364,66 @@ fn open_egress_log(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         egress_log::fallback_run_id(std::process::id(), nanos)
-    });
-    match egress_log::EgressLog::open(path, &run_id) {
+    })
+}
+
+/// `--run-summary`: check the target once at startup. A refused target is
+/// reported and the launch goes on without a summary.
+fn start_run_summary(
+    path: Option<&std::path::Path>,
+    dry_run: bool,
+    cwd: &std::path::Path,
+    run_id: &str,
+    command: &[String],
+) -> Option<run_summary::SummaryGuard> {
+    let path = path.filter(|_| !dry_run)?;
+    match run_summary::RunSummaryTarget::prepare(path, cwd) {
+        Ok(target) => Some(run_summary::SummaryGuard::start(
+            target,
+            run_id,
+            run_summary::program_name(command),
+        )),
+        Err(error) => {
+            output::security_warn(&format!("{error}; run summary disabled"));
+            None
+        }
+    }
+}
+
+fn network_mode_name(mode: config::NetworkMode) -> &'static str {
+    match mode {
+        config::NetworkMode::Off => "off",
+        config::NetworkMode::Filtered => "filtered",
+        config::NetworkMode::Full => "full",
+    }
+}
+
+/// The summary's network section: counted only where the proxy saw every
+/// connection.
+fn network_section(
+    mode: config::NetworkMode,
+    stats: &egress_log::EgressStats,
+) -> run_summary::NetworkSection {
+    let name = network_mode_name(mode);
+    if mode == config::NetworkMode::Filtered {
+        run_summary::NetworkSection::Counted {
+            mode: name,
+            totals: stats.snapshot(),
+        }
+    } else {
+        run_summary::NetworkSection::NotCounted { mode: name }
+    }
+}
+
+/// Open the `--egress-log` file for this run. Optional logging is
+/// best-effort, as `--audit-log` is (README `## Audit log`): a file that
+/// cannot be opened is reported through `output::security_warn`, which
+/// `--exec` does not hide, and the launch goes on without it.
+fn open_egress_log(
+    path: &std::path::Path,
+    run_id: &str,
+) -> Option<std::sync::Arc<egress_log::EgressLog>> {
+    match egress_log::EgressLog::open(path, run_id) {
         Ok(log) => Some(std::sync::Arc::new(log)),
         Err(error) => {
             // The error already names the path (EgressLog::open).
@@ -1866,308 +1921,346 @@ fn run(
     // log, so the sandbox never sees the file. `validate_egress_log`
     // already refused it outside filtered mode. The stats count every
     // connection whether or not a file was asked for.
+    let run_id = launch_run_id();
     let egress_log = match cli.egress_log.as_deref() {
-        Some(path) if !cli.dry_run => open_egress_log(path),
+        Some(path) if !cli.dry_run => open_egress_log(path, &run_id),
         _ => None,
     };
     let egress_stats = std::sync::Arc::new(egress_log::EgressStats::default());
 
-    // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
-    let guard = sandbox::prepare()?;
+    // Run summary: created before anything below can fail,
+    // so a start failure is recorded too. It implies teardown.
+    let summary = start_run_summary(
+        cli.run_summary.as_deref(),
+        cli.dry_run,
+        &invocation_cwd,
+        &run_id,
+        &config.command,
+    );
+    // Implied by the flag itself, even when its target was refused.
+    let teardown_requested =
+        cli.teardown_report || (cli.run_summary.is_some() && !cli.dry_run);
+    let summary_network_mode = config.network_mode();
+    let drain_on_exit = egress_log.is_some() || summary.is_some();
 
-    // Filtered egress: the CONNECT proxy runs as threads in this
-    // supervisor process. On Linux the sandbox reaches it through the
-    // bind-mounted Unix socket and the in-sandbox bridge; on macOS the
-    // child talks to its loopback TCP port directly (no netns there).
-    // The handle must outlive the child, so it stays bound for the rest
-    // of run() (dropping it unlinks the socket file).
-    #[cfg(target_os = "linux")]
-    let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
-    {
-        let mut allowlist = config.allow_hosts().to_vec();
-        allowlist.extend(config.allow_private_hosts().iter().cloned());
-        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
-        proxy_config.allow_private_hosts =
-            config.allow_private_hosts().to_vec();
-        // Test-only escape hatches (tests/filtered_egress.rs,
-        // tests/phantom_secrets.rs): let the end-to-end tests CONNECT to
-        // loopback fixtures and trust a self-signed root. These are compiled
-        // in ONLY under the `test-hooks` feature; a release build
-        // (`cargo build --release`, `cargo install`) has neither the env-var
-        // read nor the string, so they cannot be reached at runtime.
-        proxy_config.danger_allow_private = test_allow_private();
-        proxy_config.danger_extra_roots = test_extra_roots();
-        // The audit handle is supervisor-side; the sandbox never sees
-        // the file it appends to.
-        proxy_config.audit = audit_log.clone();
-        proxy_config.egress = egress_log.clone();
-        proxy_config.stats = std::sync::Arc::clone(&egress_stats);
-        proxy_config.drain_on_exit = egress_log.is_some();
-        proxy_config.prompt = host_prompt(config);
-        let proxy_config = launch_runner.finish_proxy_config(proxy_config);
-        let socket = proxy::default_socket_path();
-        let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
-            .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
-        Some(proxy)
-    } else {
-        if config.prompt_hosts_enabled() {
-            output::warn(
-                "--prompt-hosts has no effect: network egress is not filtered",
-            );
-        }
-        None
-    };
-    #[cfg(target_os = "macos")]
-    let egress_proxy = if config.network_mode() == config::NetworkMode::Filtered
-    {
-        let mut allowlist = config.allow_hosts().to_vec();
-        allowlist.extend(config.allow_private_hosts().iter().cloned());
-        let mut proxy_config = proxy::ProxyConfig::new(allowlist);
-        proxy_config.allow_private_hosts =
-            config.allow_private_hosts().to_vec();
-        proxy_config.audit = audit_log.clone();
-        proxy_config.egress = egress_log.clone();
-        proxy_config.stats = std::sync::Arc::clone(&egress_stats);
-        proxy_config.drain_on_exit = egress_log.is_some();
-        let proxy_config = launch_runner.finish_proxy_config(proxy_config);
-        let proxy = proxy::Proxy::start(proxy_config, None)
-            .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
-        Some(proxy)
-    } else {
-        None
-    };
+    // Everything from here to the launch record runs inside one closure,
+    // so every `?` and `return Err` after the summary exists reaches the
+    // single finish() below it, with no list of error paths to maintain.
+    let result = (|| -> Result<(i32, Option<run_summary::RunEnd>), String> {
+        let config = launch_runner.config();
 
-    // Port forwards (Linux): one host-side Unix listener per port, bound
-    // before the sandbox is built so bwrap can mount each socket. Like the
-    // proxy handle, they must outlive the child (dropping unlinks them).
-    #[cfg(target_os = "linux")]
-    let port_forwards = config
-        .forward_ports()
-        .iter()
-        .map(|&port| {
-            proxy::PortForward::start(port, cli.verbose).map_err(|e| {
-                format!("Failed to start the forward for port {port}: {e}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    // Published ports (Linux): the host listens on 127.0.0.1:<port> from
-    // here on (a taken port is fatal) and connections wait in the backlog
-    // until the in-sandbox bridge connects to the mounted Unix socket.
-    #[cfg(target_os = "linux")]
-    let port_publishes = config
-        .publish_ports()
-        .iter()
-        .map(|&port| {
-            proxy::PortPublish::start(port, cli.verbose).map_err(|e| {
-                format!("Failed to publish port {port} on 127.0.0.1: {e}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    #[cfg(target_os = "linux")]
-    let bridge_sockets = sandbox::BridgeSockets {
-        forward: port_forwards
-            .iter()
-            .map(|f| (f.port(), f.unix_path().to_path_buf()))
-            .collect(),
-        publish: port_publishes
-            .iter()
-            .map(|p| (p.port(), p.unix_path().to_path_buf()))
-            .collect(),
-    };
-    #[cfg(not(target_os = "linux"))]
-    let bridge_sockets = sandbox::BridgeSockets::default();
+        // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
+        let guard = sandbox::prepare()?;
 
-    let project_dir = std::env::current_dir()
-        .map_err(|e| format!("Cannot determine current directory: {e}"))?;
-
-    // Save config in normal mode. In lockdown mode avoid host writes unless user
-    // explicitly requested persistence via --init.
-    //
-    if store.available
-        && !skip_project_auto_save
-        && should_auto_save_project_config(&cli, config)
-    {
-        let mut to_save = config::project_config_for_auto_save(
-            &cli,
-            project_config,
-            &invocation_cwd,
-        );
-        forge_auth::strip_runtime(&mut to_save);
-        config_store::save_project_constraints(&store, to_save)?;
-    }
-
-    // Handle dry run
-    if cli.dry_run {
-        let formatted = sandbox::dry_run(
-            &guard,
-            config,
-            &project_dir,
-            cli.verbose,
-            egress_proxy.as_ref(),
-            &bridge_sockets,
-            cli.teardown_report,
-        )?;
-        output::dry_run_line(&formatted);
-        return Ok(0);
-    }
-
-    // Forge credentials are the final host-derived launch authority. Load and
-    // verify them only after every read-only/nonlaunch exit and after the dry
-    // run has completed, then keep the revocation guard alive with the runner.
-    if !cli.clean {
-        launch_runner.attach_forge(&store)?;
-    }
-    let config = launch_runner.config();
-    if let Some((harness, saved, approved_env_names)) =
-        final_access_render.take()
-    {
-        eprintln!(
-            "{}",
-            onboarding::render_effective_access(
-                config,
-                &invocation_cwd,
-                &harness,
-                saved,
-                &approved_env_names,
-            )?
-        );
-    }
-    if let Some(runtime) = &launch_runner.forge {
-        eprintln!("{}", runtime.summary_line());
-    }
-
-    // A real host inode gives bwrap a race-resistant mountpoint for the
-    // mandatory absent-file mask. Identity-checked RAII removes only the
-    // placeholder we created, never a replacement made concurrently. A hard
-    // crash may leave an empty 0600 file; it grants no authority and the next
-    // migration/launch treats it as recoverable masking debris.
-    let _legacy_mask_placeholder =
-        config_store::LegacyMaskPlaceholder::prepare(&store)?;
-
-    // macOS has no private /tmp mount. Hard browser profiles therefore live
-    // inside the launch's dedicated session scratch directory and must be
-    // removed when this supervisor exits. Linux hard profiles live in the
-    // sandbox's tmpfs, so this guard is a no-op there.
-    let _browser_profile_guard = sandbox::browser_profile_guard(config);
-
-    output::info(&format!("Jail Active: {}", project_dir.display()));
-
-    // Set up status bar if enabled and stdio is attached to a terminal
-    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if exec_requires_terminal_passthrough(
-        cli.exec,
-        stdout_is_tty,
-        config.terminal_passthrough_enabled(),
-    ) {
-        return Err(
-            "--exec on a terminal requires --terminal-passthrough".into()
-        );
-    }
-    let needs_direct_tty = command_needs_direct_tty(&config.command);
-    let multiplexer = running_inside_multiplexer();
-    // Auto-skip the ai-jail status bar / PTY proxy inside a
-    // multiplexer unless the user explicitly opted in via -s,
-    // --status-bar=..., or `no_status_bar = false` in config.
-    let explicit_status_bar =
-        cli.status_bar_style.is_some() || config.no_status_bar == Some(false);
-    let multiplexer_skip = multiplexer.is_some() && !explicit_status_bar;
-    let use_status_bar = config.status_bar_enabled()
-        && stdout_is_tty
-        && stdin_is_tty
-        && !cli.exec
-        && !needs_direct_tty
-        && !multiplexer_skip;
-    // Even without the overlay, interactive children use a PTY proxy so the
-    // host terminal never accepts escape sequences directly from the sandbox.
-    // The decision keys on stdout: piped stdin + terminal stdout still
-    // filters (see pty_proxy_active).
-    let use_pty = pty_proxy_active(cli.exec, stdout_is_tty);
-    if cli.verbose {
-        if config.status_bar_enabled() {
-            if needs_direct_tty {
-                output::verbose(&format!(
-                    "Status bar: skipped ({} requires direct terminal passthrough)",
-                    command::effective_name(&config.command)
-                        .unwrap_or("command")
-                ));
-            } else if multiplexer_skip {
-                output::verbose(&format!(
-                    "Status bar: auto-disabled ({} detected; pass -s to force-enable)",
-                    multiplexer.unwrap()
-                ));
-            } else if stdout_is_tty && stdin_is_tty {
-                output::verbose("Status bar: enabled");
-            } else {
-                output::verbose("Status bar: skipped (stdio is not a tty)");
-            }
+        // Filtered egress: the CONNECT proxy runs as threads in this
+        // supervisor process. On Linux the sandbox reaches it through the
+        // bind-mounted Unix socket and the in-sandbox bridge; on macOS the
+        // child talks to its loopback TCP port directly (no netns there).
+        // The handle must outlive the child, so it stays bound for the rest
+        // of run() (dropping it unlinks the socket file).
+        #[cfg(target_os = "linux")]
+        let egress_proxy = if config.network_mode()
+            == config::NetworkMode::Filtered
+        {
+            let mut allowlist = config.allow_hosts().to_vec();
+            allowlist.extend(config.allow_private_hosts().iter().cloned());
+            let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+            proxy_config.allow_private_hosts =
+                config.allow_private_hosts().to_vec();
+            // Test-only escape hatches (tests/filtered_egress.rs,
+            // tests/phantom_secrets.rs): let the end-to-end tests CONNECT to
+            // loopback fixtures and trust a self-signed root. These are
+            // compiled in ONLY under the `test-hooks` feature; a release build
+            // (`cargo build --release`, `cargo install`) has neither the
+            // env-var read nor the string, so they cannot be reached at
+            // runtime.
+            proxy_config.danger_allow_private = test_allow_private();
+            proxy_config.danger_extra_roots = test_extra_roots();
+            // The audit handle is supervisor-side; the sandbox never sees
+            // the file it appends to.
+            proxy_config.audit = audit_log.clone();
+            proxy_config.egress = egress_log.clone();
+            proxy_config.stats = std::sync::Arc::clone(&egress_stats);
+            // The egress log and the summary both need the lines and bytes
+            // of tunnels the command left open; any other run ends its
+            // proxy as before.
+            proxy_config.drain_on_exit = drain_on_exit;
+            proxy_config.prompt = host_prompt(config);
+            let proxy_config = launch_runner.finish_proxy_config(proxy_config);
+            let socket = proxy::default_socket_path();
+            let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
+                .map_err(|e| {
+                    format!("Failed to start the egress proxy: {e}")
+                })?;
+            Some(proxy)
         } else {
-            output::verbose(
-                "Status bar: off (use --no-status-bar to disable globally)",
+            if config.prompt_hosts_enabled() {
+                output::warn(
+                    "--prompt-hosts has no effect: network egress is not filtered",
+                );
+            }
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let egress_proxy = if config.network_mode()
+            == config::NetworkMode::Filtered
+        {
+            let mut allowlist = config.allow_hosts().to_vec();
+            allowlist.extend(config.allow_private_hosts().iter().cloned());
+            let mut proxy_config = proxy::ProxyConfig::new(allowlist);
+            proxy_config.allow_private_hosts =
+                config.allow_private_hosts().to_vec();
+            proxy_config.audit = audit_log.clone();
+            proxy_config.egress = egress_log.clone();
+            proxy_config.stats = std::sync::Arc::clone(&egress_stats);
+            // The egress log and the summary both need the lines and bytes
+            // of tunnels the command left open; any other run ends its
+            // proxy as before.
+            proxy_config.drain_on_exit = drain_on_exit;
+            let proxy_config = launch_runner.finish_proxy_config(proxy_config);
+            let proxy =
+                proxy::Proxy::start(proxy_config, None).map_err(|e| {
+                    format!("Failed to start the egress proxy: {e}")
+                })?;
+            Some(proxy)
+        } else {
+            None
+        };
+
+        // Port forwards (Linux): one host-side Unix listener per port, bound
+        // before the sandbox is built so bwrap can mount each socket. Like the
+        // proxy handle, they must outlive the child (dropping unlinks them).
+        #[cfg(target_os = "linux")]
+        let port_forwards = config
+            .forward_ports()
+            .iter()
+            .map(|&port| {
+                proxy::PortForward::start(port, cli.verbose).map_err(|e| {
+                    format!("Failed to start the forward for port {port}: {e}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Published ports (Linux): the host listens on 127.0.0.1:<port> from
+        // here on (a taken port is fatal) and connections wait in the backlog
+        // until the in-sandbox bridge connects to the mounted Unix socket.
+        #[cfg(target_os = "linux")]
+        let port_publishes = config
+            .publish_ports()
+            .iter()
+            .map(|&port| {
+                proxy::PortPublish::start(port, cli.verbose).map_err(|e| {
+                    format!("Failed to publish port {port} on 127.0.0.1: {e}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(target_os = "linux")]
+        let bridge_sockets = sandbox::BridgeSockets {
+            forward: port_forwards
+                .iter()
+                .map(|f| (f.port(), f.unix_path().to_path_buf()))
+                .collect(),
+            publish: port_publishes
+                .iter()
+                .map(|p| (p.port(), p.unix_path().to_path_buf()))
+                .collect(),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let bridge_sockets = sandbox::BridgeSockets::default();
+
+        let project_dir = std::env::current_dir()
+            .map_err(|e| format!("Cannot determine current directory: {e}"))?;
+
+        // Save config in normal mode. In lockdown mode avoid host writes unless
+        // user explicitly requested persistence via --init.
+        //
+        if store.available
+            && !skip_project_auto_save
+            && should_auto_save_project_config(&cli, config)
+        {
+            let mut to_save = config::project_config_for_auto_save(
+                &cli,
+                project_config,
+                &invocation_cwd,
+            );
+            forge_auth::strip_runtime(&mut to_save);
+            config_store::save_project_constraints(&store, to_save)?;
+        }
+
+        // Handle dry run
+        if cli.dry_run {
+            let formatted = sandbox::dry_run(
+                &guard,
+                config,
+                &project_dir,
+                cli.verbose,
+                egress_proxy.as_ref(),
+                &bridge_sockets,
+                // The argv a launch would run: --run-summary implies the
+                // teardown wrapper, dry run or not.
+                cli.teardown_report || cli.run_summary.is_some(),
+            )?;
+            output::dry_run_line(&formatted);
+            return Ok((0, None));
+        }
+
+        // Forge credentials are the final host-derived launch authority. Load
+        // and verify them only after every read-only/nonlaunch exit and after
+        // the dry run has completed, then keep the revocation guard alive with
+        // the runner.
+        if !cli.clean {
+            launch_runner.attach_forge(&store)?;
+        }
+        let config = launch_runner.config();
+        if let Some((harness, saved, approved_env_names)) =
+            final_access_render.take()
+        {
+            eprintln!(
+                "{}",
+                onboarding::render_effective_access(
+                    config,
+                    &invocation_cwd,
+                    &harness,
+                    saved,
+                    &approved_env_names,
+                )?
             );
         }
-    }
-    if use_status_bar {
-        statusbar::setup(
-            &project_dir,
-            &config.command,
-            config.status_bar_style(),
-            config,
-        );
-    }
-    // The update check only runs with the status bar active AND an
-    // explicit opt-in (phones home to GitHub; default off).
-    if should_check_update(config, use_status_bar) {
-        statusbar::check_update_background();
-    }
+        if let Some(runtime) = &launch_runner.forge {
+            eprintln!("{}", runtime.summary_line());
+        }
 
-    // Build bwrap command (reads $HOME, /dev, etc. for mount discovery).
-    // When Landlock is enabled, the inner command is wrapped with
-    // `ai-jail --landlock-exec` so Landlock is applied INSIDE the
-    // sandbox after bwrap finishes mount namespace setup.
-    // Allocate the PTY before building the command: the macOS profile scopes
-    // its terminal ioctl grant to this exact device, so the slave path must be
-    // known while the sandbox profile is still being generated.
-    let pty = if use_pty { Some(pty::open()?) } else { None };
-    let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
-    // Teardown report: the pipe opens before the command
-    // is built, because the wrapper is told its descriptor number. Every
-    // early return below drops it; it is close-on-exec until the spawn.
-    #[cfg(target_os = "linux")]
-    let mut teardown_run = teardown::TeardownRun::start(cli.teardown_report);
-    #[cfg(target_os = "linux")]
-    let teardown_report_fd = teardown_run.report_fd();
-    #[cfg(not(target_os = "linux"))]
-    let teardown_report_fd = None;
-    let mut cmd = launch_runner.build_sandbox(|final_config| {
-        sandbox::build(
-            &guard,
-            final_config,
-            &project_dir,
-            cli.verbose,
-            sandbox_tty.as_deref(),
-            egress_proxy.as_ref(),
-            &bridge_sockets,
-            teardown_report_fd,
-        )
-    })?;
+        // A real host inode gives bwrap a race-resistant mountpoint for the
+        // mandatory absent-file mask. Identity-checked RAII removes only the
+        // placeholder we created, never a replacement made concurrently. A hard
+        // crash may leave an empty 0600 file; it grants no authority and the
+        // next migration/launch treats it as recoverable masking debris.
+        let _legacy_mask_placeholder =
+            config_store::LegacyMaskPlaceholder::prepare(&store)?;
 
-    // Apply NOFILE and CORE limits on the parent (inherited by child
-    // across fork+exec). NPROC is applied inside the sandbox instead
-    // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
-    // internal clone() calls for namespace creation.
-    let file_size_set = sandbox::rlimits::apply(config, cli.verbose);
+        // macOS has no private /tmp mount. Hard browser profiles therefore live
+        // inside the launch's dedicated session scratch directory and must be
+        // removed when this supervisor exits. Linux hard profiles live in the
+        // sandbox's tmpfs, so this guard is a no-op there.
+        let _browser_profile_guard = sandbox::browser_profile_guard(config);
 
-    // Both spawn paths arm the report descriptor right before the fork
-    // and close it right after.
-    #[cfg(target_os = "linux")]
-    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut teardown_run;
-    #[cfg(not(target_os = "linux"))]
-    let spawn_bracket: &mut dyn signals::SpawnBracket = &mut ();
+        output::info(&format!("Jail Active: {}", project_dir.display()));
 
-    let child_status = if use_pty {
-        let resize_redraw_key =
-            match config.resize_redraw_key.as_deref() {
+        // Set up status bar if enabled and stdio is attached to a terminal
+        let stdout_is_tty =
+            std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if exec_requires_terminal_passthrough(
+            cli.exec,
+            stdout_is_tty,
+            config.terminal_passthrough_enabled(),
+        ) {
+            return Err(
+                "--exec on a terminal requires --terminal-passthrough".into()
+            );
+        }
+        let needs_direct_tty = command_needs_direct_tty(&config.command);
+        let multiplexer = running_inside_multiplexer();
+        // Auto-skip the ai-jail status bar / PTY proxy inside a
+        // multiplexer unless the user explicitly opted in via -s,
+        // --status-bar=..., or `no_status_bar = false` in config.
+        let explicit_status_bar = cli.status_bar_style.is_some()
+            || config.no_status_bar == Some(false);
+        let multiplexer_skip = multiplexer.is_some() && !explicit_status_bar;
+        let use_status_bar = config.status_bar_enabled()
+            && stdout_is_tty
+            && stdin_is_tty
+            && !cli.exec
+            && !needs_direct_tty
+            && !multiplexer_skip;
+        // Even without the overlay, interactive children use a PTY proxy so the
+        // host terminal never accepts escape sequences directly from the
+        // sandbox. The decision keys on stdout: piped stdin + terminal stdout
+        // still filters (see pty_proxy_active).
+        let use_pty = pty_proxy_active(cli.exec, stdout_is_tty);
+        if cli.verbose {
+            if config.status_bar_enabled() {
+                if needs_direct_tty {
+                    output::verbose(&format!(
+                        "Status bar: skipped ({} requires direct terminal passthrough)",
+                        command::effective_name(&config.command)
+                            .unwrap_or("command")
+                    ));
+                } else if multiplexer_skip {
+                    output::verbose(&format!(
+                        "Status bar: auto-disabled ({} detected; pass -s to force-enable)",
+                        multiplexer.unwrap()
+                    ));
+                } else if stdout_is_tty && stdin_is_tty {
+                    output::verbose("Status bar: enabled");
+                } else {
+                    output::verbose("Status bar: skipped (stdio is not a tty)");
+                }
+            } else {
+                output::verbose(
+                    "Status bar: off (use --no-status-bar to disable globally)",
+                );
+            }
+        }
+        if use_status_bar {
+            statusbar::setup(
+                &project_dir,
+                &config.command,
+                config.status_bar_style(),
+                config,
+            );
+        }
+        // The update check only runs with the status bar active AND an
+        // explicit opt-in (phones home to GitHub; default off).
+        if should_check_update(config, use_status_bar) {
+            statusbar::check_update_background();
+        }
+
+        // Build bwrap command (reads $HOME, /dev, etc. for mount discovery).
+        // When Landlock is enabled, the inner command is wrapped with
+        // `ai-jail --landlock-exec` so Landlock is applied INSIDE the
+        // sandbox after bwrap finishes mount namespace setup. Allocate the PTY
+        // before building the command: the macOS profile scopes its terminal
+        // ioctl grant to this exact device, so the slave path must be known
+        // while the sandbox profile is still being generated.
+        let pty = if use_pty { Some(pty::open()?) } else { None };
+        let sandbox_tty = pty.as_ref().and_then(pty::Pty::slave_path);
+        // Teardown report: the pipe opens before the command
+        // is built, because the wrapper is told its descriptor number. Every
+        // early return below drops it; it is close-on-exec until the spawn.
+        #[cfg(target_os = "linux")]
+        let mut teardown_run = teardown::TeardownRun::start(teardown_requested);
+        #[cfg(target_os = "linux")]
+        let teardown_report_fd = teardown_run.report_fd();
+        #[cfg(not(target_os = "linux"))]
+        let teardown_report_fd = None;
+        let mut cmd = launch_runner.build_sandbox(|final_config| {
+            sandbox::build(
+                &guard,
+                final_config,
+                &project_dir,
+                cli.verbose,
+                sandbox_tty.as_deref(),
+                egress_proxy.as_ref(),
+                &bridge_sockets,
+                teardown_report_fd,
+            )
+        })?;
+
+        // Apply NOFILE and CORE limits on the parent (inherited by child
+        // across fork+exec). NPROC is applied inside the sandbox instead
+        // — see run_landlock_exec() — to avoid EAGAIN during bwrap's
+        // internal clone() calls for namespace creation.
+        let file_size_set = sandbox::rlimits::apply(config, cli.verbose);
+
+        // Both spawn paths arm the report descriptor right before the fork
+        // and close it right after.
+        #[cfg(target_os = "linux")]
+        let spawn_bracket: &mut dyn signals::SpawnBracket = &mut teardown_run;
+        #[cfg(not(target_os = "linux"))]
+        let spawn_bracket: &mut dyn signals::SpawnBracket = &mut ();
+
+        let child_status = if use_pty {
+            let resize_redraw_key = match config.resize_redraw_key.as_deref() {
                 Some(spec) => match pty::parse_resize_redraw_key(spec) {
                     Ok(seq) => seq,
                     Err(e) => {
@@ -2182,136 +2275,192 @@ fn run(
                 ),
             };
 
-        if cli.verbose {
-            match (&resize_redraw_key, config.resize_redraw_key.as_deref()) {
-                (Some(_), Some(spec)) => output::verbose(&format!(
-                    "Resize redraw key: {spec} (used on terminal resize)"
-                )),
-                (None, Some(spec)) => output::verbose(&format!(
-                    "Resize redraw key: {spec} (disabled)"
-                )),
-                (Some(_), None)
-                    if default_resize_redraw_key(&config.command).is_some() =>
+            if cli.verbose {
+                match (&resize_redraw_key, config.resize_redraw_key.as_deref())
                 {
-                    output::verbose(
-                        "Resize redraw key: ctrl-shift-l (codex default)",
-                    );
+                    (Some(_), Some(spec)) => output::verbose(&format!(
+                        "Resize redraw key: {spec} (used on terminal resize)"
+                    )),
+                    (None, Some(spec)) => output::verbose(&format!(
+                        "Resize redraw key: {spec} (disabled)"
+                    )),
+                    (Some(_), None)
+                        if default_resize_redraw_key(&config.command)
+                            .is_some() =>
+                    {
+                        output::verbose(
+                            "Resize redraw key: ctrl-shift-l (codex default)",
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
 
-        // PTY proxy path: ai-jail owns the real terminal, child gets a PTY
-        // slave. The overlay remains optional, but output filtering is not.
-        // `use_pty` is what put a PTY in `pty` above.
-        let pty = pty.expect("PTY allocated when use_pty is set");
-        match pty::run_with_config(
-            pty,
-            &mut cmd,
-            resize_redraw_key.as_deref(),
-            config,
-            use_status_bar,
-            spawn_bracket,
-        ) {
-            Ok(status) => {
-                statusbar::teardown();
-                status
+            // PTY proxy path: ai-jail owns the real terminal, child gets a PTY
+            // slave. The overlay remains optional, but output filtering is not.
+            // `use_pty` is what put a PTY in `pty` above.
+            let pty = pty.expect("PTY allocated when use_pty is set");
+            match pty::run_with_config(
+                pty,
+                &mut cmd,
+                resize_redraw_key.as_deref(),
+                config,
+                use_status_bar,
+                spawn_bracket,
+            ) {
+                Ok(status) => {
+                    statusbar::teardown();
+                    status
+                }
+                Err(e) => {
+                    statusbar::teardown();
+                    return Err(e);
+                }
             }
-            Err(e) => {
-                statusbar::teardown();
-                return Err(e);
-            }
-        }
-    } else {
-        // Non-interactive and --exec paths preserve inherited/piped stdio.
-        let gate = signals::wrap_supervised_command(&mut cmd)?;
-        let child = signals::spawn_supervised(&mut cmd, gate, spawn_bracket)?;
+        } else {
+            // Non-interactive and --exec paths preserve inherited/piped stdio.
+            let gate = signals::wrap_supervised_command(&mut cmd)?;
+            let child =
+                signals::spawn_supervised(&mut cmd, gate, spawn_bracket)?;
 
-        let pid = child.id() as i32;
+            let pid = child.id() as i32;
 
-        let status = signals::wait_child_status(pid);
-        std::mem::forget(child);
-        // Defensive terminal reset — see issue #40. The child may
-        // have left mouse tracking, alt-screen, etc. on. The PTY path
-        // does its own reset in pty::run; here we cover the
-        // no-status-bar / multiplexer-detected / crush paths.
-        output::terminal_reset();
-        status
-    };
-    // The plain wait-status mapping, never a value derived from the
-    // classified reason, so scripts see the same code as before.
-    let exit_code = child_status.exit_code();
-
-    // One explanation line per run, after the terminal is restored so
-    // it is not drawn into the child's screen. Normal exits and
-    // deliberate signals print nothing.
-    let reason = exit_reason::classify(
-        &child_status,
-        &exit_reason::LimitsInForce::read_back(file_size_set),
-    );
-    if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT) {
-        output::security_warn(&line);
-    }
-
-    // A tunnel the command left open would otherwise end only when this
-    // process exits, after the run is over, and its egress line and bytes
-    // would be missing. A run that records its egress shuts them now,
-    // within a bounded grace; any other run keeps the old ending.
-    if let Some(proxy) = egress_proxy.as_ref().filter(|p| p.drain_on_exit()) {
-        proxy.drain(std::time::Duration::from_millis(2000));
-    }
-
-    // The reader is joined only after the wait: it returns at the first
-    // report line, and EOF follows the wrapper's exit. `finish` prints
-    // what the report says; macOS accepts the flag and changes nothing.
-    #[cfg(target_os = "linux")]
-    let _teardown_section = teardown_run.finish();
-
-    // Append the launch record only now: exit code and duration are
-    // what make it an audit trail rather than a log of intentions.
-    if let Some(log) = &audit_log {
-        let network = match config.network_mode() {
-            config::NetworkMode::Off => "off",
-            config::NetworkMode::Filtered => "filtered",
-            config::NetworkMode::Full => "full",
+            let status = signals::wait_child_status(pid);
+            std::mem::forget(child);
+            // Defensive terminal reset — see issue #40. The child may
+            // have left mouse tracking, alt-screen, etc. on. The PTY path
+            // does its own reset in pty::run; here we cover the
+            // no-status-bar / multiplexer-detected / crush paths.
+            output::terminal_reset();
+            status
         };
-        let mut audit_allow_hosts = config.allow_hosts().to_vec();
-        audit_allow_hosts.extend(config.allow_private_hosts().iter().cloned());
-        log.record(audit::launch_record(&audit::LaunchRecord {
-            command: &config.command,
-            network_mode: network,
-            allow_hosts: &audit_allow_hosts,
-            lockdown: config.lockdown_enabled(),
-            agent_state: config.agent_state_enabled(),
-            gpu: config.gpu_enabled(),
-            display: config.display_enabled(),
-            audio: config.audio_enabled(),
-            kvm: config.kvm_enabled(),
-            browser_profile: config.browser_profile.as_deref(),
-            project_config: !cli.clean
-                && (store.project.is_file()
-                    || invocation_cwd.join(".ai-jail").is_file()),
-            project_trusted,
-            project_source: provenance.source,
-            project_grants: provenance.grants,
-            project_constraints: provenance.constraints,
-            global_config: store.global.exists()
-                || audit_home
-                    .as_ref()
-                    .is_some_and(|home| home.join(".ai-jail").exists()),
-            exit_code,
-            duration: launch_start.elapsed(),
-        }));
+        // A tunnel the command left open would otherwise end only when this
+        // process exits, after the run is over, and its egress line and bytes
+        // would be missing. A run that records its egress shuts them now,
+        // within a bounded grace; any other run keeps the old ending.
+        if let Some(proxy) = egress_proxy.as_ref().filter(|p| p.drain_on_exit())
+        {
+            proxy.drain(std::time::Duration::from_millis(2000));
+        }
+
+        // The reader is joined only after the wait: it returns at the first
+        // report line, and EOF follows the wrapper's exit.
+        #[cfg(target_os = "linux")]
+        let teardown_section = teardown_run.finish();
+        // macOS accepts the flag and changes nothing else.
+        #[cfg(not(target_os = "linux"))]
+        let teardown_section = if teardown_requested {
+            teardown::TeardownSection::Unsupported
+        } else {
+            teardown::TeardownSection::Inactive
+        };
+
+        // Linux: the wrapper measured the command's tree from inside the
+        // sandbox; this process only waited for bwrap. macOS has no
+        // wrapper: getrusage covers every child this process waited for.
+        #[cfg(target_os = "linux")]
+        let usage = match &teardown_section {
+            teardown::TeardownSection::Reported(report) => {
+                run_summary::usage_from_report(report.usage.as_ref())
+            }
+            _ => run_summary::unavailable_usage(),
+        };
+        #[cfg(target_os = "macos")]
+        let usage = run_summary::resource_usage();
+
+        // The wrapper saw the command's own end: it replaces the status
+        // inferred from bwrap's exit code, for the reason and the one
+        // explanation line alike. The exit code stays the process's.
+        let classified_status = match &teardown_section {
+            teardown::TeardownSection::Reported(report) => {
+                exit_reason::ChildStatus::from(&report.child)
+            }
+            _ => child_status,
+        };
+        // The plain wait-status mapping, never a value derived from the
+        // classified reason, so scripts see the same code as before.
+        let exit_code = child_status.exit_code();
+
+        // One explanation line per run, after the terminal is restored so
+        // it is not drawn into the child's screen; silent for an ordinary end.
+        let reason = exit_reason::classify(
+            &classified_status,
+            &exit_reason::LimitsInForce::read_back(file_size_set),
+        );
+        if let Some(line) = reason.explanation(exit_reason::HostTraits::CURRENT)
+        {
+            output::security_warn(&line);
+        }
+        let run_end = run_summary::RunEnd {
+            exit: reason,
+            usage,
+            network: network_section(config.network_mode(), &egress_stats),
+            teardown: teardown_section,
+        };
+
+        // Append the launch record only now: exit code and duration are
+        // what make it an audit trail rather than a log of intentions.
+        if let Some(log) = &audit_log {
+            let network = network_mode_name(config.network_mode());
+            let mut audit_allow_hosts = config.allow_hosts().to_vec();
+            audit_allow_hosts
+                .extend(config.allow_private_hosts().iter().cloned());
+            log.record(audit::launch_record(&audit::LaunchRecord {
+                command: &config.command,
+                network_mode: network,
+                allow_hosts: &audit_allow_hosts,
+                lockdown: config.lockdown_enabled(),
+                agent_state: config.agent_state_enabled(),
+                gpu: config.gpu_enabled(),
+                display: config.display_enabled(),
+                audio: config.audio_enabled(),
+                kvm: config.kvm_enabled(),
+                browser_profile: config.browser_profile.as_deref(),
+                project_config: !cli.clean
+                    && (store.project.is_file()
+                        || invocation_cwd.join(".ai-jail").is_file()),
+                project_trusted,
+                project_source: provenance.source,
+                project_grants: provenance.grants,
+                project_constraints: provenance.constraints,
+                global_config: store.global.exists()
+                    || audit_home
+                        .as_ref()
+                        .is_some_and(|home| home.join(".ai-jail").exists()),
+                exit_code,
+                duration: launch_start.elapsed(),
+            }));
+        }
+
+        // Guard is dropped here, cleaning up any temp files. On macOS the
+        // guard is a unit struct (no temp files to clean), so the explicit
+        // drop is a no-op there; clippy's drop_non_drop only fires on that
+        // platform. The drop stays meaningful on Linux (RAII temp files).
+        #[cfg_attr(target_os = "macos", allow(clippy::drop_non_drop))]
+        drop(guard);
+
+        Ok((exit_code, Some(run_end)))
+    })();
+    let (result, run_end) = match result {
+        Ok((code, end)) => (Ok(code), end),
+        Err(e) => (Err(e), None),
+    };
+
+    if let Some(summary) = summary {
+        // A launch that failed before its end has no `RunEnd`: record the
+        // error it failed with.
+        let end = run_end.unwrap_or_else(|| run_summary::RunEnd {
+            exit: exit_reason::start_failed(
+                result.as_ref().err().map_or("", String::as_str),
+            ),
+            // Nothing ran, so nothing was measured.
+            usage: run_summary::unavailable_usage(),
+            network: network_section(summary_network_mode, &egress_stats),
+            teardown: teardown::TeardownSection::Inactive,
+        });
+        summary.finish(end);
     }
-
-    // Guard is dropped here, cleaning up any temp files. On macOS the
-    // guard is a unit struct (no temp files to clean), so the explicit
-    // drop is a no-op there; clippy's drop_non_drop only fires on that
-    // platform. The drop stays meaningful on Linux (RAII temp files).
-    #[cfg_attr(target_os = "macos", allow(clippy::drop_non_drop))]
-    drop(guard);
-
-    Ok(exit_code)
+    result
 }
 
 fn main() {

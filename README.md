@@ -733,6 +733,38 @@ If that report is missing, malformed or incomplete (for example
 pid-namespace teardown ends whatever is left. On macOS the flag
 is accepted and changes nothing.
 
+`--run-summary <PATH>` writes one JSON document per launch when the run ends,
+on every path once the launch is under way: a clean exit, a death by signal
+or limit, and a sandbox that failed to start. An invocation that ends earlier
+exits with its error and writes none, for example an argument error, a missing
+`bwrap`, a project config that cannot be read, a restricted SSH agent or a
+secret that fails to start, or a cancel (Ctrl-C) before the launch. A dry run
+writes none either. It implies `--teardown-report`.
+
+```bash
+ai-jail --run-summary /tmp/run.json --egress-log /tmp/egress.jsonl \
+  --allow-host api.anthropic.com claude
+jq '.exit, .network' /tmp/run.json
+```
+
+| Section | Contents |
+|---|---|
+| top level | `schema` (`ai-jail.run-summary`), `schema_version`, `run_id` (the same as the egress lines of this launch), `ai_jail_version`, `started_at`, `ended_at`, `duration_ms`, `program` (basename only, `null` when none) |
+| `exit` | `code`, `signal`, `core_dumped`, `reason` (`exited`, `signaled`, `limit`, `start-failed`), `limit`, `evidence`, `status_source` (`reported` by the in-sandbox wrapper, `inferred` from a 128+N code, `direct` when the supervisor saw the signal itself, `exit-code` for an exit code taken as it is, or `none` when the command never started), `error` |
+| `resources` | `cpu_user_ms`, `cpu_system_ms`, `peak_rss_kib` (the largest single process, `peak_rss_scope` `largest-process`) and `source`: `sandbox-wrapper` on Linux, measured inside the sandbox for the command and everything it left behind; `getrusage` on macOS; `unavailable`, with the figures `null`, when nothing measured them |
+| `network` | `mode`, and in filtered mode the allowed, denied and errored connection counts and byte totals; `null` with the network off or full, where nothing observes it |
+| `filesystem` | `denied_accesses`, reserved: always `null` with source `unavailable` |
+| `teardown` | `supported`, `active`, `complete`, `incomplete_reason`, `grace_ms`, `survivors` (`pid`, `ppid`, `comm`, `age_s`, `ended_by`) |
+
+The schema is `docs/run-summary.schema.json`. Adding an optional field keeps
+`schema_version`; removing, renaming, retyping or re-meaning one increments it,
+and the schema's `$id` names the version. The document is written to a 0600
+temporary file in the same directory and renamed over `PATH`, so a reader sees
+the previous summary or the new one, never a partial file. A symlink at `PATH`
+or a missing directory is a warning at startup, and the run goes on without a
+summary; a write failure at the end is an error message that leaves the exit
+code unchanged.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are

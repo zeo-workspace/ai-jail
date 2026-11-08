@@ -142,6 +142,9 @@ OPTIONS:
     --teardown-report              Stop processes that outlive the command
                                    (SIGTERM, SIGKILL after 2000 ms) and name
                                    them on stderr (Linux)
+    --run-summary <PATH>           Write one versioned JSON summary of the
+                                   run to PATH, atomically, when it ends
+                                   (implies --teardown-report)
     --worktree / --no-worktree     Enable/disable linked Git worktree metadata passthrough
     --no-mise / --mise             Disable/enable mise integration
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache
@@ -264,6 +267,9 @@ pub struct CliArgs {
     /// `--teardown-report`: stop what outlives the command
     /// and name it on stderr. CLI-only, never a config key.
     pub teardown_report: bool,
+    /// `--run-summary <path>`: one versioned JSON document
+    /// per launch. CLI-only, never a config key; implies teardown.
+    pub run_summary: Option<PathBuf>,
     pub env_from_file: Vec<PathBuf>,
     /// Phantom credential bindings (`--secret KEY=host`, repeatable):
     /// the sandbox sees a placeholder; the proxy substitutes the real
@@ -620,6 +626,16 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("audit-show") => args.audit_show = true,
             Long("teardown-report") => args.teardown_report = true,
+            Long("run-summary") => {
+                // An OsString path for the same reason as --egress-log.
+                let val = parser.value().map_err(|e| e.to_string())?;
+                if val.is_empty() {
+                    return Err(
+                        "--run-summary requires a non-empty path".into()
+                    );
+                }
+                args.run_summary = Some(PathBuf::from(val));
+            }
             Long("env") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 let s = val.to_string_lossy();
@@ -1141,6 +1157,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--forward-port",
     "--publish-port",
     "--teardown-report",
+    "--run-summary",
     "--inherit-env",
     "--no-inherit-env",
     "--update-check",
