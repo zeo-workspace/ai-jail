@@ -1,5 +1,5 @@
-// Story 047 — adjustable per-process limits and CPU affinity, observed
-// through the built binary (Tasks 1.4, 2.1, 2.2, 2.3, 4.1).
+// Adjustable per-process limits and CPU affinity, observed through the
+// built binary.
 //
 // Launch-refusal and --dry-run tests need no sandbox. Tests that look
 // inside the jail need bwrap with user + network namespaces and skip with
@@ -217,7 +217,7 @@ fn allowed_list_text() -> String {
         .unwrap()
 }
 
-// ── Task 1.4 — --dry-run lines and --help (R5.1, R5.4) ──────────────
+// ── --dry-run lines and --help ──────────────
 
 #[test]
 fn dry_run_prints_each_effective_limit_with_soft_hard_and_source() {
@@ -279,7 +279,7 @@ fn help_says_limits_are_per_process_and_cpu_is_not_a_throttle() {
     );
 }
 
-// ── Launch refusals for --rlimit (R3.3, R3.7) ────────────────────────
+// ── Launch refusals for --rlimit ────────────────────────
 
 #[test]
 fn byte_suffix_on_a_count_limit_is_refused_but_accepted_on_a_byte_limit() {
@@ -312,18 +312,68 @@ fn malformed_rlimit_values_refuse_the_launch_naming_flag_value_and_forms() {
 }
 
 #[test]
-fn lockdown_refuses_a_limit_above_its_default_and_accepts_one_below() {
+fn lockdown_clamps_a_limit_above_its_default_and_keeps_one_below() {
     let tree = Tree::new("lockdown");
-    assert_ok(&tree.dry_run(&["--lockdown", "--rlimit", "nofile=1024"]));
-    let err = assert_refused(&tree.dry_run(&[
-        "--lockdown",
-        "--rlimit",
-        "nofile=8192",
-    ]));
-    assert!(err.contains("nofile"), "{err}");
+    let below =
+        assert_ok(&tree.dry_run(&["--lockdown", "--rlimit", "nofile=1024"]));
+    assert!(below.contains("rlimit name=nofile soft=1024 "), "{below}");
+    // Lockdown only tightens: a value above its ceiling runs at it.
+    let above =
+        assert_ok(&tree.dry_run(&["--lockdown", "--rlimit", "nofile=8192"]));
+    assert!(above.contains("rlimit name=nofile soft=4096 "), "{above}");
+    // The dry run says the limit was clamped, since the wrapper arguments
+    // it prints still carry the value asked for.
     assert!(
-        err.contains("4096"),
-        "must name the lockdown default: {err}"
+        above.contains(
+            "rlimit name=nofile requested=8192 lockdown_ceiling=4096"
+        ),
+        "{above}"
+    );
+}
+
+#[test]
+fn lockdown_clamp_under_a_lower_host_limit_warns_once() {
+    require_bwrap_net!();
+    let tree = Tree::new("lockdown-host");
+    let _lock = common::SANDBOX_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The host hard NOFILE (3000) is below the lockdown ceiling (4096).
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -n 3000 && exec \"$0\" \"$@\"")
+        .arg(ai_jail())
+        .args([
+            "--no-status-bar",
+            "--no-save-config",
+            "--no-network",
+            "--lockdown",
+            "--rlimit",
+            "nofile=8192",
+            "bash",
+            "-c",
+            "grep 'open files' /proc/self/limits",
+        ])
+        .current_dir(&tree.project)
+        .env("HOME", &tree.home)
+        .env("XDG_CONFIG_HOME", &tree.xdg)
+        .env_remove("AI_JAIL_QUIET")
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run ai-jail");
+    let limits = assert_ok(&out);
+    assert!(limits.contains(" 3000 "), "{limits}");
+    let err = stderr(&out);
+    let nofile: Vec<&str> = err
+        .lines()
+        .filter(|l| l.contains('⚠') && l.contains("NOFILE"))
+        .collect();
+    assert_eq!(nofile.len(), 1, "one warning per limit: {err}");
+    assert!(
+        nofile[0].contains("8192") && nofile[0].contains("applied 3000"),
+        "{}",
+        nofile[0]
     );
 }
 
@@ -335,7 +385,7 @@ fn unknown_rlimit_name_in_a_config_file_is_fatal() {
     assert!(err.contains("rss"), "{err}");
 }
 
-// ── Task 2.1 — --cpus refusals at launch (R4.3, R4.4, R4.5) ──────────
+// ── --cpus refusals at launch ──────────
 
 #[test]
 fn cpus_outside_the_allowed_set_refuse_the_launch_naming_entry_and_set() {
@@ -386,7 +436,7 @@ fn dry_run_prints_the_effective_cpu_set() {
     );
 }
 
-// ── Task 2.2 — limits and affinity observed inside the jail ──────────
+// ── limits and affinity observed inside the jail ──────────
 
 #[test]
 fn rlimit_nofile_is_the_soft_and_hard_limit_inside() {
@@ -425,7 +475,7 @@ fn rlimit_fsize_stops_a_large_write_with_sigxfsz() {
     assert_eq!(assert_ok(&out).trim(), "status=153");
 }
 
-/// R3.10 and R5.3. `nproc` must be applied after bwrap's clone: the host
+/// `nproc` must be applied after bwrap's clone: the host
 /// user runs far more than 64 processes, so applying it outside would make
 /// the namespace clone itself fail with EAGAIN. The forks the jail manages
 /// under the limit are printed, because the README records what `nproc`
@@ -532,7 +582,7 @@ fn taskset_cannot_widen_the_cpu_set_inside() {
     assert_eq!(assert_ok(&out).trim(), "REFUSED");
 }
 
-// ── Task 2.3 — the audit launch record (R8.1) ────────────────────────
+// ── the audit launch record ────────────────────────
 
 #[test]
 fn audit_record_carries_effective_rlimits_and_cpus() {
@@ -565,7 +615,7 @@ fn audit_record_carries_effective_rlimits_and_cpus() {
     assert_eq!(record["cpus"], cpu.as_str());
 }
 
-// ── Task 4.1 — supervisor and wrapper agree (round trip) ─────────────
+// ── supervisor and wrapper agree (round trip) ─────────────
 
 /// What the supervisor reports (--dry-run) is what the wrapper applies
 /// (/proc/self/limits inside), for every name and through every value

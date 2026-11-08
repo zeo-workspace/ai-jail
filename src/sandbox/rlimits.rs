@@ -236,6 +236,45 @@ fn lockdown_ceiling(name: RlimitName) -> Option<u64> {
     }
 }
 
+/// The `--lockdown` ceiling an explicit `value` is clamped to, when it is
+/// above it.
+fn lockdown_clamp(
+    config: &Config,
+    name: RlimitName,
+    value: u64,
+) -> Option<u64> {
+    if !config.lockdown_enabled() {
+        return None;
+    }
+    lockdown_ceiling(name).filter(|&ceiling| value > ceiling)
+}
+
+/// Each explicit limit `--lockdown` clamps: its name, the value asked
+/// for, and the ceiling it runs at instead.
+pub fn lockdown_clamps(config: &Config) -> Vec<(RlimitName, &str, u64)> {
+    config
+        .rlimit
+        .iter()
+        .filter_map(|(key, text)| {
+            let name: RlimitName = key.parse().ok()?;
+            let value = RlimitValue::parse(name, text).ok()?.as_raw();
+            lockdown_clamp(config, name, value)
+                .map(|ceiling| (name, text.as_str(), ceiling))
+        })
+        .collect()
+}
+
+/// Refuse explicit limits where they cannot be applied. They are applied
+/// only by the in-sandbox wrapper, which exists on Linux alone; elsewhere
+/// an explicit value would replace a default and then be applied nowhere.
+/// The platform is a parameter so both arms are testable.
+pub fn check_platform(config: &Config, linux: bool) -> Result<(), String> {
+    if linux || config.rlimit.is_empty() {
+        return Ok(());
+    }
+    Err("explicit limits (--rlimit, rlimit) are Linux only".into())
+}
+
 /// Every limit that applies inside the sandbox: the defaults (unless
 /// `--no-rlimits`), each replaced by an explicit value of the same name,
 /// plus the explicit values that have no default.
@@ -249,16 +288,14 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
     for (key, text) in &config.rlimit {
         let name: RlimitName = key.parse()?;
         let value = RlimitValue::parse(name, text)?.as_raw();
-        if config.lockdown_enabled()
-            && let Some(ceiling) = lockdown_ceiling(name)
-            && value > ceiling
-        {
-            return Err(format!(
-                "rlimit {}={text} is above the --lockdown limit {ceiling}; \
-                 lockdown only allows tightening it",
-                name.as_str()
-            ));
-        }
+        // Lockdown only tightens: a value above its ceiling runs at the
+        // ceiling (warned about by `apply_sandbox`), so a project
+        // `lockdown = true` never turns a working trusted config into a
+        // refusal.
+        let value = match lockdown_clamp(config, name, value) {
+            Some(ceiling) => ceiling,
+            None => value,
+        };
         let source = config
             .rlimit_source
             .get(key)
@@ -327,7 +364,14 @@ pub fn widens(candidate: &Config, baseline: &Config) -> bool {
 /// operator asked for it and silently running without it fails open.
 /// Returns whether the limit was set (false: a default skipped with a
 /// warning).
-fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<bool, String> {
+///
+/// `warn_clamp` is false for a default the supervisor already applied
+/// and warned about, so a host clamp is reported once per launch.
+fn apply_one(
+    limit: &EffectiveLimit,
+    warn_clamp: bool,
+    verbose: bool,
+) -> Result<bool, String> {
     let explicit = limit.source != LimitSource::Default;
     let label = format!("RLIMIT_{}", limit.name.as_str().to_uppercase());
     let fail = |msg: String| {
@@ -346,10 +390,31 @@ fn apply_one(limit: &EffectiveLimit, verbose: bool) -> Result<bool, String> {
     // say so, since the operator asked for a different number.
     let soft = limit.soft.min(current_hard);
     let hard = limit.hard.min(current_hard);
-    if soft < limit.soft {
+    if warn_clamp && soft < limit.soft {
+        // A clamped `cpu` also loses its SIGXCPU grace when soft == hard.
+        let grace = if limit.name == RlimitName::Cpu && hard - soft < 5 {
+            format!(
+                ", leaving {} s of the 5 s grace before SIGKILL",
+                hard - soft
+            )
+        } else {
+            String::new()
+        };
         output::warn(&format!(
-            "{label}: requested {}, hard limit {current_hard}, applied {soft}",
+            "{label}: requested {}, hard limit {current_hard}, applied {soft}{grace}",
             limit.soft
+        ));
+    } else if explicit
+        && limit.name == RlimitName::Cpu
+        && soft == limit.soft
+        && hard < limit.hard
+    {
+        // The soft limit fits, but the host hard limit eats the grace that
+        // keeps SIGXCPU ahead of SIGKILL.
+        output::warn(&format!(
+            "{label}: requested soft {soft}, hard limit {current_hard} \
+             leaves {} s of the 5 s grace before SIGKILL",
+            hard.saturating_sub(soft)
         ));
     }
     if let Err(e) = setrlimit(limit.name.resource(), soft, hard) {
@@ -396,7 +461,7 @@ pub fn apply(config: &Config, verbose: bool) -> Result<bool, String> {
             hard: soft,
             source: LimitSource::Default,
         };
-        if apply_one(&limit, verbose)? && name == RlimitName::Fsize {
+        if apply_one(&limit, true, verbose)? && name == RlimitName::Fsize {
             file_size_set = true;
         }
     }
@@ -415,8 +480,34 @@ pub fn apply(config: &Config, verbose: bool) -> Result<bool, String> {
 /// an unprivileged process.
 #[cfg(target_os = "linux")]
 pub fn apply_sandbox(config: &Config, verbose: bool) -> Result<(), String> {
+    let clamps = lockdown_clamps(config);
     for limit in effective(config)? {
-        apply_one(&limit, verbose)?;
+        // One warning per limit: a lockdown clamp names the host clamp
+        // too, when the host hard limit is lower still.
+        if let Some((_, requested, ceiling)) =
+            clamps.iter().find(|(name, ..)| *name == limit.name)
+        {
+            let host = getrlimit(limit.name.resource())
+                .map_or(*ceiling, |(_, hard)| hard);
+            let applied = (*ceiling).min(host);
+            let note = if applied < *ceiling {
+                format!(", hard limit {host}")
+            } else {
+                String::new()
+            };
+            output::warn(&format!(
+                "RLIMIT_{}: requested {requested}, --lockdown allows \
+                 {ceiling}{note}, applied {applied}",
+                limit.name.as_str().to_uppercase()
+            ));
+            apply_one(&limit, false, verbose)?;
+            continue;
+        }
+        // The supervisor applied every default except NPROC and warned
+        // about its clamps; the wrapper warns only for what it alone sets.
+        let warn_clamp = limit.source != LimitSource::Default
+            || limit.name == RlimitName::Nproc;
+        apply_one(&limit, warn_clamp, verbose)?;
     }
     Ok(())
 }
@@ -602,19 +693,15 @@ mod tests {
     }
 }
 
-// Story 047, Task 1.1 — the limit grammar (R3.2, R3.3).
+// The limit grammar.
 //
-// Materialization: append this whole file to the end of
-// `src/sandbox/rlimits.rs` on `feat/adjustable-rlimits`
-// (or `include!("rlimits_story047_grammar.rs");` from it).
-//
-// Contract (design.md §C6): `RlimitName` implements `FromStr` and
+// `RlimitName` implements `FromStr` and
 // `as_str`; `RlimitValue::{Finite(u64), Unlimited}` has
 // `parse(name: RlimitName, text: &str) -> Result<RlimitValue, String>`.
 // K/M/G/T are powers of 1024 and are accepted only for fsize, data, as.
 // No `Debug`/`PartialEq` derive is assumed on the new types.
 #[cfg(test)]
-mod story047_grammar_tests {
+mod grammar_tests {
     use super::*;
 
     const ALL: [&str; 7] =
@@ -739,14 +826,8 @@ mod story047_grammar_tests {
     }
 }
 
-// Story 047, Task 1.2 — effective limits and their application
-// (R3.1, R3.4, R3.5, R3.6, R3.7, R3.8, R3.10).
+// Effective limits and their application.
 //
-// Materialization: append this whole file to the end of
-// `src/sandbox/rlimits.rs` on `feat/adjustable-rlimits`
-// (or `include!("rlimits_story047_effective.rs");` from it).
-//
-// Contract (design.md §C6):
 // - `Config.rlimit: BTreeMap<String, String>` (values in the CLI grammar)
 //   and `Config.rlimit_source: BTreeMap<String, LimitSource>` (serde skip);
 // - `pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String>`;
@@ -756,10 +837,10 @@ mod story047_grammar_tests {
 // - the supervisor's `apply(config, verbose) -> Result<(), String>` applies
 //   only today's defaults (NOFILE, CORE, lockdown FSIZE) and warns, naming
 //   the requested and the applied value, when it clamps to the hard limit
-//   instead of clamping silently (R3.4).
+//   instead of clamping silently.
 // `unlimited` is RLIM_INFINITY, which is u64::MAX on Linux.
 #[cfg(test)]
-mod story047_effective_tests {
+mod effective_tests {
     use std::collections::BTreeMap;
 
     use super::*;
@@ -837,7 +918,7 @@ mod story047_effective_tests {
         let got = limits(&config(&[("nofile", "1024")]));
         assert_eq!(pair(&got, "nofile"), (1024, 1024));
         assert!(matches!(find(&got, "nofile").source, LimitSource::Cli));
-        // The other defaults stay, still labelled as defaults (R3.5).
+        // The other defaults stay, still labelled as defaults.
         assert_eq!(pair(&got, "core"), (0, 0));
         assert!(matches!(find(&got, "core").source, LimitSource::Default));
         assert_eq!(pair(&got, "nproc"), (4096, 4096));
@@ -881,29 +962,6 @@ mod story047_effective_tests {
         let mut c = config(&[("cpu", "600")]);
         c.lockdown = Some(true);
         assert!(effective(&c).is_ok());
-    }
-
-    #[test]
-    fn lockdown_refuses_a_value_above_its_default_naming_both() {
-        for (name, value, default) in [
-            ("nofile", "8192", "4096"),
-            ("nofile", "unlimited", "4096"),
-            ("nproc", "2048", "1024"),
-            ("fsize", "2G", "1073741824"),
-            ("core", "1", "0"),
-        ] {
-            let mut c = config(&[(name, value)]);
-            c.lockdown = Some(true);
-            let err = match effective(&c) {
-                Ok(_) => panic!("lockdown {name}={value} must be refused"),
-                Err(e) => e,
-            };
-            assert!(err.contains(name), "must name the limit: {err}");
-            assert!(
-                err.contains(default) || err.contains("1G"),
-                "must name the lockdown default {default}: {err}"
-            );
-        }
     }
 
     #[test]
@@ -957,21 +1015,20 @@ mod story047_effective_tests {
         }
     }
 
-    /// R3.4: clamping to the current hard limit is never silent. The hard
+    /// clamping to the current hard limit is never silent. The hard
     /// limit is lowered irreversibly, so the check runs in a child test
     /// process (the pattern of `apply_nproc_pins_hard_equal_to_soft`).
     #[test]
     fn clamping_to_the_hard_limit_warns_with_requested_and_applied() {
-        let output = std::process::Command::new(
-            std::env::current_exe().unwrap(),
-        )
-        .arg("--exact")
-        .arg("sandbox::rlimits::story047_effective_tests::clamping_child")
-        .arg("--ignored")
-        .arg("--nocapture")
-        .env("AI_JAIL_RLIMIT_CHILD", "1")
-        .output()
-        .expect("spawn child rlimit test");
+        let output =
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("sandbox::rlimits::effective_tests::clamping_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("AI_JAIL_RLIMIT_CHILD", "1")
+                .output()
+                .expect("spawn child rlimit test");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
@@ -1008,5 +1065,258 @@ mod story047_effective_tests {
             (2000, 2000),
             "applied value is the hard limit"
         );
+    }
+}
+
+// An explicit limit is applied or refused, never dropped.
+//
+// - `check_platform(config: &Config, linux: bool) -> Result<(), String>`
+//   decides whether the explicit limits in `config` may run; the launch
+//   calls it with `cfg!(target_os = "linux")`. The platform is a parameter
+//   so a Linux test can exercise the non-Linux refusal, which says that
+//   explicit limits are "Linux only".
+// - `effective()` applies an explicit value above a `--lockdown` ceiling
+//   at the ceiling instead of refusing the launch.
+// - Applying the limits warns once, naming the limit, the requested value
+//   and the value applied, for a lockdown clamp; and names the requested
+//   soft limit and the hard limit applied when the host hard limit leaves
+//   less than the 5-second `cpu` grace.
+// Warnings are read from a child test process, because lowering a hard
+// limit cannot be undone (the pattern of `clamping_child`).
+#[cfg(test)]
+mod rlimit_gatefix_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const CHILD_ENV: &str = "AI_JAIL_GATEFIX_CHILD";
+
+    fn explicit(pairs: &[(&str, &str)], source: LimitSource) -> Config {
+        Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _)| (k.to_string(), source))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    fn pair(config: &Config, name: &str) -> (u64, u64) {
+        let limits = match effective(config) {
+            Ok(v) => v,
+            Err(e) => panic!("effective() must succeed, got Err({e})"),
+        };
+        let l = limits
+            .iter()
+            .find(|l| l.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no effective limit named {name}"));
+        (l.soft, l.hard)
+    }
+
+    /// Run `gatefix_child` in a fresh test process for `case`; return its
+    /// warning lines (`⚠ ...` on a non-terminal stderr).
+    fn child_warnings(case: &str) -> Vec<String> {
+        let output =
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("sandbox::rlimits::rlimit_gatefix_tests::gatefix_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, case)
+                .env_remove("NO_COLOR")
+                .output()
+                .expect("spawn child rlimit test");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "child {case} failed\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        stderr
+            .lines()
+            .filter(|l| l.contains('⚠'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn gatefix_non_linux_launch_without_explicit_limits_is_not_refused() {
+        // Hostile half first: the refusal must not catch a launch that
+        // only runs the defaults, or none at all.
+        for config in [
+            Config::default(),
+            Config {
+                lockdown: Some(true),
+                ..Config::default()
+            },
+            Config {
+                no_rlimits: Some(true),
+                ..Config::default()
+            },
+        ] {
+            assert!(
+                check_platform(&config, false).is_ok(),
+                "no explicit limit: {config:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gatefix_non_linux_refuses_any_explicit_limit_saying_linux_only() {
+        for source in [LimitSource::Cli, LimitSource::Global] {
+            let config = explicit(&[("nofile", "1024")], source);
+            let err = match check_platform(&config, false) {
+                Ok(()) => panic!("{source:?} rlimit must be refused off Linux"),
+                Err(e) => e,
+            };
+            assert!(err.contains("Linux only"), "{err}");
+            assert!(err.contains("rlimit"), "must name the control: {err}");
+        }
+        let with_no_rlimits = Config {
+            no_rlimits: Some(true),
+            ..explicit(&[("cpu", "60")], LimitSource::Cli)
+        };
+        assert!(check_platform(&with_no_rlimits, false).is_err());
+        // The same limits are accepted on Linux.
+        assert!(
+            check_platform(
+                &explicit(&[("nofile", "1024")], LimitSource::Cli),
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn gatefix_lockdown_keeps_values_at_or_below_its_ceiling() {
+        // Hostile half first: a value that already tightens must not be
+        // raised to the ceiling.
+        for (name, value, want) in [
+            ("nofile", "1024", 1024),
+            ("nofile", "4096", 4096),
+            ("nproc", "512", 512),
+        ] {
+            let mut c = explicit(&[(name, value)], LimitSource::Cli);
+            c.lockdown = Some(true);
+            assert_eq!(pair(&c, name), (want, want), "lockdown {name}={value}");
+        }
+        // A limit lockdown has no ceiling for is left alone.
+        let mut c = explicit(&[("cpu", "600")], LimitSource::Cli);
+        c.lockdown = Some(true);
+        assert_eq!(pair(&c, "cpu"), (600, 605));
+    }
+
+    #[test]
+    fn gatefix_lockdown_clamps_a_value_above_its_ceiling() {
+        for (name, value, ceiling) in [
+            ("nofile", "8192", 4096),
+            ("nofile", "unlimited", 4096),
+            ("nproc", "2048", 1024),
+            ("fsize", "2G", GIB),
+            ("core", "1", 0),
+        ] {
+            let mut c = explicit(&[(name, value)], LimitSource::Cli);
+            c.lockdown = Some(true);
+            assert_eq!(
+                pair(&c, name),
+                (ceiling, ceiling),
+                "lockdown {name}={value} applies the ceiling"
+            );
+        }
+        // A trusted layer's value is clamped the same way, and so is a
+        // value under --no-rlimits: lockdown only tightens.
+        let mut global = explicit(&[("nofile", "8192")], LimitSource::Global);
+        global.lockdown = Some(true);
+        assert_eq!(pair(&global, "nofile"), (4096, 4096));
+        global.no_rlimits = Some(true);
+        assert_eq!(pair(&global, "nofile"), (4096, 4096));
+    }
+
+    #[test]
+    fn gatefix_lockdown_clamp_warns_once_naming_limit_requested_and_applied() {
+        let warnings = child_warnings("lockdown");
+        let named: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("8192") && w.contains("4096"))
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "one warning naming requested 8192 and applied 4096: {warnings:?}"
+        );
+        assert!(
+            named[0].to_ascii_lowercase().contains("nofile"),
+            "the warning names the limit: {}",
+            named[0]
+        );
+    }
+
+    #[test]
+    fn gatefix_cpu_grace_kept_at_five_seconds_does_not_warn() {
+        // Hostile half first: host hard 100, cpu=95 leaves exactly the
+        // 5-second grace, which is not a loss.
+        let warnings = child_warnings("cpu-exact");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.to_ascii_lowercase().contains("cpu")),
+            "no cpu warning when the grace fits: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn gatefix_cpu_grace_below_five_seconds_warns_naming_soft_and_hard() {
+        // Host hard 100, cpu=98: soft 98, hard 100 — 2 seconds of grace.
+        let warnings = child_warnings("cpu-short");
+        let hit = warnings
+            .iter()
+            .find(|w| w.to_ascii_lowercase().contains("cpu"))
+            .unwrap_or_else(|| panic!("no cpu grace warning: {warnings:?}"));
+        assert!(
+            hit.contains("98") && hit.contains("100"),
+            "names soft 98 and hard 100: {hit}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn gatefix_child() {
+        let Some(case) = std::env::var_os(CHILD_ENV) else {
+            return;
+        };
+        match case.to_str() {
+            Some("lockdown") => {
+                let (_, hard) =
+                    getrlimit(Resource::RLIMIT_NOFILE).expect("getrlimit");
+                assert!(hard >= 8192, "test needs a NOFILE hard limit >= 8192");
+                let mut c = explicit(&[("nofile", "8192")], LimitSource::Cli);
+                c.lockdown = Some(true);
+                c.no_rlimits = Some(true);
+                apply_sandbox(&c, false).expect("apply_sandbox");
+                assert_eq!(
+                    getrlimit(Resource::RLIMIT_NOFILE).expect("getrlimit"),
+                    (4096, 4096)
+                );
+            }
+            Some(case @ ("cpu-short" | "cpu-exact")) => {
+                setrlimit(Resource::RLIMIT_CPU, 100, 100).expect("lower cpu");
+                let soft = if case == "cpu-short" { "98" } else { "95" };
+                let mut c = explicit(&[("cpu", soft)], LimitSource::Cli);
+                c.no_rlimits = Some(true);
+                apply_sandbox(&c, false).expect("apply_sandbox");
+                let want = soft.parse::<u64>().unwrap();
+                assert_eq!(
+                    getrlimit(Resource::RLIMIT_CPU).expect("getrlimit"),
+                    (want, 100)
+                );
+            }
+            other => panic!("unknown child case {other:?}"),
+        }
     }
 }

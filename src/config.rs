@@ -1202,7 +1202,24 @@ pub fn parse_toml(contents: &str) -> Result<Config, String> {
 pub(crate) fn parse_global_toml(
     contents: &str,
 ) -> Result<GlobalConfig, String> {
-    toml::from_str(contents).map_err(|e| e.to_string())
+    let global: GlobalConfig =
+        toml::from_str(contents).map_err(|e| e.to_string())?;
+    // A trusted CPU set is checked at load, as `rlimit` is: a typo must
+    // stop the launch, never let a project value stand in for it.
+    check_trusted_cpus("cpus", &global.base)?;
+    for (name, table) in &global.commands {
+        check_trusted_cpus(&format!("commands.{name}.cpus"), table)?;
+    }
+    Ok(global)
+}
+
+fn check_trusted_cpus(field: &str, config: &Config) -> Result<(), String> {
+    match config.cpus.as_deref() {
+        Some(text) => crate::sandbox::affinity::parse_cpu_list(text)
+            .map(|_| ())
+            .map_err(|e| format!("{field} = \"{text}\": {e}")),
+        None => Ok(()),
+    }
 }
 
 /// Whether a symlinked config may be followed.
@@ -2102,18 +2119,36 @@ pub(crate) fn merge_layer_report(
     monotonic!(no_seccomp, |config: &Config| !config.seccomp_enabled());
     monotonic!(no_rlimits, |config: &Config| !config.rlimits_enabled());
     // Project CPUs narrow the trusted set; a set sharing no CPU with it
-    // becomes the empty list, which the launch refuses (R4.5).
-    let asked_cpus = local.cpus.clone().unwrap_or_default();
+    // becomes the empty list, which the launch refuses.
+    let asked_cpus = local.cpus.clone();
     let (cpus, dropped) =
         crate::sandbox::affinity::tighten_cpus(c.cpus.take(), local.cpus);
     c.cpus = cpus;
     if dropped {
-        warnings.push(Refusal::new(
-            "cpus",
-            vec![asked_cpus],
-            format!(
+        let text = match (&c.cpus, &asked_cpus) {
+            // No CPU left: `check_launch` refuses the launch and says why.
+            (Some(set), _) if set.is_empty() => {
+                format!("{layer} cpus shares no CPU with the baseline sandbox")
+            }
+            // The intersection is in use: say which CPUs remain.
+            (Some(set), Some(asked))
+                if set != asked
+                    && crate::sandbox::affinity::parse_cpu_list(set)
+                        .is_ok() =>
+            {
+                format!(
+                    "{layer} cpus narrowed to {set}: it named CPUs outside \
+                     the baseline sandbox"
+                )
+            }
+            _ => format!(
                 "{layer} cpus ignored because it weakens the baseline sandbox"
             ),
+        };
+        warnings.push(Refusal::new(
+            "cpus",
+            vec![asked_cpus.unwrap_or_default()],
+            text,
         ));
     }
     // Per limit, the project may only tighten: its value is kept when it
@@ -2932,7 +2967,14 @@ pub fn project_config_for_auto_save(
     invocation_cwd: &Path,
 ) -> Config {
     let stored_project_command = project.command.clone();
+    // `--rlimit` and `--cpus` are this launch's choice. Only the project
+    // policy's own entries are saved: a CLI value written here would pin
+    // every later launch to it.
+    let project_rlimit = project.rlimit.clone();
+    let project_cpus = project.cpus.clone();
     let mut to_save = merge(cli, project);
+    to_save.rlimit = project_rlimit;
+    to_save.cpus = project_cpus;
 
     // A CLI-passed command is transient when the project already has a stored
     // command. Preserve that project default instead of flipping it between
@@ -9098,13 +9140,9 @@ claude_dir = "/home/user/.claude-example"
     }
 }
 
-// Story 047, Task 1.3 — `--rlimit` flag, `rlimit` config field and the
-// project tighten-only rule (R3.1, R3.9, R6.8).
+// `--rlimit` flag, `rlimit` config field and the project tighten-only
+// rule.
 //
-// Materialization: append this whole file to the end of `src/config.rs`
-// on `feat/adjustable-rlimits` (or `include!("config_story047_rlimit.rs");`).
-//
-// Contract (design.md §C6):
 // - `Config.rlimit: BTreeMap<String, String>`, skipped when empty; a TOML
 //   integer is accepted and stored as its decimal string;
 // - `merge()` puts CLI `--rlimit NAME=VALUE` entries over the trusted map;
@@ -9115,7 +9153,7 @@ claude_dir = "/home/user/.claude-example"
 // The report of `merge_with_global_report` is read through `Debug`, so
 // these tests hold for `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
 #[cfg(test)]
-mod story047_rlimit_config_tests {
+mod rlimit_config_tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -9294,11 +9332,11 @@ mod story047_rlimit_config_tests {
 }
 
 #[cfg(test)]
-mod story047_rlimit_auto_save_tests {
+mod rlimit_auto_save_tests {
     use super::*;
 
     #[test]
-    fn auto_save_keeps_only_rlimits_a_project_file_could_carry() {
+    fn auto_save_writes_no_cli_rlimit_tight_or_loose() {
         let cli = crate::cli::parse_from(lexopt::Parser::from_args(
             [
                 "--rlimit",
@@ -9320,13 +9358,9 @@ mod story047_rlimit_auto_save_tests {
             Config::default(),
             Path::new("/tmp"),
         );
-        assert_eq!(
-            saved.rlimit,
-            BTreeMap::from([
-                ("data".to_string(), "4G".to_string()),
-                ("nofile".to_string(), "1024".to_string()),
-            ])
-        );
+        // A CLI limit is this launch's choice, whether it tightens
+        // (nofile, data) or not (nproc, core): none is saved.
+        assert!(saved.rlimit.is_empty(), "{:?}", saved.rlimit);
         assert!(saved.rlimit_source.is_empty());
     }
 }
@@ -10193,5 +10227,146 @@ hide_dotdirs = [\".secrets\"]
         let body = toml::to_string(&config).unwrap();
         assert!(!body.contains("profile_version"), "{body}");
         assert_eq!(as_toml(&parse_toml(&body).unwrap()), as_toml(&config));
+    }
+}
+
+// Limits are never sticky and trusted CPU sets fail closed.
+//
+// - Auto-save never writes a CLI `--rlimit` or `--cpus` into the project
+//   policy; the project policy's own entries are what it keeps.
+// - A trusted `cpus` that does not parse is refused when the config
+//   loads, as `rlimit` is: the error names the file (the layer) and the
+//   field. `tighten_cpus` never lets a project value replace a malformed
+//   trusted one.
+// - A project `cpus` that overlaps the trusted set is reported as
+//   "narrowed to <set>", naming the set the launch runs on.
+// The merge report is read through `Debug`, so these tests hold for
+// `Vec<String>` and for `feat/profiles`' `Vec<Refusal>`.
+#[cfg(test)]
+mod config_gatefix_rlimit_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use super::*;
+
+    fn cli(args: &[&str]) -> CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .unwrap()
+    }
+
+    fn rl(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn auto_save(cli: &CliArgs, project: Config) -> Config {
+        project_config_for_auto_save(cli, project, Path::new("/project"))
+    }
+
+    #[test]
+    fn gatefix_auto_save_never_writes_cli_rlimit_or_cpus() {
+        let args = cli(&["--rlimit", "nofile=1024", "--cpus", "0", "bash"]);
+        let saved = auto_save(&args, Config::default());
+        assert!(saved.rlimit.is_empty(), "{:?}", saved.rlimit);
+        assert!(saved.rlimit_source.is_empty(), "{:?}", saved.rlimit_source);
+        assert_eq!(saved.cpus, None);
+    }
+
+    #[test]
+    fn gatefix_auto_save_keeps_only_the_project_policy_own_rlimit_and_cpus() {
+        let project = Config {
+            rlimit: rl(&[("nofile", "512")]),
+            cpus: Some("0-3".into()),
+            ..Config::default()
+        };
+        // Hostile half first: the project policy's own entries survive an
+        // auto-save; dropping them would loosen it on the next launch.
+        let saved = auto_save(&cli(&["bash"]), project.clone());
+        assert_eq!(saved.rlimit, rl(&[("nofile", "512")]));
+        assert_eq!(saved.cpus.as_deref(), Some("0-3"));
+        // A CLI value for the same name is this launch's, not the
+        // project's: the saved policy keeps the project's own.
+        let args = cli(&["--rlimit", "nofile=1024", "--cpus", "0-1", "bash"]);
+        let saved = auto_save(&args, project);
+        assert_eq!(saved.rlimit, rl(&[("nofile", "512")]));
+        assert_eq!(saved.cpus.as_deref(), Some("0-3"));
+    }
+
+    #[test]
+    fn gatefix_trusted_cpus_that_parses_loads() {
+        // Hostile half first: valid lists in the base and in a command
+        // table are not refused.
+        let global = parse_global_toml(
+            "cpus = \"0-3\"\n[commands.claude]\ncpus = \"0,2\"\n",
+        )
+        .unwrap();
+        assert_eq!(global.base.cpus.as_deref(), Some("0-3"));
+    }
+
+    #[test]
+    fn gatefix_malformed_trusted_cpus_is_refused_at_load_naming_the_layer() {
+        let base = parse_global_toml("cpus = \"0-3x\"\n");
+        let err = base.expect_err("a malformed global cpus must not load");
+        assert!(err.contains("cpus") && err.contains("0-3x"), "{err}");
+
+        let table = parse_global_toml("[commands.claude]\ncpus = \"8-x\"\n");
+        let err =
+            table.expect_err("a malformed command-table cpus must not load");
+        assert!(err.contains("cpus") && err.contains("8-x"), "{err}");
+
+        let dir = std::env::temp_dir()
+            .join(format!("ai-jail-gatefix-cpus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "cpus = \"0-3x\"\n").unwrap();
+        let loaded = load_global_from_path(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let err = loaded.expect_err("the global file must be refused");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("cpus"), "{err}");
+    }
+
+    #[test]
+    fn gatefix_tighten_cpus_keeps_a_malformed_trusted_value() {
+        use crate::sandbox::affinity::{check_launch, tighten_cpus};
+        // A valid project list must not replace a trusted list that does
+        // not parse: the launch has to fail closed on the trusted text.
+        let (kept, _) = tighten_cpus(Some("0-3x".into()), Some("0-63".into()));
+        assert_eq!(kept.as_deref(), Some("0-3x"));
+        assert!(check_launch(kept.as_deref(), true).is_err());
+        let (kept, _) = tighten_cpus(Some("0-3x".into()), Some("zz".into()));
+        assert_eq!(kept.as_deref(), Some("0-3x"));
+    }
+
+    #[test]
+    fn gatefix_project_cpus_overlap_is_reported_as_narrowed_to_the_set() {
+        let trusted = Config {
+            cpus: Some("0-7".into()),
+            ..Config::default()
+        };
+        let project = Config {
+            cpus: Some("4-11".into()),
+            ..Config::default()
+        };
+        let (merged, report) =
+            merge_with_global_report(trusted, project, Path::new("/tmp"));
+        let warnings: Vec<String> =
+            report.iter().map(|w| format!("{w:?}")).collect();
+        let set = merged.cpus.clone().expect("the intersection is used");
+        assert_eq!(set, "4-7");
+        let cpus: Vec<&String> =
+            warnings.iter().filter(|w| w.contains("cpus")).collect();
+        assert_eq!(cpus.len(), 1, "{warnings:?}");
+        assert!(
+            cpus[0].contains(&format!("narrowed to {set}")),
+            "names the set used: {}",
+            cpus[0]
+        );
+        assert!(!cpus[0].contains("ignored"), "{}", cpus[0]);
     }
 }

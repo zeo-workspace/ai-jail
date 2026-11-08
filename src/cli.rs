@@ -1311,6 +1311,207 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--cpus",
 ];
 
+/// Config fields that are runtime state, never written by a user.
+#[cfg(test)]
+const INTERFACE_INTERNAL_FIELDS: &[&str] =
+    &["rlimit_source", "runtime_harnesses"];
+
+/// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
+/// (fe4dfe0). The drift test is a ratchet: it holds every name added
+/// since to the guide, and documenting one of these lets it be removed.
+#[cfg(test)]
+const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
+    "rw_maps",
+    "overlay_maps",
+    "hide_dotdirs",
+    "mask",
+    "deny_paths",
+    "mask_exceptions",
+    "deny_path_exceptions",
+    "no_gpu",
+    "no_docker",
+    "tailscale",
+    "no_display",
+    "audio",
+    "aws",
+    "kube",
+    "gcloud",
+    "docker_config",
+    "kvm",
+    "prompt_hosts",
+    "macos_host_ipc",
+    "macos_chromium",
+    "macos_trustd",
+    "allow_pty",
+    "allow_loopback_listen",
+    "allow_loopback_connect",
+    "terminal_passthrough",
+    "x11",
+    "host_shm",
+    "no_worktree",
+    "no_mise",
+    "no_toolchains",
+    "no_save_config",
+    "no_hide_config",
+    "pictures",
+    "browser_profile",
+    "private_home",
+    "no_landlock",
+    "no_status_bar",
+    "status_bar_style",
+    "resize_redraw_key",
+    "no_seccomp",
+    "no_rlimits",
+    "systemd_user",
+    "allow_tcp_ports",
+    "allow_hosts",
+    "allow_private_hosts",
+    "forward_ports",
+    "publish_ports",
+    "claude_dir",
+    "inherit_env",
+    "env_pass",
+    "env_from_file",
+    "secret_hosts",
+    "trust_project_config",
+    "update_check",
+    "audit_log",
+    "--harness",
+    "--request-file",
+    "--request",
+    "--private-home",
+    "--no-private-home",
+    "--lockdown",
+    "--no-lockdown",
+    "--no-display",
+    "--display",
+    "--audio",
+    "--no-audio",
+    "--no-github",
+    "--aws",
+    "--no-aws",
+    "--kube",
+    "--no-kube",
+    "--gcloud",
+    "--no-gcloud",
+    "--docker-config",
+    "--no-docker-config",
+    "--kvm",
+    "--no-kvm",
+    "--prompt-hosts",
+    "--no-prompt-hosts",
+    "--network",
+    "--no-network",
+    "--macos-host-ipc",
+    "--no-macos-host-ipc",
+    "--macos-chromium",
+    "--no-macos-chromium",
+    "--macos-trustd",
+    "--no-macos-trustd",
+    "--allow-pty",
+    "--no-allow-pty",
+    "--allow-loopback-listen",
+    "--no-allow-loopback-listen",
+    "--allow-loopback-connect",
+    "--no-allow-loopback-connect",
+    "--no-gpu",
+    "--gpu",
+    "--no-docker",
+    "--docker",
+    "--tailscale",
+    "--no-tailscale",
+    "--landlock",
+    "--no-landlock",
+    "--seccomp",
+    "--no-seccomp",
+    "--rlimits",
+    "--no-rlimits",
+    "--ssh",
+    "--no-ssh",
+    "--pictures",
+    "--no-pictures",
+    "--clean",
+    "--exec",
+    "--dry-run",
+    "--rw-map",
+    "--ro-map",
+    "--overlay-map",
+    "--map",
+    "--mask",
+    "--deny-path",
+    "--mask-except",
+    "--deny-path-except",
+    "--hide-dotdir",
+    "--allow-tcp-port",
+    "--allow-host",
+    "--allow-private-host",
+    "--systemd-user",
+    "--no-systemd-user",
+    "--worktree",
+    "--no-worktree",
+    "--browser",
+    "--no-browser",
+    "--claude-dir",
+    "--x11",
+    "--no-x11",
+    "--host-shm",
+    "--no-host-shm",
+    "--terminal-passthrough",
+    "--no-terminal-passthrough",
+    "--agent-state",
+    "--no-agent-state",
+    "--publish-port",
+    "--inherit-env",
+    "--no-inherit-env",
+    "--update-check",
+    "--no-update-check",
+    "--audit-log",
+    "--no-audit-log",
+    "--audit-verify",
+    "--env-from-file",
+    "--secret",
+    "--mise",
+    "--no-mise",
+    "--toolchains",
+    "--no-toolchains",
+    "--save-config",
+    "--no-save-config",
+    "--hide-config",
+    "--no-hide-config",
+    "--status-bar",
+    "--no-status-bar",
+    "--bootstrap",
+    "--verbose",
+];
+
+/// Whether `text` names `name` as a whole word: `--rlimits` does not
+/// name `--rlimit`, and `no_rlimits` does not name `rlimit`.
+#[cfg(test)]
+fn names_whole(text: &str, name: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// Every `Config` field and sandbox long flag `guide` does not mention,
+/// apart from runtime-only fields and the ratchet baseline.
+#[cfg(test)]
+pub(crate) fn interface_drift(guide: &str) -> Vec<String> {
+    crate::config_store::config_field_names()
+        .into_iter()
+        .chain(SANDBOX_LONG_FLAGS.iter().copied())
+        .filter(|name| {
+            !INTERFACE_INTERNAL_FIELDS.contains(name)
+                && !INTERFACE_UNDOCUMENTED_BASELINE.contains(name)
+                && !names_whole(guide, name)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 fn is_sandbox_long_flag(arg: &str) -> bool {
     let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
     SANDBOX_LONG_FLAGS.contains(&flag)
@@ -3110,5 +3311,192 @@ mod tests {
         assert_eq!(status.harnesses, vec!["claude"]);
         let capabilities = parse_test(&["capabilities", "--json"]).unwrap();
         assert!(capabilities.capabilities && capabilities.json);
+    }
+}
+
+// `--rlimit` and `--cpus` stay in sync across the interface surfaces.
+//
+// - `crate::onboarding::render_effective_access` lists every explicit
+//   limit as `rlimit <name>=<soft>/<hard> (<source>)`, with the values
+//   `rlimits::effective()` applies, and the CPU set as `cpus=<set>`
+//   Defaults are not explicit limits and are not listed
+//   that way.
+// - `crate::cli::interface_drift(guide: &str) -> Vec<String>` returns every
+//   `Config` field (by its config name, e.g. `rlimit`) and every long flag
+//   in `SANDBOX_LONG_FLAGS` (e.g. `--rlimit`) that `guide` does not
+//   mention as a whole name and that is not on the drift test's own
+//   allowlist of internal fields. A longer name (`--rlimits`,
+//   `no_rlimits`) does not document a shorter one.
+// - `docs/TUI_DESIGN.md` names `--rlimit` and `--cpus` as CLI/config-only,
+//   and `docs/onboarding-provenance.toml` has a claim for each whose guide
+//   sections exist in `docs/USER_GUIDE.md`.
+#[cfg(test)]
+mod interface_rlimit_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::cli::interface_drift;
+    use crate::config::Config;
+    use crate::sandbox::rlimits::LimitSource;
+
+    const GUIDE: &str = include_str!("../docs/USER_GUIDE.md");
+    const DESIGN: &str = include_str!("../docs/TUI_DESIGN.md");
+    const PROVENANCE: &str = include_str!("../docs/onboarding-provenance.toml");
+
+    fn review(config: &Config) -> String {
+        crate::onboarding::render_effective_access(
+            config,
+            Path::new("/project"),
+            "claude",
+            None,
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn with_limits(pairs: &[(&str, &str, LimitSource)]) -> Config {
+        Config {
+            rlimit: pairs
+                .iter()
+                .map(|(k, v, _)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: pairs
+                .iter()
+                .map(|(k, _, s)| (k.to_string(), *s))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    fn has_line(text: &str, want: &str) -> bool {
+        text.lines()
+            .any(|l| l.trim().trim_start_matches("- ") == want)
+    }
+
+    #[test]
+    fn interface_review_lists_no_explicit_limit_for_defaults() {
+        // Hostile half first: the defaults the launch applies anyway are
+        // not explicit limits, and no CPU set means no cpus line.
+        let text = review(&Config::default());
+        assert!(
+            !text.lines().any(|l| l.contains("rlimit ")
+                && l.contains('=')
+                && l.contains('/')),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.trim().starts_with("cpus=")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn interface_review_lists_each_explicit_limit_and_the_cpu_set() {
+        let mut config = with_limits(&[
+            ("nofile", "64", LimitSource::Cli),
+            ("cpu", "10", LimitSource::Cli),
+            ("data", "8G", LimitSource::Global),
+        ]);
+        config.cpus = Some("0-3".into());
+        let text = review(&config);
+        assert!(has_line(&text, "rlimit nofile=64/64 (cli)"), "{text}");
+        // cpu carries the 5-second grace the launch applies.
+        assert!(has_line(&text, "rlimit cpu=10/15 (cli)"), "{text}");
+        let gib8 = 8_u64 << 30;
+        assert!(
+            has_line(&text, &format!("rlimit data={gib8}/{gib8} (global)")),
+            "{text}"
+        );
+        assert!(has_line(&text, "cpus=0-3"), "{text}");
+        // An untouched default is still not listed as explicit.
+        assert!(!text.contains("rlimit core="), "{text}");
+    }
+
+    #[test]
+    fn interface_drift_names_undocumented_limit_controls() {
+        let drift = interface_drift("");
+        for item in ["rlimit", "cpus", "--rlimit", "--cpus"] {
+            assert!(
+                drift.iter().any(|d| d == item),
+                "{item} must not be allowlisted as internal: {drift:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_drift_is_not_satisfied_by_a_longer_name() {
+        let guide = "Use `--rlimits` or `--no-rlimits`; the config key is \
+                     `no_rlimits`.\n";
+        let drift = interface_drift(guide);
+        assert!(drift.iter().any(|d| d == "--rlimit"), "{drift:?}");
+        assert!(drift.iter().any(|d| d == "rlimit"), "{drift:?}");
+    }
+
+    #[test]
+    fn interface_drift_accepts_the_documented_forms() {
+        let guide = "## Resource limits\n\n`--rlimit NAME=VALUE` sets one \
+                     limit; in config, `[rlimit]` takes `nofile = 4096`.\n\
+                     `--cpus LIST` pins the sandbox; in config, \
+                     `cpus = \"0-3\"`.\n";
+        let drift = interface_drift(guide);
+        for item in ["rlimit", "cpus", "--rlimit", "--cpus"] {
+            assert!(!drift.iter().any(|d| d == item), "{item}: {drift:?}");
+        }
+    }
+
+    #[test]
+    fn interface_user_guide_documents_every_field_and_sandbox_flag() {
+        // The two controls this branch adds, checked directly as well, so
+        // the guard does not rest on `interface_drift` alone.
+        for flag in ["--rlimit", "--cpus"] {
+            assert!(
+                GUIDE.replace(&format!("{flag}s"), "").contains(flag),
+                "docs/USER_GUIDE.md lacks {flag}"
+            );
+        }
+        let drift = interface_drift(GUIDE);
+        assert!(
+            drift.is_empty(),
+            "undocumented in docs/USER_GUIDE.md: {drift:?}"
+        );
+    }
+
+    #[test]
+    fn interface_tui_design_and_provenance_name_the_limit_controls() {
+        for flag in ["--rlimit", "--cpus"] {
+            // `--rlimits` is an older, different flag: it does not count.
+            assert!(
+                DESIGN
+                    .lines()
+                    .any(|l| l.replace(&format!("{flag}s"), "").contains(flag)),
+                "docs/TUI_DESIGN.md lacks {flag}"
+            );
+        }
+        assert!(DESIGN.contains("CLI/config-only"), "docs/TUI_DESIGN.md");
+
+        let doc: toml::Value = toml::from_str(PROVENANCE).unwrap();
+        let claims = doc["claim"].as_array().unwrap();
+        for field in ["rlimit", "cpus"] {
+            let claim = claims
+                .iter()
+                .find(|c| {
+                    toml::to_string(c)
+                        .unwrap()
+                        .split(|ch: char| {
+                            !(ch.is_ascii_alphanumeric() || ch == '_')
+                        })
+                        .any(|word| word == field)
+                })
+                .unwrap_or_else(|| panic!("no provenance claim for {field}"));
+            let sections = claim["guide_sections"].as_array().unwrap();
+            assert!(!sections.is_empty(), "{field}: no guide section");
+            for section in sections {
+                let heading = format!("## {}", section.as_str().unwrap());
+                assert!(
+                    GUIDE.lines().any(|l| l.trim_end() == heading),
+                    "{field}: docs/USER_GUIDE.md has no {heading}"
+                );
+            }
+        }
     }
 }
