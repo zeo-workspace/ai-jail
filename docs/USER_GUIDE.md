@@ -535,6 +535,12 @@ duration, and never any request content. A file that cannot be opened is a
 warning, not a launch failure. The README's `Run observability` section
 describes every field.
 
+When the command dies of a signal, ai-jail prints one stderr line naming the
+signal and the limit behind it when one is known (the file-size rlimit under
+`--lockdown`, with the value actually in force), even under `--exec`. Ordinary
+exits and deliberate signals print nothing, and the exit code is unchanged.
+There is no setting for it.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
