@@ -474,12 +474,13 @@ ai-jail --cpus 0-3 --dry-run claude
 - **Every limit applies to each process on its own**, not to the sandbox as a
   whole: `data=8G` lets every process use 8 GiB.
 - `cpu` is CPU *seconds*. At the limit the process gets `SIGXCPU`, five seconds
-  later `SIGKILL`. It ends a runaway loop; it does not throttle.
+  later `SIGKILL`. It ends a runaway loop; it does not throttle. It needs at
+  least 1 second: `cpu=0` is refused.
 - Explicit values are applied inside the sandbox only, never to ai-jail's own
   supervisor, so the terminal proxy, the egress proxy and the audit writer keep
   running when the agent hits a limit. The supervisor always keeps its own
-  `core` 0 and `nofile` default, so the sandbox cannot be given more than
-  those.
+  `core` 0 and `nofile` default, and under `--lockdown` its `fsize` default,
+  so the sandbox cannot be given more than those.
 - A limit can only be lowered from where the process starts: asking for more
   than the current hard limit applies the hard limit and prints
   `RLIMIT_<NAME>: requested …, hard limit …, applied …`.
@@ -495,7 +496,10 @@ ai-jail --cpus 0-3 --dry-run claude
   the audit log records the same set. These are the values the sandbox gets:
   an explicit `core` or `nofile` above ai-jail's own default (`core` 0,
   `nofile` 65536) cannot be raised past it, so the line shows the default and
-  adds `ceiling=supervisor`.
+  adds `ceiling=supervisor`. A value above the hard limit ai-jail itself was
+  started with shows that limit and `ceiling=host`. Under `--lockdown`, a
+  value lowered to lockdown's default adds
+  `rlimit name=<n> requested=<r> lockdown_ceiling=<c>`.
 
 `--cpus LIST` (`8,24`, `0-3`) pins the sandbox to those CPUs with CPU affinity,
 and the seccomp filter then refuses `sched_setaffinity`, so nothing inside can
@@ -511,14 +515,13 @@ each needs a cgroup the user does not own:
 |---|---|
 | `memory.max` (total memory) | `data`/`as` cap each process; a total across processes is a cgroup limit |
 | `cpu.max` (CPU share, throttling) | rlimits can only end a process after N CPU seconds, not slow it down |
-| `cpuset.cpus` (CPU set the sandbox cannot leave) | `--cpus` reaches the same effect with affinity plus the seccomp lock |
+| `cpuset.cpus` exclusive CPUs (no other process may use them) | `--cpus` keeps the sandbox on a CPU set with affinity plus the seccomp lock, but cannot keep other processes off it |
 | `io.max` (disk bandwidth) | no rlimit bounds I/O rate |
 | `pids.max` below Linux 5.14 | before 5.14 `RLIMIT_NPROC` counts every process of the user on the host |
 
-`nproc` on Linux 5.14 and later counts per user *and* user namespace. Measured
-on 2026-11-08 with kernel 7.3.3: with `--rlimit nproc=64` a sandbox spawned 62
-processes while 1417 processes of the same user ran outside it — host
-processes did not count against the limit.
+`nproc` on Linux 5.14 and later counts per user *and* user namespace, so host
+processes of the same user do not count against the sandbox's limit
+(`tests/rlimit_values.rs` checks it).
 
 ### Dev toolchains
 

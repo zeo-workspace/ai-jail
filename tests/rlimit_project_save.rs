@@ -1,8 +1,8 @@
 // The project's own limit survives save and migration, through the built
 // binary.
 //
-// Two cases that used to fail: a trusted `nproc = 8192` above the
-// built-in default (4096) and a project `nproc = 6000` between the two.
+// Both cases use a trusted `nproc = 8192` above the built-in default
+// (4096) and a project `nproc = 6000` between the two.
 //
 // - External project document: a real launch auto-saves the policy; the
 //   next `--dry-run` must still report the project's 6000.
