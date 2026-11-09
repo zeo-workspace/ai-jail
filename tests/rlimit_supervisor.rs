@@ -187,9 +187,8 @@ fn supervisor_without_explicit_limits_runs_at_the_defaults() {
 
 #[test]
 fn supervisor_keeps_core_zero_when_core_zero_is_explicit() {
-    // The case that used to fail: `--rlimit core=0` left the supervisor —
-    // which holds the egress proxy and its secret substitution — with an
-    // unlimited core size.
+    // An explicit `core=0` must not remove the supervisor's core limit:
+    // the supervisor holds the egress proxy and its secret substitution.
     require_bwrap!();
     let (supervisor, sandbox) = launch(&["--rlimit", "core=0"]);
     assert_eq!(

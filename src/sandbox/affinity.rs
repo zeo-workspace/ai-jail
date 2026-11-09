@@ -1,10 +1,12 @@
 //! `--cpus`: CPU affinity for the sandbox, locked by seccomp.
 //!
-//! Moved from `feat/resource-limits` d3187c5 (`src/limits.rs`), without
-//! the systemd scope code: affinity needs no privilege, and the seccomp
-//! rule in `seccomp.rs` is what stops the sandbox from widening it again.
+//! Affinity needs no privilege, and the seccomp rule in `seccomp.rs` is
+//! what stops the sandbox from widening it again.
 
 use std::collections::BTreeSet;
+use std::path::Path;
+
+use crate::sandbox::rlimits::LimitSource;
 
 /// Upper bound on a CPU number, matching glibc's `CPU_SETSIZE`.
 const MAX_CPU: usize = 1024;
@@ -64,11 +66,11 @@ pub fn format_cpu_list(cpus: &BTreeSet<usize>) -> String {
 /// Project CPUs narrow the baseline to their intersection. Returns the
 /// value to keep and whether the project value was (partly) dropped.
 ///
-/// Unlike the `feat/resource-limits` version, an empty intersection is
-/// kept as the empty list rather than falling back to the baseline: the
-/// project asked for CPUs the trusted layers never allow, so nothing is
-/// left to run on, and the launch refuses it (`check_launch`) instead of
-/// quietly running on CPUs the project excluded.
+/// An empty intersection is kept as the empty list rather than falling
+/// back to the baseline: the project asked for CPUs the trusted layers
+/// never allow, so nothing is left to run on, and the launch refuses it
+/// (`check_launch`) instead of quietly running on CPUs the project
+/// excluded.
 pub fn tighten_cpus(
     base: Option<String>,
     local: Option<String>,
@@ -126,35 +128,68 @@ pub fn validate_cpus(cpus: &BTreeSet<usize>) -> Result<(), String> {
     }
 }
 
-/// Every refusal `--cpus` can produce, checked before anything starts.
+/// Every refusal a CPU set can produce, checked before anything starts.
+///
+/// A refusal caused by the project names its stored policy, the file the
+/// operator can still edit: the launch has already migrated a legacy
+/// project file away. A refusal caused by `--cpus` (or by a source this
+/// launch cannot name) keeps the flag's wording.
 pub fn check_launch(
     cpus: Option<&str>,
+    source: Option<LimitSource>,
+    project_path: Option<&Path>,
     seccomp_enabled: bool,
 ) -> Result<(), String> {
     let Some(text) = cpus else {
         return Ok(());
     };
+    let refuse = |cli: String, reason: String| match (source, project_path) {
+        (Some(LimitSource::Project), Some(path)) => {
+            format!("project policy {}: cpus {reason}", path.display())
+        }
+        (Some(LimitSource::Global), _) => {
+            format!("global config cpus {reason}")
+        }
+        _ => cli,
+    };
     if text.is_empty() {
-        return Err("--cpus: the project .ai-jail CPU set shares no CPU \
-                    with the trusted set, so nothing is left to run on"
-            .into());
+        return Err(refuse(
+            "--cpus: the project .ai-jail CPU set shares no CPU with the \
+             trusted set, so nothing is left to run on"
+                .into(),
+            "shares no CPU with the trusted set, so nothing is left to \
+             run on"
+                .into(),
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = seccomp_enabled;
-        Err("--cpus is Linux only".into())
+        Err(refuse(
+            "--cpus is Linux only".into(),
+            "is Linux only".into(),
+        ))
     }
     #[cfg(target_os = "linux")]
     {
         // Affinity alone is advisory: any process may widen its own.
         // Seccomp is what makes --cpus a limit rather than a hint.
         if !seccomp_enabled {
-            return Err("--cpus needs seccomp, which stops the sandbox \
-                        from widening its own CPU set; drop --no-seccomp"
-                .into());
+            return Err(refuse(
+                "--cpus needs seccomp, which stops the sandbox from \
+                 widening its own CPU set; drop --no-seccomp"
+                    .into(),
+                "needs seccomp, which stops the sandbox from widening \
+                 its own CPU set; drop --no-seccomp"
+                    .into(),
+            ));
         }
-        let set = parse_cpu_list(text).map_err(|e| format!("--cpus: {e}"))?;
-        validate_cpus(&set)
+        let set = parse_cpu_list(text)
+            .map_err(|e| refuse(format!("--cpus: {e}"), e))?;
+        validate_cpus(&set).map_err(|e| {
+            let reason = e.strip_prefix("--cpus ").unwrap_or(&e).to_string();
+            refuse(e, reason)
+        })
     }
 }
 
@@ -176,7 +211,7 @@ pub fn apply_cpus(cpus: &BTreeSet<usize>) -> Result<(), String> {
 
 // `--cpus`: parsing, formatting, validation and project narrowing.
 //
-// The signatures are shared with `feat/resource-limits`' `src/limits.rs`:
+// The module exposes
 // `parse_cpu_list(&str) -> Result<BTreeSet<usize>, String>`,
 // `format_cpu_list(&BTreeSet<usize>) -> String`,
 // `validate_cpus(&BTreeSet<usize>) -> Result<(), String>`,
@@ -259,5 +294,251 @@ mod affinity_tests {
         for needle in ["systemd-run", "\"sudo\"", "/sys/fs/cgroup", "setuid("] {
             assert!(!code.contains(needle), "affinity.rs mentions {needle}");
         }
+    }
+}
+
+// A CPU-set refusal names the layer that caused it.
+//
+// The launch migrates a legacy project file into the policy store before
+// it checks `cpus`, so a refusal caused by the project must point at the
+// stored policy, which still exists, and never at `--cpus`, which the
+// operator did not pass. A refusal caused by `--cpus` keeps its text.
+//
+// - `Config.cpus_source: Option<LimitSource>`, runtime only, set by the
+//   layer that last decided `cpus` (`Cli` from `merge`, `Project` when a
+//   project value is what the launch keeps);
+// - `check_launch(cpus: Option<&str>, source: Option<LimitSource>,
+//   project_path: Option<&Path>, seccomp_enabled: bool)`.
+// A `None` source is treated as the command line, as for `rlimit`.
+#[cfg(test)]
+mod refusal_layer_tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::{config::Config, sandbox::rlimits::LimitSource};
+
+    /// Where the policy store keeps the project's document. No `.ai-jail`
+    /// in it, so a message naming the legacy file is told apart.
+    const POLICY: &str = "/srv/xdg/ai-jail/projects/proj-refusal.toml";
+
+    fn policy() -> &'static Path {
+        Path::new(POLICY)
+    }
+
+    fn refusal(
+        cpus: &str,
+        source: Option<LimitSource>,
+        seccomp_enabled: bool,
+    ) -> String {
+        match check_launch(Some(cpus), source, Some(policy()), seccomp_enabled)
+        {
+            Ok(()) => panic!("cpus {cpus:?} from {source:?} must be refused"),
+            Err(e) => e,
+        }
+    }
+
+    fn assert_blames_the_command_line(err: &str, case: &str) {
+        assert!(err.starts_with("--cpus"), "{case}: keeps --cpus: {err}");
+        assert!(!err.contains("project policy"), "{case}: {err}");
+        assert!(!err.contains(POLICY), "{case}: names the policy: {err}");
+    }
+
+    fn assert_blames_the_project_policy(err: &str, case: &str) {
+        assert!(err.contains("project policy"), "{case}: {err}");
+        assert!(err.contains(POLICY), "{case}: names the path: {err}");
+        assert!(!err.starts_with("--cpus"), "{case}: blames --cpus: {err}");
+        assert!(!err.contains("--cpus:"), "{case}: blames --cpus: {err}");
+        assert!(!err.contains(".ai-jail"), "{case}: legacy file: {err}");
+        assert!(err.contains("cpus"), "{case}: names the control: {err}");
+    }
+
+    fn cli_args(args: &[&str]) -> crate::cli::CliArgs {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            args.iter().map(std::ffi::OsString::from),
+        ))
+        .expect("test arguments parse")
+    }
+
+    #[test]
+    fn refusal_layer_cli_empty_set_keeps_the_cpus_text() {
+        // Hostile half first: the stored policy path is known at every
+        // launch, so it must not be blamed for a value it did not set.
+        for source in [Some(LimitSource::Cli), None] {
+            let err = refusal("", source, true);
+            assert_blames_the_command_line(&err, "empty set");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal_layer_cli_invalid_list_and_no_seccomp_keep_the_cpus_text() {
+        for source in [Some(LimitSource::Cli), None] {
+            let err = refusal("x", source, true);
+            assert_blames_the_command_line(&err, "invalid list");
+            let err = refusal("0", source, false);
+            assert_blames_the_command_line(&err, "seccomp off");
+            assert!(err.contains("seccomp"), "says why: {err}");
+        }
+    }
+
+    #[test]
+    fn refusal_layer_project_empty_intersection_names_the_policy() {
+        // Project `cpus = "8-9"` under `--cpus 0-3`: nothing is left.
+        let (kept, _) = tighten_cpus(Some("0-3".into()), Some("8-9".into()));
+        assert_eq!(kept.as_deref(), Some(""));
+        let err = refusal("", Some(LimitSource::Project), true);
+        assert_blames_the_project_policy(&err, "empty intersection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal_layer_project_invalid_list_names_the_policy() {
+        let err = refusal("x", Some(LimitSource::Project), true);
+        assert_blames_the_project_policy(&err, "invalid list");
+        assert!(err.contains("\"x\""), "names the value: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal_layer_project_cpus_without_seccomp_names_the_policy() {
+        let err = refusal("0", Some(LimitSource::Project), false);
+        assert_blames_the_project_policy(&err, "seccomp off");
+        assert!(err.contains("seccomp"), "says why: {err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal_layer_valid_project_cpus_still_launch() {
+        // Naming the layer must not turn a usable set into a refusal.
+        let first = *allowed_cpus().unwrap().iter().next().unwrap();
+        let text = first.to_string();
+        for source in [Some(LimitSource::Project), Some(LimitSource::Cli)] {
+            assert_eq!(
+                check_launch(Some(&text), source, Some(policy()), true),
+                Ok(()),
+                "cpus {text} from {source:?}"
+            );
+        }
+        assert_eq!(
+            check_launch(
+                None,
+                Some(LimitSource::Project),
+                Some(policy()),
+                false
+            ),
+            Ok(()),
+            "no cpus at all"
+        );
+    }
+
+    #[test]
+    fn refusal_layer_merge_records_which_layer_decided_cpus() {
+        let args = cli_args(&["--cpus", "0-3", "bash"]);
+        let baseline = crate::config::merge(&args, Config::default());
+        assert_eq!(baseline.cpus_source, Some(LimitSource::Cli));
+
+        // Hostile half first: a project without `cpus` decides nothing.
+        let (merged, _) = crate::config::merge_with_global_report(
+            baseline.clone(),
+            Config::default(),
+            Path::new("/project"),
+        );
+        assert_eq!(merged.cpus.as_deref(), Some("0-3"));
+        assert_eq!(merged.cpus_source, Some(LimitSource::Cli));
+
+        // A trusted list that does not parse is kept over a valid project
+        // list, so the refusal that follows is not the project's.
+        let malformed = Config {
+            cpus: Some("0-3x".into()),
+            cpus_source: Some(LimitSource::Global),
+            ..Config::default()
+        };
+        let project = Config {
+            cpus: Some("0-63".into()),
+            ..Config::default()
+        };
+        let (merged, _) = crate::config::merge_with_global_report(
+            malformed,
+            project,
+            Path::new("/project"),
+        );
+        assert_eq!(merged.cpus.as_deref(), Some("0-3x"));
+        assert_ne!(merged.cpus_source, Some(LimitSource::Project));
+
+        // Project `cpus = "8-9"` under `--cpus 0-3`: the project decided.
+        let project = Config {
+            cpus: Some("8-9".into()),
+            ..Config::default()
+        };
+        let (merged, _) = crate::config::merge_with_global_report(
+            baseline,
+            project,
+            Path::new("/project"),
+        );
+        assert_eq!(merged.cpus.as_deref(), Some(""));
+        assert_eq!(merged.cpus_source, Some(LimitSource::Project));
+        let err = match check_launch(
+            merged.cpus.as_deref(),
+            merged.cpus_source,
+            Some(policy()),
+            true,
+        ) {
+            Ok(()) => panic!("an empty CPU set must be refused"),
+            Err(e) => e,
+        };
+        assert_blames_the_project_policy(&err, "merged empty set");
+    }
+}
+
+// A trusted CPU set written in another order is still the trusted value,
+// and a refusal caused by the global config names it, not `--cpus`.
+#[cfg(test)]
+mod refusal_layer_trusted_tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn refusal_layer_trusted_set_in_another_order_stays_trusted() {
+        // The project names a superset, so the kept value is the trusted
+        // set itself: the trusted layer decided, whatever its spelling.
+        for spelling in ["1-3", "3,1-2"] {
+            let trusted = Config {
+                cpus: Some(spelling.into()),
+                cpus_source: Some(LimitSource::Global),
+                ..Config::default()
+            };
+            let project = Config {
+                cpus: Some("0-7".into()),
+                ..Config::default()
+            };
+            let (merged, _) = crate::config::merge_with_global_report(
+                trusted,
+                project,
+                Path::new("/project"),
+            );
+            assert_eq!(
+                merged.cpus_source,
+                Some(LimitSource::Global),
+                "trusted {spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_layer_global_refusal_names_the_global_config() {
+        let err = match check_launch(
+            Some(""),
+            Some(LimitSource::Global),
+            Some(Path::new("/srv/xdg/ai-jail/projects/p.toml")),
+            true,
+        ) {
+            Ok(()) => panic!("an empty CPU set must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.starts_with("global config cpus"), "{err}");
+        assert!(!err.contains("--cpus"), "{err}");
+        assert!(!err.contains("project policy"), "{err}");
     }
 }

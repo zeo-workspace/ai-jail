@@ -255,8 +255,8 @@ fn supervisor_fsize_lockdown_without_explicit_fsize_runs_at_one_gib() {
 
 #[test]
 fn supervisor_fsize_keeps_one_gib_under_cli_fsize() {
-    // An explicit `fsize` used to drop lockdown's limit from the supervisor
-    // entirely, leaving it `unlimited` while the sandbox ran at 512 MiB.
+    // An explicit `fsize` must not drop lockdown's limit from the
+    // supervisor: the sandbox runs at 512 MiB, the supervisor at 1 GiB.
     require_bwrap_net!();
     require_lockdown_tools!("cat", "sleep");
     let run = launch(&["--lockdown", "--rlimit", "fsize=512M"], None);
