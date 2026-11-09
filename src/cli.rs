@@ -44,12 +44,12 @@ OPTIONS:
     --landlock / --no-landlock     Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --seccomp / --no-seccomp       Enable/disable seccomp syscall filter (Linux, default: on)
     --rlimits / --no-rlimits       Enable/disable resource limits (default: on)
-    --rlimit NAME=VALUE            Set one resource limit, applied to each process on its own
-                                   (per process, not a total for the sandbox; repeatable).
+    --rlimit <NAME=VALUE>          Set one resource limit per process, not a total for
+                                   the sandbox (repeatable).
                                    NAME: nproc, nofile, core, cpu, fsize, data, as.
                                    VALUE: integer, K/M/G/T for fsize/data/as, or unlimited.
-                                   cpu is CPU seconds and ends the process; it does not throttle
-                                   Linux only: refused on other platforms
+                                   cpu is CPU seconds and ends the process; it does not throttle.
+                                   Linux only: refused on other platforms.
     --memory <SIZE>                Cap the whole sandbox's memory (e.g. 8G, 512M;
                                    swap off). Linux + systemd user session
     --max-tasks <N>                Cap processes AND threads in the whole sandbox
@@ -1315,7 +1315,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
 /// Config fields that are runtime state, never written by a user.
 #[cfg(test)]
 const INTERFACE_INTERNAL_FIELDS: &[&str] =
-    &["rlimit_source", "runtime_harnesses"];
+    &["rlimit_source", "cpus_source", "runtime_harnesses"];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
 /// (fe4dfe0). The drift test is a ratchet: it holds every name added

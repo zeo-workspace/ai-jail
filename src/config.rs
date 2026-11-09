@@ -352,6 +352,10 @@ pub struct Config {
     /// audit record. Runtime only: never read from or written to a file.
     #[serde(skip)]
     pub rlimit_source: BTreeMap<String, crate::sandbox::rlimits::LimitSource>,
+    /// Which layer decided `cpus`, so a refusal names the file that caused
+    /// it. Runtime only: never read from or written to a file.
+    #[serde(skip)]
+    pub cpus_source: Option<crate::sandbox::rlimits::LimitSource>,
     /// CPUs the sandbox may run on (`8,24`, `0-3`), applied as CPU
     /// affinity and locked by seccomp. The project `.ai-jail` may only
     /// narrow it.
@@ -1654,6 +1658,9 @@ pub(crate) fn global_config_for_command_report(
         base.rlimit_source
             .insert(name.clone(), crate::sandbox::rlimits::LimitSource::Global);
     }
+    if base.cpus.is_some() {
+        base.cpus_source = Some(crate::sandbox::rlimits::LimitSource::Global);
+    }
     let mut ignored_command_tables = Vec::new();
     let mut apply = |name: &str, base: &mut Config| {
         let Some(command_config) = commands.get(name) else {
@@ -1865,6 +1872,9 @@ fn merge_trusted(global: Config, local: Config) -> Config {
     take!(no_landlock);
     take!(no_seccomp);
     take!(no_rlimits);
+    if local.cpus.is_some() {
+        c.cpus_source = Some(crate::sandbox::rlimits::LimitSource::Global);
+    }
     take!(cpus);
     for (name, value) in local.rlimit {
         c.rlimit_source
@@ -2338,8 +2348,27 @@ pub(crate) fn merge_layer_report(
     // Project CPUs narrow the trusted set; a set sharing no CPU with it
     // becomes the empty list, which the launch refuses.
     let asked_cpus = local.cpus.clone();
+    let trusted = c.cpus.clone();
     let (cpus, dropped) =
         crate::sandbox::affinity::tighten_cpus(c.cpus.take(), local.cpus);
+    // The kept value is the project's unless it is the trusted text
+    // unchanged (no project value, or a malformed trusted list kept).
+    // Compared as CPU sets: `3,1-2` and `1-3` are the same trusted value.
+    let same_set = |a: &Option<String>, b: &Option<String>| match (a, b) {
+        (Some(a), Some(b)) => {
+            match (
+                crate::sandbox::affinity::parse_cpu_list(a),
+                crate::sandbox::affinity::parse_cpu_list(b),
+            ) {
+                (Ok(x), Ok(y)) => x == y,
+                _ => a == b,
+            }
+        }
+        _ => a == b,
+    };
+    if asked_cpus.is_some() && !same_set(&cpus, &trusted) {
+        c.cpus_source = Some(crate::sandbox::rlimits::LimitSource::Project);
+    }
     c.cpus = cpus;
     if dropped {
         let text = match (&c.cpus, &asked_cpus) {
@@ -3124,6 +3153,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     clone_into!(memory_max);
     direct!(max_tasks);
     direct!(cpu_quota);
+    if cli.cpus.is_some() {
+        config.cpus_source = Some(crate::sandbox::rlimits::LimitSource::Cli);
+    }
     clone_into!(cpus);
 
     config
@@ -3259,6 +3291,7 @@ pub fn project_config_for_auto_save(
     // That merge stays the only tighten-only decision.
     to_save.rlimit = well_formed_rlimits(&to_save.rlimit);
     to_save.rlimit_source.clear();
+    to_save.cpus_source = None;
 
     drop_launch_only_fields(&mut to_save);
     absolutize_user_paths(&mut to_save, invocation_cwd);
@@ -5388,6 +5421,7 @@ no_gpu = true
             no_rlimits: None,
             rlimit: BTreeMap::from([("nofile".into(), "1024".into())]),
             rlimit_source: BTreeMap::new(),
+            cpus_source: None,
             cpus: Some("0-3,8".into()),
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000, 8080],
@@ -8857,6 +8891,7 @@ hide_dotdirs = [".my_secrets"]
             no_rlimits: None,
             rlimit: BTreeMap::new(),
             rlimit_source: BTreeMap::new(),
+            cpus_source: None,
             cpus: None,
             systemd_user: Some(true),
             allow_tcp_ports: vec![32000],
@@ -10862,7 +10897,7 @@ mod config_explicit_rlimit_tests {
         // not parse: the launch has to fail closed on the trusted text.
         let (kept, _) = tighten_cpus(Some("0-3x".into()), Some("0-63".into()));
         assert_eq!(kept.as_deref(), Some("0-3x"));
-        assert!(check_launch(kept.as_deref(), true).is_err());
+        assert!(check_launch(kept.as_deref(), None, None, true).is_err());
         let (kept, _) = tighten_cpus(Some("0-3x".into()), Some("zz".into()));
         assert_eq!(kept.as_deref(), Some("0-3x"));
     }
@@ -10897,7 +10932,7 @@ mod config_explicit_rlimit_tests {
 
 // The project's own limit survives save and migration.
 //
-// The case that used to fail:
+// The case pinned here:
 // a trusted `nproc = 8192` raised above the built-in default (4096) and a
 // project `nproc = 6000` between the two. The launch merge applies 6000;
 // saving or migrating the project policy must keep it, or the next launch
@@ -11370,5 +11405,96 @@ mod profile_type_word_tests {
             "{body:?}: must name the type as \"is of type array\": {err}"
         );
         assert!(err.contains("table"), "{body:?}: {err}");
+    }
+}
+
+// A config layer holding `cpu = 0` fails to load, naming the file.
+//
+// The value is refused where every other malformed limit is: at load, so
+// the operator learns which file to fix before anything runs. TOML gives
+// the value as an integer or as a string; both spellings are the same
+// zero. Other limits keep `0` as a valid value.
+#[cfg(test)]
+mod config_cpu_floor_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct CpuFloorDir(PathBuf);
+
+    impl CpuFloorDir {
+        fn new(tag: &str) -> CpuFloorDir {
+            let dir = std::env::temp_dir().join(format!(
+                "ai-jail-config-cpu-floor-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            CpuFloorDir(dir)
+        }
+
+        fn load_global(&self, body: &str) -> (PathBuf, Result<(), String>) {
+            let path = self.0.join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let loaded = load_global_from_path(&path).map(|_| ());
+            (path, loaded)
+        }
+    }
+
+    impl Drop for CpuFloorDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_cpu_floor_loads_one_second_unlimited_and_other_zeros() {
+        // Hostile half first: values next to the floor, and `0` on limits
+        // the floor is not about, still load.
+        let dir = CpuFloorDir::new("ok");
+        for body in [
+            "[rlimit]\ncpu = 1\n",
+            "[rlimit]\ncpu = \"unlimited\"\n",
+            "[rlimit]\ncore = 0\nnofile = 0\nfsize = \"0\"\n",
+        ] {
+            let (path, loaded) = dir.load_global(body);
+            assert!(
+                loaded.is_ok(),
+                "{} with {body:?}: {loaded:?}",
+                path.display()
+            );
+        }
+        assert!(parse_toml("[rlimit]\ncpu = 1\ncore = 0\n").is_ok());
+    }
+
+    #[test]
+    fn config_cpu_floor_refuses_a_global_zero_naming_the_file() {
+        let dir = CpuFloorDir::new("zero");
+        // Hostile half: the quoted zero is the same value as the bare one.
+        for body in ["[rlimit]\ncpu = 0\n", "[rlimit]\ncpu = \"0\"\n"] {
+            let (path, loaded) = dir.load_global(body);
+            let err = match loaded {
+                Ok(()) => panic!("{body:?} must not load"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(&path.display().to_string()),
+                "must name the layer's file: {err}"
+            );
+            assert!(err.contains("cpu"), "must name the limit: {err}");
+            assert!(
+                err.contains("at least 1 second"),
+                "must say what the floor is: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_cpu_floor_refuses_a_project_zero() {
+        let err = match parse_toml("[rlimit]\ncpu = 0\n") {
+            Ok(_) => panic!("a project cpu = 0 must not parse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("at least 1 second"), "{err}");
     }
 }

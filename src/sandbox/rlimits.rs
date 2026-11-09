@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::output;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 // Normal mode: generous limits that prevent abuse
 // without breaking build tools or AI agents.
@@ -149,6 +150,14 @@ impl RlimitValue {
             return Err(refuse());
         }
         let base: u64 = digits.parse().map_err(|_| refuse())?;
+        // At 0 the kernel sends SIGXCPU at once: a wrapper that has
+        // already used CPU time dies before `exec`, with no message.
+        if name == RlimitName::Cpu && base == 0 {
+            return Err(format!(
+                "invalid value {text:?} for rlimit cpu: cpu needs at least \
+                 1 second"
+            ));
+        }
         base.checked_mul(multiplier)
             .map(RlimitValue::Finite)
             .ok_or_else(refuse)
@@ -192,12 +201,14 @@ impl LimitSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitCeiling {
     Supervisor,
+    Host,
 }
 
 impl LimitCeiling {
     pub fn as_str(self) -> &'static str {
         match self {
             LimitCeiling::Supervisor => "supervisor",
+            LimitCeiling::Host => "host",
         }
     }
 }
@@ -301,11 +312,37 @@ pub fn lockdown_clamps(config: &Config) -> Vec<(RlimitName, &str, u64)> {
 /// only by the in-sandbox wrapper, which exists on Linux alone; elsewhere
 /// an explicit value would replace a default and then be applied nowhere.
 /// The platform is a parameter so both arms are testable.
-pub fn check_platform(config: &Config, linux: bool) -> Result<(), String> {
+pub fn check_platform(
+    config: &Config,
+    linux: bool,
+    project_path: Option<&Path>,
+) -> Result<(), String> {
     if linux || config.rlimit.is_empty() {
         return Ok(());
     }
-    Err("explicit limits (--rlimit, rlimit) are Linux only".into())
+    // Name every layer holding an entry, so the operator can find the
+    // file: a project policy refuses every launch of that project.
+    let mut layers: Vec<String> = Vec::new();
+    for key in config.rlimit.keys() {
+        let layer = match config.rlimit_source.get(key) {
+            Some(LimitSource::Project) => match project_path {
+                Some(path) => format!("project policy {}", path.display()),
+                None => "project policy".to_string(),
+            },
+            Some(LimitSource::Global) => "global config rlimit".to_string(),
+            Some(LimitSource::Profile) => "named profile rlimit".to_string(),
+            Some(LimitSource::Default) | Some(LimitSource::Cli) | None => {
+                "--rlimit".to_string()
+            }
+        };
+        if !layers.contains(&layer) {
+            layers.push(layer);
+        }
+    }
+    Err(format!(
+        "explicit limits are Linux only (set by {})",
+        layers.join(", ")
+    ))
 }
 
 /// The hard limit the sandbox inherits from the supervisor for `name`.
@@ -387,6 +424,43 @@ pub fn effective(config: &Config) -> Result<Vec<EffectiveLimit>, String> {
             ceiling,
         })
         .collect())
+}
+
+/// Lower each limit to the hard limit ai-jail itself runs under:
+/// `apply` only lowers, so the sandbox inherits at most that value, and
+/// the dry run and the audit record must show what it gets. A line is
+/// marked `host` when the host lowers its soft or its hard value, unless
+/// the supervisor ceiling already holds it at or below the host's.
+/// `None` from `host_hard` means the limit is unknown: no clamp.
+pub fn clamp_to_host(
+    limits: &mut [EffectiveLimit],
+    host_hard: impl Fn(RlimitName) -> Option<u64>,
+) {
+    for limit in limits.iter_mut() {
+        let Some(host) = host_hard(limit.name) else {
+            continue;
+        };
+        let soft = limit.soft.min(host);
+        // The cpu grace is recomputed from the clamped soft limit, so
+        // `cpu=unlimited` under a host limit of 30 gives 30/30.
+        let hard = if limit.name == RlimitName::Cpu {
+            soft.saturating_add(5).min(host)
+        } else {
+            limit.hard.min(host)
+        };
+        if soft != limit.soft || hard != limit.hard {
+            limit.soft = soft;
+            limit.hard = hard;
+            limit.ceiling = Some(LimitCeiling::Host);
+        }
+    }
+}
+
+/// The hard limit this process runs under, as `clamp_to_host` reads it.
+pub fn host_hard_limit(name: RlimitName) -> Option<u64> {
+    name.resource()
+        .and_then(|r| getrlimit(r).ok())
+        .map(|(_, hard)| hard)
 }
 
 /// The value a layer holds for one limit: its explicit entry, else the
@@ -528,10 +602,13 @@ pub fn supervisor_limits(config: &Config) -> Vec<EffectiveLimit> {
         .into_iter()
         .filter(|(name, _)| match name {
             RlimitName::Core | RlimitName::Nofile | RlimitName::Fsize => true,
-            RlimitName::Nproc => false,
-            RlimitName::Cpu | RlimitName::Data | RlimitName::As => {
-                !config.rlimit.contains_key(name.as_str())
-            }
+            // nproc counts against bwrap's clone(); cpu, data and as
+            // have no default, and on the supervisor they would kill or
+            // cap it.
+            RlimitName::Nproc
+            | RlimitName::Cpu
+            | RlimitName::Data
+            | RlimitName::As => false,
         })
         .map(|(name, soft)| EffectiveLimit {
             name,
@@ -911,7 +988,9 @@ mod grammar_tests {
     #[test]
     fn decimal_integers_parse_for_every_name() {
         for limit in ALL {
-            assert_eq!(finite(limit, "0"), 0);
+            // cpu has a floor of one second (`cpu_floor_tests`).
+            let low = if limit == "cpu" { "1" } else { "0" };
+            assert_eq!(finite(limit, low), low.parse::<u64>().unwrap());
             assert_eq!(finite(limit, "4096"), 4096);
         }
         assert_eq!(finite("nofile", "18446744073709551614"), u64::MAX - 1);
@@ -1109,7 +1188,7 @@ mod effective_tests {
     #[test]
     fn cpu_hard_limit_is_five_seconds_above_soft() {
         assert_eq!(pair(&limits(&config(&[("cpu", "60")])), "cpu"), (60, 65));
-        assert_eq!(pair(&limits(&config(&[("cpu", "0")])), "cpu"), (0, 5));
+        assert_eq!(pair(&limits(&config(&[("cpu", "1")])), "cpu"), (1, 6));
         // Saturating, never wrapping to a tiny hard limit.
         let near = (u64::MAX - 2).to_string();
         assert_eq!(
@@ -1306,7 +1385,7 @@ mod rlimit_explicit_tests {
             },
         ] {
             assert!(
-                check_platform(&config, false).is_ok(),
+                check_platform(&config, false, None).is_ok(),
                 "no explicit limit: {config:?}"
             );
         }
@@ -1316,7 +1395,7 @@ mod rlimit_explicit_tests {
     fn non_linux_refuses_any_explicit_limit_saying_linux_only() {
         for source in [LimitSource::Cli, LimitSource::Global] {
             let config = explicit(&[("nofile", "1024")], source);
-            let err = match check_platform(&config, false) {
+            let err = match check_platform(&config, false, None) {
                 Ok(()) => panic!("{source:?} rlimit must be refused off Linux"),
                 Err(e) => e,
             };
@@ -1327,12 +1406,13 @@ mod rlimit_explicit_tests {
             no_rlimits: Some(true),
             ..explicit(&[("cpu", "60")], LimitSource::Cli)
         };
-        assert!(check_platform(&with_no_rlimits, false).is_err());
+        assert!(check_platform(&with_no_rlimits, false, None).is_err());
         // The same limits are accepted on Linux.
         assert!(
             check_platform(
                 &explicit(&[("nofile", "1024")], LimitSource::Cli),
-                true
+                true,
+                None
             )
             .is_ok()
         );
@@ -1482,11 +1562,11 @@ mod rlimit_explicit_tests {
 //
 // Contract the implementation must meet:
 // - `supervisor_limits(config: &Config) -> Vec<EffectiveLimit>` is the pure
-//   seam that computes the limits `apply` sets on the supervisor (the
+//   function that computes the limits `apply` sets on the supervisor (the
 //   ai-jail process that holds the PTY loop, the egress proxy and its secret
-//   substitution, and the audit writer). `apply` applies exactly that set.
-//   The seam does not exist at c1929f0: `apply` decides inline, and skips a
-//   default whenever an explicit value of the same name exists.
+//   substitution, and the audit writer). `apply` applies exactly that set,
+//   so a default is never skipped because an explicit value of the same
+//   name exists.
 // - With the default set on, the supervisor set holds `core` 0 and the
 //   `nofile` default (65536; 4096 under `--lockdown`), each with hard ==
 //   soft, whatever explicit `core`/`nofile` values are given. An explicit
@@ -1576,8 +1656,8 @@ mod rlimit_supervisor_tests {
 
     #[test]
     fn supervisor_set_keeps_core_and_nofile_defaults_given_explicitly() {
-        // The case that used to fail: asking for the default values removed
-        // them from the supervisor (core unlimited, nofile the host's).
+        // Asking for the default values must keep them on the supervisor,
+        // not leave core unlimited and nofile at the host's.
         let set =
             supervisor_set(&explicit(&[("core", "0"), ("nofile", "65536")]));
         assert_eq!(entry(&set, RlimitName::Core), Some((0, 0)), "{set:?}");
@@ -1645,8 +1725,8 @@ mod rlimit_supervisor_tests {
         if std::env::var_os(CHILD_ENV).is_none() {
             return;
         }
-        // Start from the case that used to fail: a dumpable process with a host
-        // `nofile` soft limit below the default.
+        // Start from a dumpable process with a host `nofile` soft limit
+        // below the default.
         let (_, core_hard) = getrlimit(Resource::RLIMIT_CORE).expect("core");
         setrlimit(Resource::RLIMIT_CORE, core_hard, core_hard)
             .expect("raise core soft to hard");
@@ -1851,9 +1931,9 @@ mod supervisor_fsize_tests {
 
     #[test]
     fn supervisor_fsize_keeps_lockdown_default_under_cli_fsize() {
-        // `--lockdown --rlimit fsize=512M` used to leave the supervisor
-        // with an unlimited file size. The 512 MiB is the sandbox's: the
-        // supervisor holds the default, not the explicit value.
+        // `--lockdown --rlimit fsize=512M` must keep lockdown's file size
+        // on the supervisor. The 512 MiB is the sandbox's: the supervisor
+        // holds the default, not the explicit value.
         let config = lockdown_with(&[("fsize", "512M")], LimitSource::Cli);
         assert_eq!(
             fsize_entry(&config),
@@ -1937,15 +2017,11 @@ mod supervisor_fsize_tests {
 // The effective view reports the value the sandbox actually receives, and
 // every printed limit spells `RLIM_INFINITY` as `unlimited`.
 //
-// Materialization: append this whole file to the end of
-// `src/sandbox/rlimits.rs`.
-//
 // Why a ceiling exists: the supervisor always applies its `core` and
 // `nofile` defaults with hard pinned to soft, and the sandbox inherits that
 // hard limit, so an explicit value above it can never be reached. The
 // effective view must say so instead of repeating the request.
 //
-// Seam the fix provides:
 // - `EffectiveLimit.ceiling: Option<LimitCeiling>`, `Some` only when the
 //   supervisor ceiling changed the value;
 // - `LimitCeiling::Supervisor`, with `as_str()` == "supervisor" (the text
@@ -2096,5 +2172,405 @@ mod effective_ceiling_tests {
         assert_eq!(fmt_rlim(0), "0");
         assert_eq!(fmt_rlim(65536), "65536");
         assert_eq!(fmt_rlim(1073741824), "1073741824");
+    }
+}
+
+#[cfg(test)]
+mod clamp_to_host_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> Config {
+        let rlimit: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let rlimit_source: BTreeMap<String, LimitSource> = pairs
+            .iter()
+            .map(|(k, _)| (k.to_string(), LimitSource::Cli))
+            .collect();
+        Config {
+            rlimit,
+            rlimit_source,
+            ..Config::default()
+        }
+    }
+
+    /// `effective()` for `pairs`, then clamped against a fake host whose
+    /// hard limits are `host`; a name missing from `host` reads as
+    /// unknown (`None`).
+    fn clamped(
+        pairs: &[(&str, &str)],
+        host: &[(RlimitName, u64)],
+    ) -> Vec<EffectiveLimit> {
+        let mut limits = match effective(&config(pairs)) {
+            Ok(v) => v,
+            Err(e) => panic!("effective() must succeed, got Err({e})"),
+        };
+        let host: BTreeMap<RlimitName, u64> = host.iter().copied().collect();
+        clamp_to_host(&mut limits, |name| host.get(&name).copied());
+        limits
+    }
+
+    fn find<'a>(
+        limits: &'a [EffectiveLimit],
+        name: &str,
+    ) -> &'a EffectiveLimit {
+        limits
+            .iter()
+            .find(|l| l.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no effective limit named {name}"))
+    }
+
+    fn pair(limits: &[EffectiveLimit], name: &str) -> (u64, u64) {
+        let l = find(limits, name);
+        (l.soft, l.hard)
+    }
+
+    fn marker(limits: &[EffectiveLimit], name: &str) -> Option<&'static str> {
+        find(limits, name).ceiling.map(LimitCeiling::as_str)
+    }
+
+    #[test]
+    fn clamp_to_host_leaves_values_within_the_host_limit_unmarked() {
+        // The marker must not fire where the host changed nothing: below
+        // the host limit, exactly at it, and with the host unlimited.
+        let got = clamped(
+            &[("nofile", "1024"), ("cpu", "60")],
+            &[(RlimitName::Nofile, 2048), (RlimitName::Cpu, 65)],
+        );
+        assert_eq!(pair(&got, "nofile"), (1024, 1024));
+        assert_eq!(marker(&got, "nofile"), None);
+        assert_eq!(pair(&got, "cpu"), (60, 65));
+        assert_eq!(marker(&got, "cpu"), None);
+
+        let got = clamped(&[("nofile", "2048")], &[(RlimitName::Nofile, 2048)]);
+        assert_eq!(pair(&got, "nofile"), (2048, 2048));
+        assert_eq!(marker(&got, "nofile"), None);
+
+        let got = clamped(
+            &[("cpu", "60"), ("as", "unlimited")],
+            &[
+                (RlimitName::Cpu, nix::libc::RLIM_INFINITY),
+                (RlimitName::As, nix::libc::RLIM_INFINITY),
+            ],
+        );
+        assert_eq!(pair(&got, "cpu"), (60, 65));
+        assert_eq!(pair(&got, "as"), (u64::MAX, u64::MAX));
+        assert_eq!(marker(&got, "cpu"), None);
+        assert_eq!(marker(&got, "as"), None);
+    }
+
+    #[test]
+    fn clamp_to_host_keeps_the_supervisor_ceiling_when_it_is_lower() {
+        // Both ceilings bind only nominally here: the supervisor's 65536
+        // is the lower one, so it stays the value and the name shown. A
+        // host limit equal to it does not take the marker either.
+        for host in [70000, 65536] {
+            let got =
+                clamped(&[("nofile", "100000")], &[(RlimitName::Nofile, host)]);
+            assert_eq!(pair(&got, "nofile"), (65536, 65536), "host {host}");
+            assert_eq!(marker(&got, "nofile"), Some("supervisor"), "{host}");
+        }
+    }
+
+    #[test]
+    fn clamp_to_host_marks_the_host_when_it_is_below_the_supervisor() {
+        let got =
+            clamped(&[("nofile", "100000")], &[(RlimitName::Nofile, 2048)]);
+        assert_eq!(pair(&got, "nofile"), (2048, 2048));
+        assert_eq!(marker(&got, "nofile"), Some("host"));
+        // The layer that asked is still the one reported.
+        assert!(matches!(find(&got, "nofile").source, LimitSource::Cli));
+    }
+
+    #[test]
+    fn clamp_to_host_lowers_an_explicit_value_above_the_host_limit() {
+        let got = clamped(&[("nofile", "3000")], &[(RlimitName::Nofile, 2048)]);
+        assert_eq!(pair(&got, "nofile"), (2048, 2048));
+        assert_eq!(marker(&got, "nofile"), Some("host"));
+        assert!(matches!(find(&got, "nofile").source, LimitSource::Cli));
+
+        // `unlimited` is a value like any other: a finite host limit
+        // bounds it.
+        let got = clamped(
+            &[("as", "unlimited")],
+            &[(RlimitName::As, 8 * 1024 * 1024 * 1024)],
+        );
+        assert_eq!(pair(&got, "as"), (8589934592, 8589934592));
+        assert_eq!(marker(&got, "as"), Some("host"));
+    }
+
+    #[test]
+    fn clamp_to_host_gives_cpu_the_host_limit_as_soft_and_hard() {
+        // The host hard limit is below the soft limit itself: the kernel
+        // bounds both values by it, so there is no grace left at all.
+        let got = clamped(&[("cpu", "60")], &[(RlimitName::Cpu, 30)]);
+        assert_eq!(pair(&got, "cpu"), (30, 30));
+        assert_eq!(marker(&got, "cpu"), Some("host"));
+        assert!(matches!(find(&got, "cpu").source, LimitSource::Cli));
+
+        let got = clamped(&[("cpu", "unlimited")], &[(RlimitName::Cpu, 30)]);
+        assert_eq!(pair(&got, "cpu"), (30, 30));
+        assert_eq!(marker(&got, "cpu"), Some("host"));
+    }
+
+    #[test]
+    fn clamp_to_host_shortens_the_cpu_grace_to_the_host_limit() {
+        // The soft limit fits under the host limit, the five-second grace
+        // above it does not: the hard value is the host's.
+        let got = clamped(&[("cpu", "60")], &[(RlimitName::Cpu, 62)]);
+        assert_eq!(pair(&got, "cpu"), (60, 62));
+        // Only the grace shrank, and the line still says why the hard
+        // value is not the soft value plus five.
+        assert_eq!(marker(&got, "cpu"), Some("host"));
+
+        let got = clamped(&[("cpu", "60")], &[(RlimitName::Cpu, 60)]);
+        assert_eq!(pair(&got, "cpu"), (60, 60));
+    }
+
+    #[test]
+    fn clamp_to_host_touches_only_the_names_the_host_bounds() {
+        // A low host limit on one resource must not leak into another,
+        // and an unreadable host limit (`None`) changes nothing.
+        let got = clamped(
+            &[("nofile", "3000"), ("cpu", "60"), ("fsize", "64M")],
+            &[(RlimitName::Nofile, 2048)],
+        );
+        assert_eq!(pair(&got, "nofile"), (2048, 2048));
+        assert_eq!(pair(&got, "cpu"), (60, 65));
+        assert_eq!(pair(&got, "fsize"), (67108864, 67108864));
+        assert_eq!(pair(&got, "core"), (0, 0));
+        assert_eq!(marker(&got, "cpu"), None);
+        assert_eq!(marker(&got, "fsize"), None);
+        assert_eq!(marker(&got, "core"), None);
+        assert!(matches!(find(&got, "core").source, LimitSource::Default));
+
+        let got = clamped(&[("nofile", "3000"), ("cpu", "60")], &[]);
+        assert_eq!(pair(&got, "nofile"), (3000, 3000));
+        assert_eq!(pair(&got, "cpu"), (60, 65));
+        assert_eq!(marker(&got, "nofile"), None);
+        assert_eq!(marker(&got, "cpu"), None);
+    }
+
+    #[test]
+    fn clamp_to_host_marks_a_default_the_host_lowers() {
+        // The defaults are bounded by the host like any other value; the
+        // source stays `default`.
+        let got = clamped(&[], &[(RlimitName::Nofile, 1024)]);
+        assert_eq!(pair(&got, "nofile"), (1024, 1024));
+        assert_eq!(marker(&got, "nofile"), Some("host"));
+        assert!(matches!(find(&got, "nofile").source, LimitSource::Default));
+    }
+
+    #[test]
+    fn clamp_to_host_names_its_ceiling_host() {
+        assert_eq!(LimitCeiling::Host.as_str(), "host");
+        assert_eq!(LimitCeiling::Supervisor.as_str(), "supervisor");
+    }
+}
+
+// `cpu` needs at least one second of CPU time.
+//
+// Why a floor exists: the limit is set on the wrapper, which has already
+// spent CPU time before it execs the command. At `cpu=0` the kernel sends
+// SIGXCPU before `exec`, so the jail dies with exit 152 and no message.
+// The grammar refuses the value instead, for `--rlimit` and for every
+// config layer, saying "cpu needs at least 1 second".
+//
+// The floor is about `cpu` alone: `0` stays a valid value for every other
+// limit (`core = 0` is the supervisor's own default).
+#[cfg(test)]
+mod cpu_floor_tests {
+    use super::*;
+
+    fn cpu_floor_cli(spec: &str) -> Result<crate::cli::CliArgs, String> {
+        crate::cli::parse_from(lexopt::Parser::from_args(
+            ["--rlimit", spec, "bash"]
+                .iter()
+                .map(std::ffi::OsString::from),
+        ))
+    }
+
+    #[test]
+    fn cpu_floor_leaves_zero_valid_for_every_other_limit() {
+        // Hostile half first: a floor that fired on the value rather than
+        // on the name would refuse the supervisor's own `core = 0`.
+        for limit in ["nproc", "nofile", "core", "fsize", "data", "as"] {
+            let name: RlimitName = limit.parse().unwrap();
+            assert_eq!(
+                RlimitValue::parse(name, "0"),
+                Ok(RlimitValue::Finite(0)),
+                "{limit}=0 must stay valid"
+            );
+            let spec = format!("{limit}=0");
+            assert!(cpu_floor_cli(&spec).is_ok(), "--rlimit {spec}");
+        }
+    }
+
+    #[test]
+    fn cpu_floor_accepts_one_second_and_unlimited() {
+        // Hostile half: the smallest value above the floor, and the value
+        // with no limit at all, are not refused.
+        assert_eq!(
+            RlimitValue::parse(RlimitName::Cpu, "1"),
+            Ok(RlimitValue::Finite(1))
+        );
+        assert_eq!(
+            RlimitValue::parse(RlimitName::Cpu, "unlimited"),
+            Ok(RlimitValue::Unlimited)
+        );
+        for spec in ["cpu=1", "cpu=unlimited"] {
+            let args = cpu_floor_cli(spec)
+                .unwrap_or_else(|e| panic!("--rlimit {spec}: {e}"));
+            let (_, value) = spec.split_once('=').unwrap();
+            assert!(
+                args.rlimit.iter().any(|(k, v)| k == "cpu" && v == value),
+                "{:?}",
+                args.rlimit
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_floor_refuses_zero_in_every_spelling() {
+        // Hostile half: "00" is the same zero spelled differently, and a
+        // check on the text instead of the value would let it through.
+        for text in ["0", "00"] {
+            let err = match RlimitValue::parse(RlimitName::Cpu, text) {
+                Ok(v) => panic!("cpu={text} must be refused, got {v:?}"),
+                Err(e) => e,
+            };
+            assert!(err.contains("cpu"), "must name the limit: {err}");
+            assert!(
+                err.contains("at least 1 second"),
+                "must say what the floor is: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_floor_refuses_the_cli_flag_naming_it() {
+        let err = match cpu_floor_cli("cpu=0") {
+            Ok(_) => panic!("--rlimit cpu=0 must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("--rlimit"), "must name the flag: {err}");
+        assert!(err.contains("cpu=0"), "must name the value: {err}");
+        assert!(
+            err.contains("at least 1 second"),
+            "must say what the floor is: {err}"
+        );
+    }
+}
+
+// Off Linux, the refusal of an explicit limit names the layers that hold
+// one, so the operator can find the file.
+//
+// A project policy holding `[rlimit]` refuses every non-Linux launch of
+// that project; a refusal that says only "--rlimit" sends the operator to
+// a flag they never passed.
+//
+// - `check_platform(config: &Config, linux: bool,
+//   project_path: Option<&Path>) -> Result<(), String>`, where
+//   `project_path` is the stored project policy; the layers come from
+//   `rlimit_source`, an entry without one counting as the command line.
+// The platform stays a parameter, so these run on Linux too.
+#[cfg(test)]
+mod platform_layer_tests {
+    use std::{collections::BTreeMap, path::Path};
+
+    use super::*;
+
+    /// Where the policy store keeps the project's document.
+    const POLICY: &str = "/srv/xdg/ai-jail/projects/proj-platform.toml";
+
+    fn policy() -> &'static Path {
+        Path::new(POLICY)
+    }
+
+    fn layered(entries: &[(&str, &str, LimitSource)]) -> Config {
+        Config {
+            rlimit: entries
+                .iter()
+                .map(|(k, v, _)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+            rlimit_source: entries
+                .iter()
+                .map(|(k, _, s)| (k.to_string(), *s))
+                .collect::<BTreeMap<_, _>>(),
+            ..Config::default()
+        }
+    }
+
+    fn refusal(config: &Config) -> String {
+        match check_platform(config, false, Some(policy())) {
+            Ok(()) => panic!("explicit limits must be refused off Linux"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn platform_layer_cli_limit_does_not_blame_the_project() {
+        // Hostile half first: the policy path is known at every launch,
+        // so it must not be named for a limit it does not hold.
+        let err = refusal(&layered(&[("nofile", "1024", LimitSource::Cli)]));
+        assert!(err.contains("Linux only"), "{err}");
+        assert!(err.contains("--rlimit"), "names the flag: {err}");
+        assert!(!err.contains("project policy"), "{err}");
+        assert!(!err.contains(POLICY), "names the policy: {err}");
+
+        // An entry without a recorded source is the command line's.
+        let unsourced = Config {
+            rlimit: BTreeMap::from([("cpu".into(), "60".into())]),
+            ..Config::default()
+        };
+        let err = refusal(&unsourced);
+        assert!(err.contains("--rlimit"), "names the flag: {err}");
+        assert!(!err.contains(POLICY), "names the policy: {err}");
+    }
+
+    #[test]
+    fn platform_layer_global_limit_blames_neither_flag_nor_project() {
+        let err = refusal(&layered(&[("nofile", "1024", LimitSource::Global)]));
+        assert!(err.contains("Linux only"), "{err}");
+        assert!(err.contains("rlimit"), "names the control: {err}");
+        assert!(!err.contains("--rlimit"), "blames the flag: {err}");
+        assert!(!err.contains("project policy"), "{err}");
+        assert!(!err.contains(POLICY), "names the policy: {err}");
+    }
+
+    #[test]
+    fn platform_layer_project_limit_names_the_stored_policy() {
+        let err = refusal(&layered(&[("nproc", "512", LimitSource::Project)]));
+        assert!(err.contains("Linux only"), "{err}");
+        assert!(err.contains("project policy"), "{err}");
+        assert!(err.contains(POLICY), "names the path: {err}");
+        assert!(!err.contains("--rlimit"), "blames the flag: {err}");
+        assert!(!err.contains(".ai-jail"), "names the legacy file: {err}");
+    }
+
+    #[test]
+    fn platform_layer_names_every_layer_that_holds_a_limit() {
+        let err = refusal(&layered(&[
+            ("nofile", "1024", LimitSource::Cli),
+            ("nproc", "512", LimitSource::Project),
+        ]));
+        assert!(err.contains("--rlimit"), "names the flag: {err}");
+        assert!(err.contains("project policy"), "{err}");
+        assert!(err.contains(POLICY), "names the path: {err}");
+    }
+
+    #[test]
+    fn platform_layer_accepts_what_it_accepted() {
+        // Naming layers must not refuse a launch that runs.
+        let project = layered(&[("nproc", "512", LimitSource::Project)]);
+        assert_eq!(check_platform(&project, true, Some(policy())), Ok(()));
+        assert_eq!(
+            check_platform(&Config::default(), false, Some(policy())),
+            Ok(())
+        );
+        assert_eq!(check_platform(&project, true, None), Ok(()));
     }
 }

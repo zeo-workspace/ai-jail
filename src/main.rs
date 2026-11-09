@@ -2229,10 +2229,21 @@ fn run(
         // impossible combination (an explicit limit off Linux, a CPU set
         // with no CPU left) stops the launch before anything starts, dry
         // run included.
-        sandbox::rlimits::check_platform(config, cfg!(target_os = "linux"))?;
-        let effective_limits = sandbox::rlimits::effective(config)?;
+        let project_policy = store.available.then_some(store.project.as_path());
+        sandbox::rlimits::check_platform(
+            config,
+            cfg!(target_os = "linux"),
+            project_policy,
+        )?;
+        let mut effective_limits = sandbox::rlimits::effective(config)?;
+        sandbox::rlimits::clamp_to_host(
+            &mut effective_limits,
+            sandbox::rlimits::host_hard_limit,
+        );
         sandbox::affinity::check_launch(
             config.cpus.as_deref(),
+            config.cpus_source,
+            project_policy,
             config.seccomp_enabled(),
         )?;
 

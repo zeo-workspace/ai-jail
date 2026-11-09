@@ -470,7 +470,7 @@ fn rlimit_fsize_stops_a_large_write_with_sigxfsz() {
     // 153 = 128 + SIGXFSZ(25).
     let out = tree.jail(
         &["--rlimit", "fsize=1M"],
-        "head -c 2097152 /dev/zero > /tmp/aj047.big; echo status=$?",
+        "head -c 2097152 /dev/zero > /tmp/aj-fsize.big; echo status=$?",
     );
     assert_eq!(assert_ok(&out).trim(), "status=153");
 }
