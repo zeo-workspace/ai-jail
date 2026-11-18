@@ -840,6 +840,17 @@ pub(crate) fn finalize_launch_config_with_ssh(
                 .push("MISE_NOT_FOUND_AUTO_INSTALL=false".into());
         }
     }
+    if !config.mise_enabled()
+        && !config.lockdown_enabled()
+        && sandbox::command_is_mise_wrapper(&config)
+    {
+        let name = config.command.first().map(String::as_str).unwrap_or("");
+        output::warn(&format!(
+            "{name} is a mise command wrapper, and mise integration is off, \
+             so mise cannot find its tools or config in the sandbox and \
+             {name} will likely fail to start. Launch with --mise."
+        ));
+    }
     if config.toolchains_enabled() && !config.lockdown_enabled() {
         let maps = sandbox::toolchain_maps();
         for spec in maps.ro {
@@ -2767,6 +2778,9 @@ fn main() {
     for notice in &migration_notices {
         output::migration_notice(notice.id, &notice.text, notice.warning);
     }
+    // Unanswered prompt notifications are closed here: a killed notify-send
+    // leaves its notification behind, and ai-jail is about to exit.
+    proxy::close_pending_prompts();
     match result {
         Ok(code) => std::process::exit(code),
         Err(msg) => {

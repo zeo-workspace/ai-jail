@@ -384,6 +384,27 @@ mod tests {
     }
 
     #[test]
+    fn supervision_gate_write_end_does_not_survive_exec() {
+        let mut command = Command::new("/usr/bin/true");
+        let gate = wrap_supervised_command(&mut command).unwrap();
+        let write_flags = unsafe {
+            nix::libc::fcntl(gate.write.as_raw_fd(), nix::libc::F_GETFD)
+        };
+        assert!(write_flags >= 0);
+        assert_ne!(
+            write_flags & nix::libc::FD_CLOEXEC,
+            0,
+            "the gate write end would leak into the sandboxed command"
+        );
+        // The supervisor needs the read end after exec.
+        let read_flags = unsafe {
+            nix::libc::fcntl(gate.read.as_raw_fd(), nix::libc::F_GETFD)
+        };
+        assert!(read_flags >= 0);
+        assert_eq!(read_flags & nix::libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
     fn clear_child_pid_only_clears_matching_supervised_process() {
         let _guard = PID_LOCK.lock().unwrap();
         let saved = CHILD_PID.load(Ordering::SeqCst);
