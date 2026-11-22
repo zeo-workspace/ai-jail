@@ -858,6 +858,46 @@ counted (`oom_kills`, `memory_peak`, `tasks_refused`, `cpu_usage_usec`). The
 config fields are `memory_max`, `max_tasks`, `cpu_quota` and `cpus`; a project
 `.ai-jail` may add or lower a limit, never raise it.
 
+## Hiding the host: `--mask-host`
+
+By default the sandbox reads the host's own description of itself: `/sys` and
+`/etc` are bound read-only and the fresh `/proc` still carries system-wide
+files. An agent can read the CPU model and count, the RAM and swap, the host's
+load, the board (DMI), the machine id and every sibling cgroup unit.
+`--mask-host` (Linux) replaces them, at launch, with a view sized to the
+sandbox:
+
+| Path | Inside the sandbox |
+|---|---|
+| `/proc/cpuinfo` | one block per allowed CPU, model `Virtual CPU`; vendor and feature flags stay the host's (software picks code paths by them) |
+| `/proc/stat` | one zeroed line per allowed CPU (static: usage reads idle) |
+| `/proc/loadavg` | `0.00 0.00 0.00 1/1 1` |
+| `/proc/meminfo` | sized to the memory limit, swap to the swap limit; the host's file when there is no limit |
+| `/sys/devices/system/cpu` | `online`, `possible`, `present` and one `cpuN/` per allowed CPU |
+| `/sys/fs/cgroup` | only the sandbox's own cgroup, read-only, in its own cgroup namespace (`/proc/self/cgroup` reads `0::/`) |
+| `/sys/class/dmi`, `/sys/devices/virtual/dmi` | empty |
+| `/etc/machine-id` | a random id per launch |
+
+The allowed CPUs are the process's affinity (`taskset`), trimmed to the
+cgroup's `cpu.max` rounded up to whole CPUs; the memory limit is the
+smallest `memory.max` from the sandbox's cgroup up to the root. Run ai-jail
+inside a limited scope (for example `systemd-run --user --scope -p
+MemoryMax=8G -p CPUQuota=400% ai-jail --mask-host ...`) and every tool --
+`nproc`, `getconf`, `lscpu`, `free` -- reports the same 4 CPUs and 8 GiB.
+The flag is never saved to a profile: pass it on each launch.
+
+**Cost.** A procfs with files mounted over it is no longer "fully visible" to
+the kernel, so a sandbox nested inside this one cannot mount its own `/proc`
+(`Can't mount proc on /proc: Operation not permitted`): bwrap with
+`--unshare-pid`, rootless podman and Claude Code's own Bash sandbox fail.
+ai-jail's default Landlock and seccomp filters already stop nested sandboxes,
+so this changes behaviour only under `--no-landlock --no-seccomp`.
+
+**What it cannot hide.** This hides the easy answers; it does not isolate.
+The `cpuid` instruction, timing, the `uname(2)` kernel release, the CPU
+numbers `sched_getaffinity` and `/proc/self/status` return, and the mount
+sources in `/proc/self/mountinfo` stay the host's. Only a VM changes those.
+
 ## Browsers
 
 `--browser[=hard|soft]` reuses an isolated browser profile, but browsers still
@@ -990,6 +1030,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
                                 session; see Resource limits)
 --cpus LIST                     pin the sandbox to CPUs, locked by seccomp
 --state-root DIR                $HOME, /tmp and Claude config on disk under DIR (Linux; not saved)
+--mask-host                     hardware view sized to the sandbox's limits (Linux; not saved; see Hiding the host)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit

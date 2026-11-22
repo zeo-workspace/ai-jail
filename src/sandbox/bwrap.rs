@@ -188,6 +188,13 @@ fn mounted_map_args<'a>(
 struct MountSet {
     base: Vec<Mount>,
     sys_masks: Vec<Mount>,
+    /// `--mask-host`: synthetic /proc and /sys files, the jail's own
+    /// cgroup and DMI masks. Right after the base mounts it replaces, and
+    /// before everything a user maps or masks on purpose.
+    host_view: Vec<Mount>,
+    /// `--mask-host` also gives the sandbox its own cgroup namespace, so
+    /// /proc/self/cgroup reads `0::/` and names no host unit.
+    unshare_cgroup: bool,
     home_dotfiles: Vec<Mount>,
     devin_env: Vec<(String, String)>,
     /// Devin state roots are read-write; the installation below its data
@@ -261,10 +268,11 @@ impl MountSet {
             .chain(self.extra.iter())
             .chain(self.extra_inside.iter())
     }
-    fn ordered_mounts(&self) -> [&[Mount]; 29] {
+    fn ordered_mounts(&self) -> [&[Mount]; 30] {
         [
             &self.base,
             &self.sys_masks,
+            &self.host_view,
             &self.gpu,
             &self.kvm,
             &self.docker,
@@ -326,6 +334,10 @@ impl MountSet {
 
         if lockdown || should_use_new_session() {
             args.push("--new-session".into());
+        }
+
+        if self.unshare_cgroup {
+            args.push("--unshare-cgroup".into());
         }
 
         // Lockdown always isolates the network namespace, even if --network
@@ -581,6 +593,9 @@ pub struct SandboxGuard {
     deny_file_path: PathBuf,
     /// Mode-000 temp directory used as the source for --deny-path directory overlays.
     deny_dir_path: PathBuf,
+    /// `--mask-host`'s synthetic files, made on first use and removed
+    /// with the guard, which outlives the sandbox.
+    host_view: std::cell::OnceCell<super::host_view::HostView>,
 }
 
 impl SandboxGuard {
@@ -618,6 +633,53 @@ impl SandboxGuard {
     fn deny_dir_path(&self) -> &Path {
         &self.deny_dir_path
     }
+
+    fn host_view(
+        &self,
+        config: &Config,
+        write: bool,
+    ) -> Result<&super::host_view::HostView, String> {
+        if let Some(view) = self.host_view.get() {
+            return Ok(view);
+        }
+        let view = super::host_view::HostView::create(
+            host_view_request(config),
+            write,
+        )?;
+        Ok(self.host_view.get_or_init(|| view))
+    }
+}
+
+/// What the launch adds to the host view beyond the limits ai-jail reads
+/// from its own cgroup and affinity.
+fn host_view_request(_config: &Config) -> super::host_view::HostViewRequest {
+    super::host_view::HostViewRequest::default()
+}
+
+/// Put `--mask-host`'s view over the base mounts.
+fn apply_host_view(
+    mount_set: &mut MountSet,
+    view: &super::host_view::HostView,
+) {
+    use super::host_view::HostViewMount;
+    mount_set.host_view = view
+        .mounts()
+        .iter()
+        .map(|m| match m {
+            HostViewMount::File { src, dest } => Mount::FileRoBind {
+                src: src.clone(),
+                dest: dest.clone(),
+            },
+            HostViewMount::Dir { src, dest } => Mount::RoBind {
+                src: src.clone(),
+                dest: dest.clone(),
+            },
+            HostViewMount::Tmpfs { dest } => {
+                Mount::Tmpfs { dest: dest.clone() }
+            }
+        })
+        .collect();
+    mount_set.unshare_cgroup = true;
 }
 
 impl Drop for SandboxGuard {
@@ -644,6 +706,7 @@ impl SandboxGuard {
             empty_path: PathBuf::from("/tmp/ai-jail-test-empty"),
             deny_file_path: PathBuf::from("/tmp/ai-jail-test-deny-file"),
             deny_dir_path: PathBuf::from("/tmp/ai-jail-test-deny-dir"),
+            host_view: std::cell::OnceCell::new(),
         }
     }
 }
@@ -1009,6 +1072,7 @@ pub fn prepare() -> Result<SandboxGuard, String> {
         empty_path,
         deny_file_path,
         deny_dir_path,
+        host_view: std::cell::OnceCell::new(),
     })
 }
 
@@ -1525,8 +1589,16 @@ pub fn build(
     bridge_sockets: &super::BridgeSockets,
 ) -> Result<Command, String> {
     let sources = MountSources::from_guard(guard);
-    let mount_set =
+    let mut mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
+    if config.mask_host {
+        apply_host_view(&mut mount_set, guard.host_view(config, true)?);
+        if verbose {
+            crate::output::verbose(
+                "Host view: synthetic CPU, memory and load files, own cgroup, no DMI (--mask-host)",
+            );
+        }
+    }
     let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let bwrap = bwrap_binary_path()?;
@@ -1750,6 +1822,11 @@ pub fn dry_run(
         create_dirs: false,
         ..MountSources::from_guard(guard)
     };
+    let host_view = if config.mask_host {
+        Some(guard.host_view(config, false)?)
+    } else {
+        None
+    };
     let args = build_dry_run_args_forwarded(
         config,
         project_dir,
@@ -1757,6 +1834,7 @@ pub fn dry_run(
         verbose,
         proxy_socket,
         bridge_sockets,
+        host_view,
     )?;
     let secret_names = crate::config::env_pass_names(&config.env_pass);
     Ok(format_dry_run_args_redacting(&args, &secret_names))
@@ -1790,6 +1868,7 @@ fn build_dry_run_args_full(
         verbose,
         proxy_socket,
         &super::BridgeSockets::default(),
+        None,
     )
 }
 
@@ -1800,9 +1879,13 @@ fn build_dry_run_args_forwarded(
     verbose: bool,
     proxy_socket: Option<&Path>,
     bridge_sockets: &super::BridgeSockets,
+    host_view: Option<&super::host_view::HostView>,
 ) -> Result<Vec<String>, String> {
-    let mount_set =
+    let mut mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
+    if let Some(view) = host_view {
+        apply_host_view(&mut mount_set, view);
+    }
     let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
     let launch = super::build_launch_command(config);
@@ -2156,6 +2239,9 @@ fn discover_mounts_full(
         mask: mask_mounts,
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
+        // Filled by apply_host_view under --mask-host.
+        host_view: Vec::new(),
+        unshare_cgroup: false,
     };
     // --state-root: the sandbox's $HOME and /tmp on disk instead of tmpfs.
     // Every bind ai-jail layers over $HOME stays where it was; only the
@@ -5037,6 +5123,7 @@ mod tests {
                 forward: vec![(49374, sock.clone())],
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -5094,6 +5181,7 @@ mod tests {
                 )],
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -5132,6 +5220,7 @@ mod tests {
                 forward: vec![(49374, PathBuf::from("/tmp/only-one.sock"))],
                 ..Default::default()
             },
+            None,
         );
         assert!(result.unwrap_err().contains("--forward-port 8080"));
     }
@@ -5156,6 +5245,7 @@ mod tests {
                 publish: vec![(4096, sock.clone())],
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
 
@@ -5204,8 +5294,55 @@ mod tests {
             false,
             None,
             &crate::sandbox::BridgeSockets::default(),
+            None,
         );
         assert!(result.unwrap_err().contains("--publish-port 4096"));
+    }
+
+    #[test]
+    fn mask_host_binds_its_view_over_proc_and_unshares_the_cgroup() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            mask_host: true,
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let view = guard.host_view(&config, false).unwrap();
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+            Some(view),
+        )
+        .unwrap();
+        let proc_at = args
+            .windows(2)
+            .position(|w| w[0] == "--proc" && w[1] == "/proc")
+            .expect("base /proc mount");
+        let cpuinfo_at = args
+            .iter()
+            .position(|a| a == "/proc/cpuinfo")
+            .expect("synthetic cpuinfo bind");
+        assert!(cpuinfo_at > proc_at, "the view must land on top of /proc");
+        assert_eq!(args[cpuinfo_at - 2], "--ro-bind");
+        assert!(args.iter().any(|a| a == "--unshare-cgroup"));
+
+        let plain = build_dry_run_args_forwarded(
+            &minimal_test_config(),
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+            None,
+        )
+        .unwrap();
+        assert!(!plain.iter().any(|a| a == "--unshare-cgroup"));
+        assert!(!plain.iter().any(|a| a == "/proc/cpuinfo"));
     }
 
     #[test]
