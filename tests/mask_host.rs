@@ -352,3 +352,64 @@ fn overlay_system_alone_is_refused() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn mask_host_follows_the_stack_limits_and_keeps_the_id_per_state_root() {
+    require_bwrap!();
+    let probe = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            "MemoryMax=512M",
+            "true",
+        ])
+        .output();
+    if !probe.is_ok_and(|o| o.status.success()) {
+        eprintln!("SKIPPED: no systemd user scope available");
+        return;
+    }
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 4 {
+        eprintln!("SKIPPED: needs CPUs 2-3");
+        return;
+    }
+    let root = std::env::temp_dir()
+        .join(format!("ai-jail-mask-host-state.{}", std::process::id()));
+    let run = || {
+        let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Command::new(ai_jail())
+            .args([
+                "--clean",
+                "--no-save-config",
+                "--no-ssh",
+                "--no-gpu",
+                "--no-docker",
+                "--no-display",
+                "--no-status-bar",
+                "--memory",
+                "512M",
+                "--cpu-quota",
+                "100%",
+                "--cpus",
+                "2-3",
+                "--mask-host",
+                "--state-root",
+            ])
+            .arg(&root)
+            .args(["sh", "-c", PROBE])
+            .output()
+            .expect("failed to spawn ai-jail")
+    };
+    let first = stdout(&run());
+    // --cpus 2-3 trimmed to a 100% quota: one CPU, keeping its number.
+    assert_eq!(field(&first, "online"), "2", "{first}");
+    assert_eq!(field(&first, "processors"), "1", "{first}");
+    assert_eq!(field(&first, "memtotal"), "524288", "{first}");
+    assert_eq!(field(&first, "cgroup"), "0::/");
+    let id = field(&first, "machineid").to_string();
+    assert_eq!(id.len(), 32, "{first}");
+    let second = stdout(&run());
+    assert_eq!(field(&second, "machineid"), id, "one id per state root");
+    let _ = std::fs::remove_dir_all(&root);
+}
