@@ -107,6 +107,7 @@ fn plan_sizes_every_file_to_the_cgroup_limits() {
         "/proc/meminfo",
         "/proc/stat",
         "/proc/loadavg",
+        "/proc/uptime",
         "/sys/devices/system/cpu",
         "/sys/fs/cgroup",
         "/sys/class/dmi",
@@ -118,6 +119,8 @@ fn plan_sizes_every_file_to_the_cgroup_limits() {
             "{dest} missing from {all:?}"
         );
     }
+    assert_eq!(file(&plan, "uptime"), synth::uptime(0.0, 4));
+    assert_eq!(plan.uptime_cpus, 4);
 }
 
 #[test]
@@ -286,4 +289,24 @@ fn a_dry_run_view_writes_nothing() {
     let view = HostView::create(HostViewRequest::default(), false).unwrap();
     assert!(!view.dir.exists());
     assert!(!view.mounts().is_empty());
+}
+
+#[test]
+fn a_written_view_keeps_uptime_live_until_dropped() {
+    let read = |path: &Path| -> f64 {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.len(), synth::UPTIME_LEN, "{text:?}");
+        text.split_whitespace().next().unwrap().parse().unwrap()
+    };
+    let view = HostView::create(HostViewRequest::default(), true).unwrap();
+    let path = view.dir.join("uptime");
+    let first = read(&path);
+    assert!(first < 1.0, "a new jail is {first}s old");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let second = read(&path);
+    assert!(second >= first + 1.0, "{first} -> {second}");
+    // Dropping stops the ticker promptly, not after its next tick.
+    let started = std::time::Instant::now();
+    drop(view);
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
 }

@@ -632,7 +632,9 @@ launch, as a wrapper such as an editor does with a directory per project.
 `--mask-host` gives the sandbox a hardware view sized to its limits instead of
 the host's: `/proc/cpuinfo` (model `Virtual CPU`), `/proc/stat`,
 `/proc/loadavg`, `/proc/meminfo` and `/sys/devices/system/cpu` are generated at
-launch; `/sys/fs/cgroup` shows only the sandbox's own cgroup, in its own cgroup
+launch, and `/proc/uptime` counts from the sandbox's start (rewritten once a
+second; idle time is that age times the sandbox's CPU count), so `uptime` keeps
+working; `/sys/fs/cgroup` shows only the sandbox's own cgroup, in its own cgroup
 namespace; DMI is hidden; `/etc/machine-id` is the sandbox's own.
 
 - CPUs: the `--cpus` set when given, else the affinity, trimmed to
