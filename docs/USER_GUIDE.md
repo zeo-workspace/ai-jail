@@ -714,6 +714,28 @@ nothing. The flag is Linux only, refused under `--lockdown` (whose `$HOME` and
 `/tmp` stay in memory on purpose), and never saved to a profile: pass it on each
 launch, as a wrapper such as an editor does with a directory per project.
 
+## Hiding the host
+
+`--mask-host` gives the sandbox a hardware view sized to its limits instead of
+the host's: `/proc/cpuinfo` (model `Virtual CPU`), `/proc/stat`,
+`/proc/loadavg`, `/proc/meminfo` and `/sys/devices/system/cpu` are generated at
+launch; `/sys/fs/cgroup` shows only the sandbox's own cgroup, in its own cgroup
+namespace; DMI is hidden; `/etc/machine-id` is the sandbox's own.
+
+- CPUs: the `--cpus` set when given, else the affinity, trimmed to
+  `--cpu-quota` rounded up to whole CPUs (`--cpu-quota 400%` shows 4).
+- Memory: `--memory`, with swap 0 as the limit pins it; without a memory limit
+  `/proc/meminfo` stays the host's.
+- Machine id: kept in `DIR/machine-id` under `--state-root DIR`, so it stays the
+  same between launches; a fresh one per launch otherwise.
+
+A nested sandbox can no longer mount its own `/proc` under `--mask-host`; with
+ai-jail's default Landlock and seccomp a nested sandbox is refused anyway, so
+this matters only under `--no-landlock --no-seccomp`. The `cpuid` instruction,
+timing, `uname(2)`, the CPU numbers of `sched_getaffinity` and the mount
+sources in `/proc/self/mountinfo` stay the host's. Linux only, never saved to a
+profile: pass it on each launch.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
