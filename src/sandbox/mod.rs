@@ -66,6 +66,8 @@ mod host_view;
 #[cfg(target_os = "linux")]
 mod host_view_synth;
 #[cfg(target_os = "linux")]
+mod host_view_uptime;
+#[cfg(target_os = "linux")]
 mod landlock;
 #[cfg(target_os = "macos")]
 mod seatbelt;

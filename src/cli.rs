@@ -213,7 +213,7 @@ OPTIONS:
                                    DIR (home/, tmp/, claude/) instead of tmpfs (Linux; created
                                    0700; never saved to a profile)
     --mask-host                    Show the sandbox a host sized to its limits: synthetic
-                                   /proc/cpuinfo, meminfo, stat, loadavg and
+                                   /proc/cpuinfo, meminfo, stat, loadavg, uptime and
                                    /sys/devices/system/cpu, only its own cgroup, no DMI, its
                                    own machine-id (Linux; never saved). A nested sandbox can no
                                    longer mount /proc (bwrap, podman, Claude Code's Bash
