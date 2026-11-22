@@ -183,3 +183,34 @@ fn mask_host_sizes_meminfo_to_a_memory_limit() {
     let text = stdout(&out);
     assert_eq!(field(&text, "memtotal"), "524288", "{text}");
 }
+
+/// `/proc/uptime` inside a masked jail: "SECONDS IDLE".
+fn uptime_pair(text: &str) -> (f64, f64) {
+    let mut it = text.split_whitespace().map(|v| v.parse::<f64>().unwrap());
+    (it.next().unwrap(), it.next().unwrap())
+}
+
+#[test]
+fn mask_host_uptime_counts_from_the_jail_start() {
+    require_bwrap!();
+    let host = std::fs::read_to_string("/proc/uptime").unwrap();
+    let (host_up, _) = uptime_pair(&host);
+    let out = stdout(&jail(
+        true,
+        "cat /proc/uptime; sleep 2.2; cat /proc/uptime; uptime >/dev/null && echo uptime_rc=0",
+    ));
+    let lines: Vec<&str> = out.lines().collect();
+    let (first, first_idle) = uptime_pair(lines[0]);
+    let (second, second_idle) = uptime_pair(lines[1]);
+    // The jail's own age, not the host's: a few seconds at most.
+    assert!(first < 10.0, "uptime is the host's ({host_up}):\n{out}");
+    assert!(host_up > 30.0 || first < host_up, "{out}");
+    // Live: it advances while the jail runs.
+    assert!(second >= first + 1.0, "uptime did not advance:\n{out}");
+    // Idle counts every jail CPU as idle (pinned to one CPU here).
+    if taskset_available() {
+        assert!((first_idle - first).abs() < 0.02, "{out}");
+        assert!((second_idle - second).abs() < 0.02, "{out}");
+    }
+    assert_eq!(field(&out, "uptime_rc"), "0");
+}

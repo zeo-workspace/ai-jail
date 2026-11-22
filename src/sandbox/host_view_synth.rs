@@ -222,6 +222,27 @@ pub(super) fn stat(ids: &BTreeSet<usize>, btime: u64) -> String {
     out
 }
 
+/// Characters per `/proc/uptime` field: 16 holds 31 years of idle time on
+/// 1024 CPUs, so the ticker's rewrites keep one length in practice (and a
+/// longer value only grows the file, never leaves a stale tail).
+const UPTIME_FIELD: usize = 16;
+
+/// Bytes in every `/proc/uptime` this module writes.
+#[cfg(test)]
+pub(super) const UPTIME_LEN: usize = 2 * UPTIME_FIELD + 2;
+
+/// `/proc/uptime` for a jail `elapsed` seconds old: its own age, and the
+/// idle time of `cpus` CPUs that never ran anything -- consistent with the
+/// zeroed `/proc/stat`. Fixed width so the ticker can rewrite it in place
+/// without the length changing under a reader.
+pub(super) fn uptime(elapsed: f64, cpus: usize) -> String {
+    // Precision loss only past 2^52 CPU-seconds.
+    #[allow(clippy::cast_precision_loss)]
+    let idle = elapsed * cpus as f64;
+    let w = UPTIME_FIELD;
+    format!("{elapsed:>w$.2} {idle:>w$.2}\n")
+}
+
 /// `/proc/loadavg` for an idle machine: one running task, the reader.
 pub(super) fn loadavg() -> String {
     "0.00 0.00 0.00 1/1 1\n".into()
@@ -388,6 +409,31 @@ Hugepagesize:       2048 kB
         assert!(!text.contains("cpu4 "));
         assert!(text.contains("\nbtime 1700000000\n"));
         assert!(text.contains("\nprocs_running 1\n"));
+    }
+
+    #[test]
+    fn uptime_is_the_jails_age_with_every_cpu_idle() {
+        assert_eq!(uptime(0.0, 4), format!("{:>16} {:>16}\n", "0.00", "0.00"));
+        let text = uptime(12.345, 4);
+        let values: Vec<f64> = text
+            .split_whitespace()
+            .map(|v| v.parse().unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert!((values[0] - 12.35).abs() < 0.006, "{text}");
+        assert!((values[1] - 49.38).abs() < 0.006, "{text}");
+    }
+
+    #[test]
+    fn uptime_keeps_one_length_as_it_grows() {
+        for (elapsed, cpus) in [(0.0, 1), (99.99, 1), (100.0, 32), (1.0e6, 64)]
+        {
+            assert_eq!(
+                uptime(elapsed, cpus).len(),
+                UPTIME_LEN,
+                "{elapsed} {cpus}"
+            );
+        }
     }
 
     #[test]

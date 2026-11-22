@@ -5,7 +5,8 @@
 //! fresh `/proc`, whose system-wide files still describe the host: its CPU
 //! model and count, its RAM and swap, its load, its board (DMI) and every
 //! sibling cgroup. Under `--mask-host` the launch writes synthetic
-//! `/proc/cpuinfo`, `/proc/stat`, `/proc/loadavg`, `/proc/meminfo` (when a
+//! `/proc/cpuinfo`, `/proc/stat`, `/proc/loadavg`, a live `/proc/uptime`
+//! counted from the jail's start, `/proc/meminfo` (when a
 //! memory limit applies) and `/sys/devices/system/cpu` into a private temp
 //! directory and binds them over the real ones, shows only the jail's own
 //! cgroup at `/sys/fs/cgroup` (with `--unshare-cgroup`, so
@@ -35,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::host_view_synth as synth;
+use super::host_view_uptime::UptimeTicker;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const SYS_CPU: &str = "/sys/devices/system/cpu";
@@ -156,6 +158,8 @@ pub(super) enum HostViewMount {
 pub(super) struct HostViewPlan {
     pub files: Vec<(PathBuf, String)>,
     pub mounts: Vec<HostViewMount>,
+    /// CPUs the live `/proc/uptime` counts as idle.
+    pub uptime_cpus: usize,
 }
 
 /// Lay out the view for `snap`. Pure: `exists` answers for host paths, so
@@ -174,7 +178,10 @@ pub(super) fn plan(
         .or_else(|| snap.affinity.clone())
         .unwrap_or_else(|| snap.host_cpus.clone());
     let ids = synth::jail_cpu_ids(&base, snap.quota_cpus);
-    let mut out = HostViewPlan::default();
+    let mut out = HostViewPlan {
+        uptime_cpus: ids.len(),
+        ..HostViewPlan::default()
+    };
     let mut file = |name: &str, text: String, dest: Option<&str>| {
         out.files.push((PathBuf::from(name), text));
         if let Some(dest) = dest {
@@ -191,6 +198,11 @@ pub(super) fn plan(
     );
     file("stat", synth::stat(&ids, snap.btime), Some("/proc/stat"));
     file("loadavg", synth::loadavg(), Some("/proc/loadavg"));
+    file(
+        "uptime",
+        synth::uptime(0.0, ids.len()),
+        Some("/proc/uptime"),
+    );
     if let Some(memory) = snap.memory_max {
         let text = synth::meminfo(
             memory,
@@ -245,6 +257,8 @@ pub(crate) struct HostView {
     dir: PathBuf,
     written: bool,
     mounts: Vec<HostViewMount>,
+    /// Keeps `/proc/uptime` live; stopped first when the view is dropped.
+    uptime: Option<UptimeTicker>,
 }
 
 impl HostView {
@@ -254,6 +268,8 @@ impl HostView {
         request: HostViewRequest,
         write: bool,
     ) -> Result<Self, String> {
+        // The jail's clock starts here, just before bwrap is spawned.
+        let start = std::time::Instant::now();
         let snap = HostSnapshot::read();
         let machine_id = machine_id(request.machine_id_file.as_deref(), write)?;
         let dir = std::env::temp_dir().join(format!(
@@ -275,9 +291,11 @@ impl HostView {
             dir,
             written: false,
             mounts: plan.mounts,
+            uptime: None,
         };
-        if write {
-            view.write(&plan.files)?;
+        if write && let Some(file) = view.write(&plan.files)? {
+            view.uptime =
+                Some(UptimeTicker::start(file, start, plan.uptime_cpus)?);
         }
         Ok(view)
     }
@@ -286,7 +304,12 @@ impl HostView {
         &self.mounts
     }
 
-    fn write(&mut self, files: &[(PathBuf, String)]) -> Result<(), String> {
+    /// Write the files; returns `uptime` still open for writing, since the
+    /// ticker could not reopen it once it is read-only.
+    fn write(
+        &mut self,
+        files: &[(PathBuf, String)],
+    ) -> Result<Option<std::fs::File>, String> {
         let fail = |what: &Path, e: std::io::Error| {
             format!("--mask-host: cannot write {}: {e}", what.display())
         };
@@ -295,6 +318,7 @@ impl HostView {
             .create(&self.dir)
             .map_err(|e| fail(&self.dir, e))?;
         self.written = true;
+        let mut uptime = None;
         for (rel, text) in files {
             let path = self.dir.join(rel);
             if let Some(parent) = path.parent() {
@@ -318,13 +342,17 @@ impl HostView {
                 std::fs::Permissions::from_mode(0o444),
             )
             .map_err(|e| fail(&path, e))?;
+            if rel == Path::new("uptime") {
+                uptime = Some(f);
+            }
         }
-        Ok(())
+        Ok(uptime)
     }
 }
 
 impl Drop for HostView {
     fn drop(&mut self) {
+        drop(self.uptime.take());
         if self.written {
             let _ = std::fs::remove_dir_all(&self.dir);
         }

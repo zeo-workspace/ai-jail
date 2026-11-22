@@ -766,6 +766,7 @@ sandbox:
 | `/proc/cpuinfo` | one block per allowed CPU, model `Virtual CPU`; vendor and feature flags stay the host's (software picks code paths by them) |
 | `/proc/stat` | one zeroed line per allowed CPU (static: usage reads idle) |
 | `/proc/loadavg` | `0.00 0.00 0.00 1/1 1` |
+| `/proc/uptime` | the sandbox's own age, rewritten in place once a second, and the idle time of its CPUs (age × CPU count, as nothing in the zeroed `/proc/stat` ran); `uptime` keeps working |
 | `/proc/meminfo` | sized to the memory limit, swap to the swap limit; the host's file when there is no limit |
 | `/sys/devices/system/cpu` | `online`, `possible`, `present` and one `cpuN/` per allowed CPU |
 | `/sys/fs/cgroup` | only the sandbox's own cgroup, read-only, in its own cgroup namespace (`/proc/self/cgroup` reads `0::/`) |
