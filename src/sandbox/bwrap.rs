@@ -2367,7 +2367,7 @@ fn discover_mounts_full(
     } else {
         (vec![], vec![])
     };
-    let mounts = MountSet {
+    let mut mounts = MountSet {
         base: discover_base(
             sources.hosts_mount,
             sources.resolv_mount,
@@ -2449,9 +2449,43 @@ fn discover_mounts_full(
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
     };
+    // --state-root: the sandbox's $HOME and /tmp on disk instead of tmpfs.
+    // Every bind ai-jail layers over $HOME stays where it was; only the
+    // backing changes. main.rs validated and created the directories.
+    if let Some(root) = &config.state_root {
+        let layout = crate::state_root::StateRoot::layout(root);
+        bind_instead_of_tmpfs(
+            &mut mounts.home_dotfiles,
+            &super::home_dir(),
+            &layout.home,
+        );
+        bind_instead_of_tmpfs(&mut mounts.base, Path::new("/tmp"), &layout.tmp);
+        if verbose {
+            output::verbose(&format!("State root: {} rw", root.display()));
+        }
+    }
     #[cfg(not(test))]
     mounts.validate_trusted_store_exclusion()?;
     Ok(mounts)
+}
+
+/// Replace the tmpfs mounted at `dest` with a read-write bind of `src`
+/// (`--state-root`). Returns whether there was a tmpfs to replace.
+fn bind_instead_of_tmpfs(
+    mounts: &mut [Mount],
+    dest: &Path,
+    src: &Path,
+) -> bool {
+    for mount in mounts.iter_mut() {
+        if matches!(mount, Mount::Tmpfs { dest: d } if d.as_path() == dest) {
+            *mount = Mount::Bind {
+                src: src.to_path_buf(),
+                dest: dest.to_path_buf(),
+            };
+            return true;
+        }
+    }
+    false
 }
 
 /// Split mounts into (outside, inside) the project directory. A mount
@@ -4316,6 +4350,53 @@ fn project_mount(project_dir: &Path, readonly: bool) -> Vec<Mount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_root_binds_home_and_tmp_in_place_of_their_tmpfs() {
+        let home = PathBuf::from("/home/u");
+        let mut home_mounts = vec![
+            Mount::Tmpfs { dest: home.clone() },
+            Mount::RoBind {
+                src: home.join(".gitconfig"),
+                dest: home.join(".gitconfig"),
+            },
+        ];
+        let mut base = vec![
+            Mount::Tmpfs {
+                dest: "/run".into(),
+            },
+            Mount::Tmpfs {
+                dest: "/tmp".into(),
+            },
+        ];
+        let root = crate::state_root::StateRoot::layout(Path::new("/state"));
+        assert!(bind_instead_of_tmpfs(&mut home_mounts, &home, &root.home));
+        assert!(bind_instead_of_tmpfs(
+            &mut base,
+            Path::new("/tmp"),
+            &root.tmp
+        ));
+        assert_eq!(
+            home_mounts[0].to_args(),
+            vec!["--bind", "/state/home", "/home/u"],
+            "the home tmpfs becomes a bind of the state root's home"
+        );
+        assert_eq!(
+            home_mounts[1].to_args(),
+            vec!["--ro-bind", "/home/u/.gitconfig", "/home/u/.gitconfig"],
+            "dotfile binds stay layered on top"
+        );
+        assert_eq!(
+            base[0].to_args(),
+            vec!["--tmpfs", "/run"],
+            "/run stays a tmpfs"
+        );
+        assert_eq!(base[1].to_args(), vec!["--bind", "/state/tmp", "/tmp"]);
+        assert!(
+            !bind_instead_of_tmpfs(&mut base, Path::new("/nope"), &root.tmp),
+            "nothing to replace"
+        );
+    }
     use crate::sandbox::test_support::linked_worktree_fixture;
     use crate::test_utils::{ENV_LOCK, EnvVarGuard};
 
