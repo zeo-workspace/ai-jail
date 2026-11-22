@@ -201,6 +201,9 @@ OPTIONS:
                                    127.0.0.1:PORT (Linux; repeatable; cannot combine with
                                    --network; every host process on loopback can reach it)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
+    --state-root <DIR>             Keep the sandbox's $HOME, /tmp and Claude config on disk under
+                                   DIR (home/, tmp/, claude/) instead of tmpfs (Linux; created
+                                   0700; never saved to a profile)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -275,6 +278,7 @@ pub struct CliArgs {
     pub forward_ports: Vec<u16>,
     pub publish_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
+    pub state_root: Option<PathBuf>,
     pub agent_state: Option<bool>,
     pub harnesses: Vec<String>,
     pub request_files: Vec<PathBuf>,
@@ -553,6 +557,11 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             Long("claude-dir") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 args.claude_dir =
+                    Some(PathBuf::from(val.to_string_lossy().into_owned()));
+            }
+            Long("state-root") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.state_root =
                     Some(PathBuf::from(val.to_string_lossy().into_owned()));
             }
             Long(s @ ("gpu" | "no-gpu")) => {
@@ -1201,6 +1210,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--browser",
     "--no-browser",
     "--claude-dir",
+    "--state-root",
     "--x11",
     "--no-x11",
     "--host-shm",
