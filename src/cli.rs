@@ -1344,6 +1344,7 @@ const INTERFACE_INTERNAL_FIELDS: &[&str] = &[
     "cpus_source",
     "runtime_harnesses",
     "state_root",
+    "mask_host",
 ];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0

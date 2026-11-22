@@ -942,14 +942,14 @@ sandbox:
 | `/sys/devices/system/cpu` | `online`, `possible`, `present` and one `cpuN/` per allowed CPU |
 | `/sys/fs/cgroup` | only the sandbox's own cgroup, read-only, in its own cgroup namespace (`/proc/self/cgroup` reads `0::/`) |
 | `/sys/class/dmi`, `/sys/devices/virtual/dmi` | empty |
-| `/etc/machine-id` | a random id per launch |
+| `/etc/machine-id` | the sandbox's own id: kept in `DIR/machine-id` under `--state-root DIR`, else random per launch |
 
-The allowed CPUs are the process's affinity (`taskset`), trimmed to the
-cgroup's `cpu.max` rounded up to whole CPUs; the memory limit is the
-smallest `memory.max` from the sandbox's cgroup up to the root. Run ai-jail
-inside a limited scope (for example `systemd-run --user --scope -p
-MemoryMax=8G -p CPUQuota=400% ai-jail --mask-host ...`) and every tool --
-`nproc`, `getconf`, `lscpu`, `free` -- reports the same 4 CPUs and 8 GiB.
+The allowed CPUs are the `--cpus` set, else the process's affinity
+(`taskset`), trimmed to the cgroup's `cpu.max` rounded up to whole CPUs; the
+memory limit is the smallest `memory.max` from the sandbox's cgroup up to the
+root. With the resource limits above (`ai-jail --memory 8G --cpu-quota 400%
+--mask-host ...`), or inside any limited scope, every tool -- `nproc`,
+`getconf`, `lscpu`, `free` -- reports the same 4 CPUs and 8 GiB.
 The flag is never saved to a profile: pass it on each launch.
 
 **Cost.** A procfs with files mounted over it is no longer "fully visible" to
