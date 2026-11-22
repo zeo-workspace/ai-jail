@@ -1234,6 +1234,8 @@ pub(crate) fn save_project_grants(
     grants.runtime_harnesses.clear();
     // `--state-root` is invocation-scoped for the same reason.
     grants.state_root = None;
+    // `--mask-host` is invocation-scoped for the same reason.
+    grants.mask_host = false;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1556,6 +1558,7 @@ pub(crate) fn config_field_names() -> Vec<&'static str> {
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
     excluded_policy!("state_root", Authority),
+    excluded_policy!("mask_host", Restriction),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -2366,6 +2369,7 @@ mod tests {
     const EXPECTED_STATIC_POLICY: &[ExpectedStaticPolicy] = &[
         expected_excluded!("runtime_harnesses", Authority),
         expected_excluded!("state_root", Authority),
+        expected_excluded!("mask_host", Restriction),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2480,6 +2484,9 @@ mod tests {
             }
             "state_root" => {
                 config.state_root = Some("/var/tmp/zeo-jail/x".into());
+            }
+            "mask_host" => {
+                config.mask_host = true;
             }
             "command" => {
                 config.command =
