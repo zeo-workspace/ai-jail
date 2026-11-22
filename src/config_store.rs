@@ -1232,6 +1232,8 @@ pub(crate) fn save_project_grants(
     // later invocation and would also defeat round-trip verification because
     // the field is intentionally skipped by serde.
     grants.runtime_harnesses.clear();
+    // `--state-root` is invocation-scoped for the same reason.
+    grants.state_root = None;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1553,6 +1555,7 @@ pub(crate) fn config_field_names() -> Vec<&'static str> {
 
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
+    excluded_policy!("state_root", Authority),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -1933,11 +1936,14 @@ fn dropped_capability_requests(
                         None,
                     ) => {}
                     (StaticPolicyClass::Authority, None)
-                        if *field == "runtime_harnesses" =>
+                        if matches!(
+                            *field,
+                            "runtime_harnesses" | "state_root"
+                        ) =>
                     {
-                        // Trusted wrapper identity is supplied by this
-                        // invocation and is never read from or migrated out
-                        // of repository policy.
+                        // Trusted wrapper identity and the state root are
+                        // supplied by this invocation and are never read from
+                        // or migrated out of repository policy.
                     }
                     _ => unreachable!(
                         "CONFIG_FIELD_POLICY category/renderer mismatch"
@@ -2359,6 +2365,7 @@ mod tests {
 
     const EXPECTED_STATIC_POLICY: &[ExpectedStaticPolicy] = &[
         expected_excluded!("runtime_harnesses", Authority),
+        expected_excluded!("state_root", Authority),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2470,6 +2477,9 @@ mod tests {
         match field {
             "runtime_harnesses" => {
                 config.runtime_harnesses = vec!["claude".into()];
+            }
+            "state_root" => {
+                config.state_root = Some("/var/tmp/zeo-jail/x".into());
             }
             "command" => {
                 config.command =

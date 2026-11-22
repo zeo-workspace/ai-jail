@@ -97,6 +97,9 @@ or integration rather than saved sandbox authority.
   no saved grant or config key)
 - Run observability: `--teardown-report` (reports on one run; no saved
   authority and no config key)
+- Sandbox state on disk: `--state-root` (a per-run directory chosen by the
+  caller -- typically a wrapper such as an editor -- not saved authority: no
+  configuration key, refused under `--lockdown` and on macOS)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule
