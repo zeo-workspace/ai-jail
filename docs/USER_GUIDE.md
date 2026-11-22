@@ -553,6 +553,17 @@ symlink, a non-regular file, a missing directory) refuses the launch, and the
 flag is refused on macOS. The README's `Run observability` section and
 `docs/SECURITY.md` describe every field and what a line can never contain.
 
+## Terminal appearance and the macOS pasteboard
+
+- `--terminal-appearance` / `--no-terminal-appearance` (config `terminal_appearance`), off by
+  default: in the interactive ai-jail PTY, lets a program ask the terminal for its background
+  colour (OSC 11), its identity (DA1) and light/dark changes (Mode 2031). It enables no other
+  terminal query and no clipboard access, and has no effect under `--exec` or without a TTY.
+- `--macos-pasteboard` / `--no-macos-pasteboard` (config `macos_pasteboard`), macOS only, off by
+  default: permits only `mach-lookup` of `com.apple.pasteboard.1`, so the jail can copy and paste
+  text and images without `--macos-host-ipc`. What you copy is readable inside the jail. Dropped
+  under `--lockdown`; an untrusted project policy cannot enable it.
+
 ## Resource limits and CPU set
 
 Per-process resource limits and the CPU set are advanced CLI/config-only
