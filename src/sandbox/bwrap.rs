@@ -689,10 +689,23 @@ impl SandboxGuard {
 
 /// What the launch adds to the host view beyond the limits ai-jail reads
 /// from its own cgroup and affinity.
+///
+/// `--cpus` is applied inside the sandbox, after these arguments are built,
+/// so the view cannot read it from its own affinity and takes it from the
+/// config. With `--state-root` the machine id lives in `DIR/machine-id`:
+/// the directory is already checked private, and one id per state root keeps
+/// tools that cache it from seeing a new machine on every launch.
 fn host_view_request(config: &Config) -> super::host_view::HostViewRequest {
     super::host_view::HostViewRequest {
+        cpus: config
+            .cpus
+            .as_deref()
+            .and_then(|list| super::affinity::parse_cpu_list(list).ok()),
+        machine_id_file: config
+            .state_root
+            .as_deref()
+            .map(|root| root.join("machine-id")),
         overlay_system: config.overlay_system,
-        ..Default::default()
     }
 }
 
@@ -5541,6 +5554,25 @@ mod tests {
             None,
         );
         assert!(result.unwrap_err().contains("--publish-port 4096"));
+    }
+
+    #[test]
+    fn mask_host_takes_cpus_and_the_machine_id_store_from_the_stack() {
+        let config = Config {
+            mask_host: true,
+            cpus: Some("28-31".into()),
+            state_root: Some("/var/tmp/zeo-jail/p".into()),
+            ..minimal_test_config()
+        };
+        let request = host_view_request(&config);
+        assert_eq!(request.cpus, Some([28, 29, 30, 31].into_iter().collect()));
+        assert_eq!(
+            request.machine_id_file,
+            Some(PathBuf::from("/var/tmp/zeo-jail/p/machine-id"))
+        );
+        let plain = host_view_request(&minimal_test_config());
+        assert_eq!(plain.cpus, None);
+        assert_eq!(plain.machine_id_file, None);
     }
 
     #[test]
