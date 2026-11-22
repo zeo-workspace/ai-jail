@@ -879,6 +879,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --systemd-user / --no-systemd-user  host user manager access (off by default)
 --ssh / --no-ssh                OPEN: full ~/.ssh and ambient-agent sharing (off by default)
 --claude-dir PATH               explicit Claude state directory
+--state-root DIR                $HOME, /tmp and Claude config on disk under DIR (Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit

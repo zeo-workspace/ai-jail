@@ -553,6 +553,24 @@ symlink, a non-regular file, a missing directory) refuses the launch, and the
 flag is refused on macOS. The README's `Run observability` section and
 `docs/SECURITY.md` describe every field and what a line can never contain.
 
+## Sandbox state on disk
+
+`--state-root DIR` keeps what the sandbox writes to `$HOME` and `/tmp`, and the
+Claude config, on disk under `DIR` instead of in memory:
+
+- `DIR/home` backs the sandbox's `$HOME`. The host dotfiles ai-jail exposes are
+  still mounted on top of it, as they are on the default tmpfs.
+- `DIR/tmp` backs `/tmp`.
+- `DIR/claude` becomes `CLAUDE_CONFIG_DIR`, unless `--claude-dir` names another
+  directory. A login made inside the sandbox lands here.
+
+`DIR` must be an absolute path. Missing parts are created with mode 0700; an
+existing `DIR` or child that is a symlink, is not yours, or is writable by group
+or others refuses the launch instead of being changed. `--dry-run` creates
+nothing. The flag is Linux only, refused under `--lockdown` (whose `$HOME` and
+`/tmp` stay in memory on purpose), and never saved to a profile: pass it on each
+launch, as a wrapper such as an editor does with a directory per project.
+
 ## Migration and reapproval
 
 Legacy repository `.ai-jail` files contribute restrictions only. Commands,
