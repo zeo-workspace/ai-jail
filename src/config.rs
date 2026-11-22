@@ -149,6 +149,10 @@ pub struct Config {
     /// only: profiles store approvals, never wrapper invocation metadata.
     #[serde(default, skip)]
     pub runtime_harnesses: Vec<String>,
+    /// `--mask-host`: a synthetic hardware view sized to the limits.
+    /// Runtime only, like `runtime_harnesses`: a launch flag, never saved.
+    #[serde(default, skip)]
+    pub mask_host: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2378,6 +2382,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
     }
+    config.mask_host = cli.mask_host;
 
     expand_user_paths(&mut config);
 
@@ -4551,6 +4556,7 @@ no_gpu = true
     fn roundtrip_serialize_deserialize() {
         let config = Config {
             runtime_harnesses: Vec::new(),
+            mask_host: false,
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -7940,6 +7946,7 @@ hide_dotdirs = [".my_secrets"]
 
         let config = Config {
             runtime_harnesses: Vec::new(),
+            mask_host: false,
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],

@@ -187,6 +187,12 @@ OPTIONS:
                                    127.0.0.1:PORT (Linux; repeatable; cannot combine with
                                    --network; every host process on loopback can reach it)
     --claude-dir <PATH>            Use PATH as Claude config dir (sets CLAUDE_CONFIG_DIR)
+    --mask-host                    Show the sandbox a host sized to its limits: synthetic
+                                   /proc/cpuinfo, meminfo, stat, loadavg and
+                                   /sys/devices/system/cpu, only its own cgroup, no DMI, its
+                                   own machine-id (Linux; never saved). A nested sandbox can no
+                                   longer mount /proc (bwrap, podman, Claude Code's Bash
+                                   sandbox; already refused unless --no-landlock --no-seccomp)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -253,6 +259,7 @@ pub struct CliArgs {
     pub forward_ports: Vec<u16>,
     pub publish_ports: Vec<u16>,
     pub claude_dir: Option<PathBuf>,
+    pub mask_host: bool,
     pub agent_state: Option<bool>,
     pub harnesses: Vec<String>,
     pub request_files: Vec<PathBuf>,
@@ -496,6 +503,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 args.claude_dir =
                     Some(PathBuf::from(val.to_string_lossy().into_owned()));
+            }
+            Long("mask-host") => {
+                args.mask_host = true;
             }
             Long(s @ ("gpu" | "no-gpu")) => {
                 args.gpu = Some(s == "gpu");
@@ -1123,6 +1133,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--browser",
     "--no-browser",
     "--claude-dir",
+    "--mask-host",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -2694,6 +2705,14 @@ mod tests {
         let error =
             parse_test(&["claude", "--secret", "K=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_mask_host() {
+        assert!(!parse_test(&["claude"]).unwrap().mask_host);
+        let args = parse_test(&["--mask-host", "claude"]).unwrap();
+        assert!(args.mask_host);
+        assert_eq!(args.command, vec!["claude"]);
     }
 
     #[test]

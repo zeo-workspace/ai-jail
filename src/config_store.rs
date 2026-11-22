@@ -1187,6 +1187,8 @@ pub(crate) fn save_project_grants(
     // later invocation and would also defeat round-trip verification because
     // the field is intentionally skipped by serde.
     grants.runtime_harnesses.clear();
+    // `--mask-host` is invocation-scoped for the same reason.
+    grants.mask_host = false;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1494,6 +1496,7 @@ macro_rules! directional_policy {
 
 const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
+    excluded_policy!("mask_host", Restriction),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -2271,6 +2274,7 @@ mod tests {
 
     const EXPECTED_STATIC_POLICY: &[ExpectedStaticPolicy] = &[
         expected_excluded!("runtime_harnesses", Authority),
+        expected_excluded!("mask_host", Restriction),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2376,6 +2380,9 @@ mod tests {
         match field {
             "runtime_harnesses" => {
                 config.runtime_harnesses = vec!["claude".into()];
+            }
+            "mask_host" => {
+                config.mask_host = true;
             }
             "command" => {
                 config.command =

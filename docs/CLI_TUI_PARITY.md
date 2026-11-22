@@ -80,6 +80,10 @@ or integration rather than saved sandbox authority.
 - Run observability: `--egress-log` (a per-run output file, not saved
   authority: no configuration key, refused outside filtered networking and
   on macOS)
+- Host view: `--mask-host` (a per-run choice made by the caller --
+  typically a wrapper such as an editor -- not saved authority: no
+  configuration key, refused on macOS; it only narrows what the sandbox
+  reads)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule
