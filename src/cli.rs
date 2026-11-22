@@ -1255,8 +1255,12 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
 
 /// Config fields that are runtime state, never written by a user.
 #[cfg(test)]
-const INTERFACE_INTERNAL_FIELDS: &[&str] =
-    &["rlimit_source", "cpus_source", "runtime_harnesses"];
+const INTERFACE_INTERNAL_FIELDS: &[&str] = &[
+    "rlimit_source",
+    "cpus_source",
+    "runtime_harnesses",
+    "state_root",
+];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
 /// (fe4dfe0). The drift test is a ratchet: it holds every name added
