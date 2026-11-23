@@ -218,6 +218,9 @@ OPTIONS:
                                    own machine-id (Linux; never saved). A nested sandbox can no
                                    longer mount /proc (bwrap, podman, Claude Code's Bash
                                    sandbox; already refused unless --no-landlock --no-seccomp)
+    --overlay-system               With --mask-host: serve /usr, /etc and /opt through
+                                   read-only overlays so the mount table names no host disk
+                                   (Linux; never saved; slower metadata walks)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -297,6 +300,7 @@ pub struct CliArgs {
     pub claude_dir: Option<PathBuf>,
     pub state_root: Option<PathBuf>,
     pub mask_host: bool,
+    pub overlay_system: bool,
     pub agent_state: Option<bool>,
     pub harnesses: Vec<String>,
     pub request_files: Vec<PathBuf>,
@@ -603,6 +607,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("mask-host") => {
                 args.mask_host = true;
+            }
+            Long("overlay-system") => {
+                args.overlay_system = true;
             }
             Long(s @ ("gpu" | "no-gpu")) => {
                 args.gpu = Some(s == "gpu");
@@ -1484,6 +1491,7 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--no-browser",
     "--claude-dir",
     "--mask-host",
+    "--overlay-system",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -3223,6 +3231,14 @@ mod tests {
         let args = parse_test(&["--mask-host", "claude"]).unwrap();
         assert!(args.mask_host);
         assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn parse_overlay_system() {
+        assert!(!parse_test(&["claude"]).unwrap().overlay_system);
+        let args =
+            parse_test(&["--mask-host", "--overlay-system", "claude"]).unwrap();
+        assert!(args.mask_host && args.overlay_system);
     }
 
     #[test]
