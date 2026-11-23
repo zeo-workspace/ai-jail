@@ -2835,11 +2835,20 @@ fn run(
         };
         #[cfg(not(target_os = "linux"))]
         let cgroup_report: Option<limits::CgroupReport> = None;
-        if let Some(msg) = limits::describe_exit(
-            exit_code,
-            &resource_limits,
-            cgroup_report.as_ref(),
-        ) {
+        // Upstream's exit_reason line above already explains the signal;
+        // this one speaks only for what the cgroup alone counted (an OOM
+        // kill or a refused fork at a whole-sandbox limit), so a run never
+        // gets two competing explanations of one signal.
+        let cgroup_counted = cgroup_report
+            .as_ref()
+            .is_some_and(|r| r.oom_kills > 0 || r.tasks_refused > 0);
+        if cgroup_counted
+            && let Some(msg) = limits::describe_exit(
+                exit_code,
+                &resource_limits,
+                cgroup_report.as_ref(),
+            )
+        {
             output::error(&msg);
         }
         let run_end = run_summary::RunEnd {

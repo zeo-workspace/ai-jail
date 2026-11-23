@@ -32,6 +32,7 @@
 # forward_ports = []           # host loopback services, specified by port
 # publish_ports = []           # Linux, publish jailed ports to host loopback
 # allow_tcp_ports = []         # obsolete, nonempty lists are refused
+# transparent_egress = false   # Linux, route proxy-unaware clients through allow_hosts
 
 # Credentials and environment. Each enabled grant is available to the jail.
 # agent_state = false
@@ -84,6 +85,11 @@
 
 # Linux only: pin the sandbox to these CPUs (needs seccomp)
 # cpus = "0-3"
+
+# Linux only: whole-sandbox cgroup limits (need a systemd user session)
+# memory_max = "8G"
+# max_tasks = 2000
+# cpu_quota = 400
 
 # Legacy compatibility only. An empty list grants no repository trust.
 # trust_project_config = []

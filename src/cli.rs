@@ -1305,6 +1305,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--allow-tcp-port",
     "--allow-host",
     "--allow-private-host",
+    "--transparent-egress",
+    "--no-transparent-egress",
     "--systemd-user",
     "--no-systemd-user",
     "--worktree",
@@ -1498,8 +1500,6 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--allow-tcp-port",
     "--allow-host",
     "--allow-private-host",
-    "--transparent-egress",
-    "--no-transparent-egress",
     "--systemd-user",
     "--no-systemd-user",
     "--worktree",
@@ -3773,7 +3773,14 @@ mod interface_profile_tests {
     const CONFIG_RS: &str = include_str!("config.rs");
 
     /// `Config` fields that no user sets: runtime state, never parsed.
-    const INTERNAL_FIELDS: &[&str] = &["runtime_harnesses"];
+    const INTERNAL_FIELDS: &[&str] = &[
+        "runtime_harnesses",
+        "rlimit_source",
+        "cpus_source",
+        "state_root",
+        "mask_host",
+        "overlay_system",
+    ];
 
     /// `Config` fields already missing from the guide at f0dc67e.
     const UNDOCUMENTED_FIELDS_AT_F0DC67E: &str = r"
@@ -3795,30 +3802,29 @@ mod interface_profile_tests {
     /// Sandbox long flags already missing from the guide at f0dc67e.
     const UNDOCUMENTED_FLAGS_AT_F0DC67E: &str = r"
     --harness --request-file --request --private-home
-    --no-private-home --no-lockdown --no-display --display
-    --audio --no-audio --no-github --aws --no-aws --kube --no-kube
-    --gcloud --no-gcloud --docker-config --no-docker-config --kvm
-    --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network
-    --macos-host-ipc --no-macos-host-ipc --macos-chromium
-    --no-macos-chromium --macos-trustd --no-macos-trustd
-    --macos-pasteboard --no-macos-pasteboard --allow-pty
-    --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
+    --no-private-home --no-lockdown --no-display --display --audio
+    --no-audio --no-github --aws --no-aws --kube --no-kube --gcloud
+    --no-gcloud --docker-config --no-docker-config --kvm --no-kvm
+    --prompt-hosts --no-prompt-hosts --no-network --macos-host-ipc
+    --no-macos-host-ipc --macos-chromium --no-macos-chromium
+    --macos-trustd --no-macos-trustd --macos-pasteboard
+    --no-macos-pasteboard --allow-pty --no-allow-pty
+    --allow-loopback-listen --no-allow-loopback-listen
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
-    --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
-    --no-ssh --pictures --no-pictures --clean   --dry-run
-    --rw-map --ro-map --overlay-map --map --mask --deny-path
-    --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
-    --allow-private-host --systemd-user --no-systemd-user
-    --worktree --no-worktree --browser --no-browser --claude-dir --x11
-    --no-x11 --host-shm --no-host-shm --terminal-passthrough
-    --no-terminal-passthrough --agent-state --no-agent-state
-    --publish-port --inherit-env --no-inherit-env --update-check
-    --no-update-check --audit-log --no-audit-log --audit-verify
-    --env-from-file --secret --mise --no-mise --toolchains
-    --no-toolchains --save-config --no-save-config --hide-config
-    --no-hide-config --status-bar --no-status-bar --bootstrap
-    --verbose
+    --seccomp --rlimits --no-rlimits --ssh --no-ssh --pictures
+    --no-pictures --clean --rw-map --ro-map --overlay-map --map
+    --mask --deny-path --mask-except --deny-path-except
+    --hide-dotdir --allow-tcp-port --allow-private-host
+    --systemd-user --no-systemd-user --worktree --no-worktree
+    --browser --no-browser --x11 --no-x11 --host-shm --no-host-shm
+    --terminal-passthrough --no-terminal-passthrough --agent-state
+    --no-agent-state --publish-port --inherit-env --no-inherit-env
+    --update-check --no-update-check --audit-log --no-audit-log
+    --audit-verify --env-from-file --secret --mise --no-mise
+    --toolchains --no-toolchains --save-config --no-save-config
+    --hide-config --no-hide-config --status-bar --no-status-bar
+    --bootstrap --verbose
 ";
 
     /// A name counts as documented only as a whole token: the bytes on

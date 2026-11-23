@@ -591,6 +591,21 @@ new one, never a torn one. A symlink at `PATH`, or a missing directory, is a
 warning at startup and the run goes on without a summary. It implies
 `--teardown-report`. The format is versioned by `docs/run-summary.schema.json`.
 
+## Clients that ignore the proxy
+
+`--transparent-egress` / `--no-transparent-egress` (config
+`transparent_egress`), Linux only and off by default, is an advanced
+CLI/config-only control: the onboarding screens do not offer it. It needs
+filtered egress (`--allow-host`) and grants nothing beyond that allowlist:
+inside the sandbox each allowlisted name resolves to a private loopback
+address and every other name to NXDOMAIN, and connections to those addresses
+on ports 80 and 443 go through the same egress proxy as `CONNECT name:port`.
+It serves clients that resolve DNS themselves instead of honouring
+`HTTPS_PROXY`. Combined with `--network` or without `--allow-host`, the launch
+is refused. The README section
+[Clients that ignore the proxy](../README.md#clients-that-ignore-the-proxy---transparent-egress)
+describes the supervisor-side helper.
+
 ## Resource limits and CPU set
 
 Per-process resource limits and the CPU set are advanced CLI/config-only
