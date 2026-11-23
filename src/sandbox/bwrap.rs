@@ -1661,6 +1661,11 @@ fn landlock_wrapper_args(
     args
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fork integration: upstream's seven launch inputs plus \
+              transparent egress"
+)]
 pub fn build(
     guard: &SandboxGuard,
     config: &Config,
@@ -2007,6 +2012,11 @@ fn build_dry_run_args_full(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fork integration: upstream's seven arguments plus the \
+              --mask-host view"
+)]
 fn build_dry_run_args_forwarded(
     config: &Config,
     project_dir: &Path,
