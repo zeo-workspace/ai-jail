@@ -2733,8 +2733,8 @@ pub(crate) fn render_effective_access(
             lines.push(format!("- [WARN] ALLOWED: {label} {}; TCP access; exact listed ports; {effect}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")));
         }
     }
-    // `--rlimit` has no onboarding control (advanced
-    // CLI/config-only, docs/TUI_DESIGN.md), so this review is where its
+    // `--rlimit` and `--cpus` have no onboarding control (advanced
+    // CLI/config-only, docs/TUI_DESIGN.md), so this review is where their
     // effect is shown: the values the sandbox applies, not the text typed.
     // The same host clamp as the dry run, so the review shows what the
     // sandbox gets under a low host hard limit.
@@ -2747,8 +2747,8 @@ pub(crate) fn render_effective_access(
         .into_iter()
         .filter(|l| l.source != crate::sandbox::rlimits::LimitSource::Default)
         .collect();
-    if !explicit.is_empty() {
-        lines.push("Explicit resource limits:".into());
+    if !explicit.is_empty() || config.cpus.is_some() {
+        lines.push("Explicit resource limits and CPU set:".into());
         for limit in explicit {
             let ceiling = limit
                 .ceiling
@@ -2761,6 +2761,9 @@ pub(crate) fn render_effective_access(
                 crate::sandbox::rlimits::fmt_rlim(limit.hard),
                 limit.source.as_str()
             ));
+        }
+        if let Some(cpus) = &config.cpus {
+            lines.push(format!("- cpus={}", escape_control_bytes(cpus)));
         }
     }
     if config.env_pass.is_empty() {

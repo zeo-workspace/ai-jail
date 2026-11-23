@@ -217,6 +217,8 @@ must still appear in the final `Complete effective access` review.
   The review lists each explicit limit as `rlimit NAME=SOFT/HARD (SOURCE)`,
   with the values the sandbox applies (after a `--lockdown` clamp, and with
   the five-second `cpu` grace). Defaults are not listed there.
+- `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
+  review shows it as `cpus=LIST`.
 
 ## Plain-terminal fallback
 
