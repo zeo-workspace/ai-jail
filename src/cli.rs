@@ -1358,6 +1358,7 @@ const INTERFACE_INTERNAL_FIELDS: &[&str] = &[
     "runtime_harnesses",
     "state_root",
     "mask_host",
+    "overlay_system",
 ];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
