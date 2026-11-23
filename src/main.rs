@@ -422,6 +422,16 @@ fn checked_limits(
     Ok(limits)
 }
 
+/// `--overlay-system` is a layer of `--mask-host`'s view (its empty bottom
+/// layer lives in the view's directory), so it is refused alone rather than
+/// ignored.
+fn validate_overlay_system(config: &config::Config) -> Result<(), String> {
+    if config.overlay_system && !config.mask_host {
+        return Err("--overlay-system requires --mask-host".into());
+    }
+    Ok(())
+}
+
 /// `--egress-log` only sees what the filtered-egress proxy relays, so with
 /// the network off or full it would log nothing while looking enabled.
 /// Checked on the finalized config: a config file or a harness
@@ -1278,6 +1288,12 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
         unsafe { std::env::set_var("PATH", &pruned) };
     }
 
+    // The quiet marker is for this helper only; the agent would read it
+    // as one more name that says it runs under ai-jail.
+    // SAFETY: single-threaded, before exec (or the
+    // reaper's spawn: quiet mode is already latched in `output`).
+    unsafe { std::env::remove_var("AI_JAIL_QUIET") };
+
     // With a teardown report, stay resident as the command's sub-reaper
     // instead of becoming it; the exec path below is unchanged without it.
     #[cfg(target_os = "linux")]
@@ -2055,6 +2071,7 @@ fn run(
         }
         _ => None,
     };
+    validate_overlay_system(&config)?;
 
     // Handle status command
     if cli.status {
@@ -2965,7 +2982,7 @@ mod tests {
         should_auto_save_project_config, should_check_update,
         should_save_global_preferences,
         untrusted_project_command_carries_credentials, validate_egress_log_on,
-        validate_network_flags, validate_write_flags,
+        validate_network_flags, validate_overlay_system, validate_write_flags,
     };
     use crate::cli::CliArgs;
     use crate::config::{BrowserProfile, Config};
@@ -3346,6 +3363,23 @@ mod tests {
         };
         assert!(validate_network_flags(&locked).is_ok());
         assert!(validate_network_flags(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn overlay_system_is_refused_without_mask_host() {
+        let alone = Config {
+            overlay_system: true,
+            ..Config::default()
+        };
+        let error = validate_overlay_system(&alone).unwrap_err();
+        assert!(error.contains("--mask-host"), "{error}");
+        let both = Config {
+            overlay_system: true,
+            mask_host: true,
+            ..Config::default()
+        };
+        assert!(validate_overlay_system(&both).is_ok());
+        assert!(validate_overlay_system(&Config::default()).is_ok());
     }
 
     #[test]

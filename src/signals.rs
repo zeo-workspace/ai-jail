@@ -243,10 +243,24 @@ pub fn run_supervised_exec(fd: i32, command: &[String]) -> Result<i32, String> {
     if read != 1 || byte[0] != 1 {
         return Err("Supervised execution was cancelled".into());
     }
-    let error = Command::new(&command[0])
-        .args(&command[1..])
-        .env_remove("AI_JAIL_SUPERVISED_EXEC")
-        .exec();
+    // `--mask-host`'s time namespace, entered here because this process
+    // is the one that becomes bwrap (host_view_timens).
+    #[cfg(target_os = "linux")]
+    if let Some(text) = std::env::var_os(crate::sandbox::host_view_timens::ENV)
+    {
+        let ns = crate::sandbox::host_view_timens::TimeNamespace::from_offsets(
+            &text.to_string_lossy(),
+        )
+        .ok_or("Invalid time namespace offsets")?;
+        ns.enter()
+            .map_err(|e| format!("Cannot enter the time namespace: {e}"))?;
+    }
+    let mut exec = Command::new(&command[0]);
+    exec.args(&command[1..])
+        .env_remove("AI_JAIL_SUPERVISED_EXEC");
+    #[cfg(target_os = "linux")]
+    exec.env_remove(crate::sandbox::host_view_timens::ENV);
+    let error = exec.exec();
     Err(format!("Cannot execute supervised sandbox: {error}"))
 }
 

@@ -216,6 +216,15 @@ OPTIONS:
     --state-root <DIR>             Keep the sandbox's $HOME, /tmp and Claude config on disk under
                                    DIR (home/, tmp/, claude/) instead of tmpfs (Linux; created
                                    0700; never saved to a profile)
+    --mask-host                    Show the sandbox a host sized to its limits: synthetic
+                                   /proc/cpuinfo, meminfo, stat, loadavg, uptime and
+                                   /sys/devices/system/cpu, only its own cgroup, no DMI, its
+                                   own machine-id (Linux; never saved). A nested sandbox can no
+                                   longer mount /proc (bwrap, podman, Claude Code's Bash
+                                   sandbox; already refused unless --no-landlock --no-seccomp)
+    --overlay-system               With --mask-host: serve /usr, /etc and /opt through
+                                   read-only overlays so the mount table names no host disk
+                                   (Linux; never saved; slower metadata walks)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -298,6 +307,8 @@ pub struct CliArgs {
     pub transparent_helper: Option<(u32, PathBuf, Vec<u16>)>,
     pub claude_dir: Option<PathBuf>,
     pub state_root: Option<PathBuf>,
+    pub mask_host: bool,
+    pub overlay_system: bool,
     pub agent_state: Option<bool>,
     pub harnesses: Vec<String>,
     pub request_files: Vec<PathBuf>,
@@ -622,6 +633,12 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let val = parser.value().map_err(|e| e.to_string())?;
                 args.state_root =
                     Some(PathBuf::from(val.to_string_lossy().into_owned()));
+            }
+            Long("mask-host") => {
+                args.mask_host = true;
+            }
+            Long("overlay-system") => {
+                args.overlay_system = true;
             }
             Long(s @ ("gpu" | "no-gpu")) => {
                 args.gpu = Some(s == "gpu");
@@ -1296,6 +1313,8 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--no-browser",
     "--claude-dir",
     "--state-root",
+    "--mask-host",
+    "--overlay-system",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -3220,6 +3239,22 @@ mod tests {
         let error =
             parse_test(&["claude", "--secret", "K=example.com"]).unwrap_err();
         assert!(error.contains("after command"));
+    }
+
+    #[test]
+    fn parse_mask_host() {
+        assert!(!parse_test(&["claude"]).unwrap().mask_host);
+        let args = parse_test(&["--mask-host", "claude"]).unwrap();
+        assert!(args.mask_host);
+        assert_eq!(args.command, vec!["claude"]);
+    }
+
+    #[test]
+    fn parse_overlay_system() {
+        assert!(!parse_test(&["claude"]).unwrap().overlay_system);
+        let args =
+            parse_test(&["--mask-host", "--overlay-system", "claude"]).unwrap();
+        assert!(args.mask_host && args.overlay_system);
     }
 
     #[test]

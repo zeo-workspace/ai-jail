@@ -62,6 +62,16 @@ fn project_config_dangerous_opt_ins(
 #[cfg(target_os = "linux")]
 pub(crate) mod bwrap;
 #[cfg(target_os = "linux")]
+mod host_view;
+#[cfg(target_os = "linux")]
+mod host_view_extra;
+#[cfg(target_os = "linux")]
+mod host_view_synth;
+#[cfg(target_os = "linux")]
+pub(crate) mod host_view_timens;
+#[cfg(target_os = "linux")]
+mod host_view_uptime;
+#[cfg(target_os = "linux")]
 mod landlock;
 #[cfg(target_os = "macos")]
 mod seatbelt;
@@ -1990,6 +2000,9 @@ pub fn build(
     {
         // No teardown report or transparent egress on macOS.
         let _ = (guard, bridge_sockets, teardown_report_fd, transparent);
+        if config.mask_host || config.overlay_system {
+            return Err("--mask-host is Linux-only".into());
+        }
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
@@ -2026,6 +2039,9 @@ pub fn dry_run(
     {
         // No wrapper on macOS: the teardown report is not supported there.
         let _ = (guard, bridge_sockets, teardown_report);
+        if config.mask_host || config.overlay_system {
+            return Err("--mask-host is Linux-only".into());
+        }
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::dry_run(
             &prepared,

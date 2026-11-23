@@ -187,6 +187,14 @@ pub struct Config {
     /// Runtime only, like `runtime_harnesses`: a launch flag, never saved.
     #[serde(default, skip)]
     pub state_root: Option<std::path::PathBuf>,
+    /// `--mask-host`: a synthetic hardware view sized to the limits.
+    /// Runtime only, like `runtime_harnesses`: a launch flag, never saved.
+    #[serde(default, skip)]
+    pub mask_host: bool,
+    /// `--overlay-system`: read-only overlays for `/usr`, `/etc`, `/opt`
+    /// under `--mask-host`. Runtime only, never saved.
+    #[serde(default, skip)]
+    pub overlay_system: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3623,6 +3631,8 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
         config.claude_dir = Some(p);
     }
     config.state_root = cli.state_root.clone();
+    config.mask_host = cli.mask_host;
+    config.overlay_system = cli.overlay_system;
 
     expand_user_paths(&mut config);
 
@@ -5970,6 +5980,8 @@ no_gpu = true
         let config = Config {
             runtime_harnesses: Vec::new(),
             state_root: None,
+            mask_host: false,
+            overlay_system: false,
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -9455,6 +9467,8 @@ hide_dotdirs = [".my_secrets"]
         let config = Config {
             runtime_harnesses: Vec::new(),
             state_root: None,
+            mask_host: false,
+            overlay_system: false,
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
