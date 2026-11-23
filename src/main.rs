@@ -388,6 +388,9 @@ fn validate_overlay_system(config: &config::Config) -> Result<(), String> {
     if config.overlay_system && !config.mask_host {
         return Err("--overlay-system requires --mask-host".into());
     }
+    if config.syscall_view && !config.mask_host {
+        return Err("--syscall-view requires --mask-host".into());
+    }
     Ok(())
 }
 
@@ -1228,6 +1231,13 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     // Apply seccomp filter after Landlock (reduces kernel syscall
     // surface). Must happen before exec so the user command inherits
     // the filter.
+    // `--syscall-view`: the notify filter goes on first, since the deny
+    // filter below may refuse seccomp(2) itself; its listener leaves for
+    // the launcher before the agent is exec'd.
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = cli.syscall_view_fd {
+        sandbox::syscall_view_install(fd)?;
+    }
     sandbox::apply_seccomp(&config, cli.verbose)?;
 
     // Drop PATH entries that do not exist in here.
@@ -3274,6 +3284,12 @@ mod tests {
             ..Config::default()
         };
         assert!(validate_overlay_system(&both).is_ok());
+        let syscalls = Config {
+            syscall_view: true,
+            ..Config::default()
+        };
+        let error = validate_overlay_system(&syscalls).unwrap_err();
+        assert!(error.contains("--syscall-view"), "{error}");
         assert!(validate_overlay_system(&Config::default()).is_ok());
     }
 

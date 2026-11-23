@@ -960,6 +960,18 @@ subvolume for them; it is separate because an overlay slows metadata walks
 itself an overlay stacked too deep (inside a container it can fail with
 `Invalid argument`).
 
+`--syscall-view` (with `--mask-host`) closes what files cannot: `uname(2)` and
+`sysinfo(2)`. A seccomp filter installed in the sandbox right before its deny
+filter sends those two calls to ai-jail outside it
+(`SECCOMP_RET_USER_NOTIF`), which writes the answer into the caller's buffer:
+`uname -r`, Python's `platform` and Node's `os.release()` read the same numeric
+release as `/proc/version`, the host name is the sandbox's, and `sysinfo`
+reports the sandbox's age as uptime, no load, memory sized to the limit and the
+sandbox's own task count (so `getconf _PHYS_PAGES` agrees with
+`/proc/meminfo`). Each of those calls makes a round trip to ai-jail; if ai-jail
+dies, they fail with `ENOSYS`, and bwrap ends the sandbox with it anyway.
+Only the native architecture is trapped.
+
 The allowed CPUs are the `--cpus` set, else the process's affinity
 (`taskset`), trimmed to the cgroup's `cpu.max` rounded up to whole CPUs; the
 memory limit is the smallest `memory.max` from the sandbox's cgroup up to the
@@ -979,7 +991,9 @@ so this changes behaviour only under `--no-landlock --no-seccomp`.
 The `cpuid` instruction, timing, the `uname(2)` kernel release, the CPU
 numbers `sched_getaffinity` and `/proc/self/status` return, and the mount
 sources in `/proc/self/mountinfo` of the writable mounts (and of the system
-trees without `--overlay-system`) stay the host's. Only a VM changes those.
+trees without `--overlay-system`) stay the host's (the release and memory
+`uname(2)`/`sysinfo(2)` report too, without `--syscall-view`). Only a VM
+changes those.
 
 ## Browsers
 
@@ -1170,6 +1184,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --state-root DIR                $HOME, /tmp and Claude config on disk under DIR (Linux; not saved)
 --mask-host                     hardware view sized to the sandbox's limits (Linux; not saved; see Hiding the host)
 --overlay-system                with --mask-host: /usr, /etc, /opt through read-only overlays (Linux; not saved)
+--syscall-view                  with --mask-host: uname(2) and sysinfo(2) answered by ai-jail (Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit
