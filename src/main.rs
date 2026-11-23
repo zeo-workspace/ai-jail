@@ -26,6 +26,7 @@ mod sandbox;
 mod secret;
 mod signals;
 mod ssh_restricted;
+mod state_root;
 mod statusbar;
 // Cross-platform here: the run summary records the teardown section on
 // macOS too (as unsupported).
@@ -857,12 +858,48 @@ pub(crate) fn finalize_launch_config(
     finalize_launch_config_with_ssh(config, project, dry_run, None)
 }
 
+/// `--state-root`: refuse it where it cannot apply, validate and create the
+/// directory (not under `--dry-run`), and make its `claude/` the Claude config
+/// directory unless `--claude-dir` named one.
+fn apply_state_root(
+    config: &mut config::Config,
+    dry_run: bool,
+) -> Result<(), String> {
+    apply_state_root_on(config, dry_run, cfg!(target_os = "linux"))
+}
+
+/// `apply_state_root` with the platform as a parameter, so the refusal off
+/// Linux is testable here.
+fn apply_state_root_on(
+    config: &mut config::Config,
+    dry_run: bool,
+    linux: bool,
+) -> Result<(), String> {
+    let Some(root) = config.state_root.clone() else {
+        return Ok(());
+    };
+    if !linux {
+        return Err("--state-root is supported on Linux only".into());
+    }
+    if config.lockdown_enabled() {
+        return Err("--state-root cannot be combined with --lockdown: \
+                    lockdown keeps $HOME and /tmp in memory on purpose"
+            .into());
+    }
+    let layout = state_root::prepare(&root, !dry_run)?;
+    if config.claude_dir.is_none() {
+        config.claude_dir = Some(layout.claude);
+    }
+    Ok(())
+}
+
 pub(crate) fn finalize_launch_config_with_ssh(
     mut config: config::Config,
     project: &std::path::Path,
     dry_run: bool,
     restricted_ssh: Option<ssh_restricted::Policy>,
 ) -> Result<FinalizedLaunch, String> {
+    apply_state_root(&mut config, dry_run)?;
     if config.lockdown_enabled() {
         forge_auth::strip_runtime(&mut config);
     }
@@ -2136,6 +2173,7 @@ fn run(
 
     // Handle --bootstrap: generate AI tool configs and exit
     if cli.bootstrap {
+        apply_state_root(&mut config, false)?;
         bootstrap::run(cli.verbose, config.claude_dir.as_deref())?;
         return Ok(0);
     }
@@ -4142,5 +4180,45 @@ mod tests {
             crate::integration::EXIT_BLOCKED
         );
         assert_eq!(error_exit_code("ordinary configuration error"), 1);
+    }
+}
+
+#[cfg(test)]
+mod state_root_tests {
+    use super::*;
+
+    #[test]
+    fn state_root_is_refused_off_linux_and_under_lockdown() {
+        let mut config = config::Config {
+            state_root: Some("/var/tmp/zeo-jail/x".into()),
+            ..config::Config::default()
+        };
+        let err = apply_state_root_on(&mut config, true, false).unwrap_err();
+        assert!(err.contains("Linux only"), "{err}");
+        config.lockdown = Some(true);
+        let err = apply_state_root_on(&mut config, true, true).unwrap_err();
+        assert!(err.contains("--lockdown"), "{err}");
+    }
+
+    #[test]
+    fn state_root_names_its_claude_dir_unless_one_is_given() {
+        let root = std::env::temp_dir()
+            .join(format!("ai-jail-main-state-{}", std::process::id()));
+        let mut config = config::Config {
+            state_root: Some(root.clone()),
+            ..config::Config::default()
+        };
+        // Dry run: nothing is created, the layout still decides the dir.
+        apply_state_root_on(&mut config, true, true).unwrap();
+        assert_eq!(config.claude_dir, Some(root.join("claude")));
+        assert!(!root.exists(), "--dry-run writes nothing");
+
+        let mut given = config::Config {
+            state_root: Some(root.clone()),
+            claude_dir: Some("/elsewhere/claude".into()),
+            ..config::Config::default()
+        };
+        apply_state_root_on(&mut given, true, true).unwrap();
+        assert_eq!(given.claude_dir, Some("/elsewhere/claude".into()));
     }
 }

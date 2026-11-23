@@ -96,6 +96,9 @@ or integration rather than saved sandbox authority.
   (each reports on one run; no saved authority and no configuration key;
   `--egress-log` is refused outside filtered networking, and `--run-summary`
   implies `--teardown-report`)
+- Sandbox state on disk: `--state-root` (a per-run directory chosen by the
+  caller -- typically a wrapper such as an editor -- not saved authority: no
+  configuration key, refused under `--lockdown` and on macOS)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

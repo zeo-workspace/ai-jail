@@ -1190,6 +1190,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
                                 cap the whole sandbox (Linux, systemd user
                                 session; see Resource limits)
 --cpus LIST                     pin the sandbox to CPUs, locked by seccomp
+--state-root DIR                $HOME, /tmp and Claude config on disk under DIR (Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit

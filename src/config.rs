@@ -183,6 +183,10 @@ pub struct Config {
     /// only: profiles store approvals, never wrapper invocation metadata.
     #[serde(default, skip)]
     pub runtime_harnesses: Vec<String>,
+    /// `--state-root`: the sandbox's home, /tmp and Claude config on disk.
+    /// Runtime only, like `runtime_harnesses`: a launch flag, never saved.
+    #[serde(default, skip)]
+    pub state_root: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3618,6 +3622,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(p) = cli.claude_dir.clone() {
         config.claude_dir = Some(p);
     }
+    config.state_root = cli.state_root.clone();
 
     expand_user_paths(&mut config);
 
@@ -4855,6 +4860,7 @@ env_pass = ["ANTHROPIC_API_KEY"]
     fn save_does_not_persist_env_pass() {
         let config = Config {
             runtime_harnesses: Vec::new(),
+            state_root: None,
             command: vec!["claude".into()],
             env_pass: vec!["ANTHROPIC_API_KEY=sk-secret".into()],
             trust_project_config: vec![],
@@ -5963,6 +5969,7 @@ no_gpu = true
     fn roundtrip_serialize_deserialize() {
         let config = Config {
             runtime_harnesses: Vec::new(),
+            state_root: None,
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -9447,6 +9454,7 @@ hide_dotdirs = [".my_secrets"]
 
         let config = Config {
             runtime_harnesses: Vec::new(),
+            state_root: None,
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
