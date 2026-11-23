@@ -213,6 +213,9 @@ OPTIONS:
     --overlay-system               With --mask-host: serve /usr, /etc and /opt through
                                    read-only overlays so the mount table names no host disk
                                    (Linux; never saved; slower metadata walks)
+    --syscall-view                 With --mask-host: answer uname(2) and sysinfo(2) from
+                                   ai-jail, so the kernel release, memory, load and uptime
+                                   they report match the host view (Linux; never saved)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -290,6 +293,9 @@ pub struct CliArgs {
     pub state_root: Option<PathBuf>,
     pub mask_host: bool,
     pub overlay_system: bool,
+    pub syscall_view: bool,
+    /// Internal: the helper's end of the `--syscall-view` socket pair.
+    pub syscall_view_fd: Option<i32>,
     pub agent_state: Option<bool>,
     pub harnesses: Vec<String>,
     pub request_files: Vec<PathBuf>,
@@ -580,6 +586,22 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("overlay-system") => {
                 args.overlay_system = true;
+            }
+            Long("syscall-view") => {
+                args.syscall_view = true;
+            }
+            Long("syscall-view-fd") => {
+                if !args.landlock_exec {
+                    return Err(
+                        "--syscall-view-fd is internal and only valid with --landlock-exec"
+                            .into(),
+                    );
+                }
+                let value = parser.value().map_err(|e| e.to_string())?;
+                args.syscall_view_fd =
+                    Some(value.to_string_lossy().parse().map_err(|_| {
+                        "invalid --syscall-view-fd".to_string()
+                    })?);
             }
             Long(s @ ("gpu" | "no-gpu")) => {
                 args.gpu = Some(s == "gpu");
@@ -1230,6 +1252,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--state-root",
     "--mask-host",
     "--overlay-system",
+    "--syscall-view",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -1281,6 +1304,7 @@ const INTERFACE_INTERNAL_FIELDS: &[&str] = &[
     "state_root",
     "mask_host",
     "overlay_system",
+    "syscall_view",
 ];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
@@ -3070,6 +3094,24 @@ mod tests {
         let args =
             parse_test(&["--mask-host", "--overlay-system", "claude"]).unwrap();
         assert!(args.mask_host && args.overlay_system);
+    }
+
+    #[test]
+    fn parse_syscall_view_and_its_internal_fd() {
+        let args =
+            parse_test(&["--mask-host", "--syscall-view", "claude"]).unwrap();
+        assert!(args.syscall_view && args.syscall_view_fd.is_none());
+        assert!(parse_test(&["--syscall-view-fd", "9", "true"]).is_err());
+        let helper = parse_test(&[
+            "--landlock-exec",
+            "--syscall-view-fd",
+            "9",
+            "--",
+            "bash",
+        ])
+        .unwrap();
+        assert_eq!(helper.syscall_view_fd, Some(9));
+        assert!(!HELP.contains("--syscall-view-fd"));
     }
 
     #[test]
