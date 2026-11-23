@@ -162,8 +162,8 @@ The result has `version`, `schema_version`, `project`, `harnesses`, `grants`
 and `blockers`. Stable blocker codes include `onboarding_required`,
 `required_grant_not_approved`, `missing_approved_env`, `directory_drift`,
 `changed_ssh_key`, `backend_unavailable`, and `limits_unavailable` (an
-explicit resource limit this host cannot apply; a launch or `--init` with it
-is refused). Status is read-only and never prompts.
+explicit resource limit or CPU set this host cannot apply; a launch or
+`--init` with it is refused). Status is read-only and never prompts.
 
 `project` carries `canonical_path`, the launch directory, and `policy_path`,
 the directory whose saved policy applies. They differ only when the trusted
