@@ -219,6 +219,14 @@ must still appear in the final `Complete effective access` review.
   the five-second `cpu` grace). Defaults are not listed there.
 - `--cpus LIST` and `cpus`: the CPU set, locked by seccomp, Linux only. The
   review shows it as `cpus=LIST`.
+- `--profile NAME` selects a named profile, a `[profiles.NAME]` table in the
+  trusted global config. It is CLI/config-only because a profile is written
+  by hand in the global file and onboarding only edits per-project grants;
+  offering it there would let the onboarding screen select trusted authority
+  it cannot show in full. It is unrelated to the onboarding access profile
+  (the per-project grants these screens edit). The review shows
+  `Named profile: profile=NAME (a trusted global layer)`, and every field it
+  widens is printed as a `profile=NAME widens=FIELD` line before the launch.
 
 ## Plain-terminal fallback
 
