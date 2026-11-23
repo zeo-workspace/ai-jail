@@ -64,7 +64,11 @@ pub(crate) mod bwrap;
 #[cfg(target_os = "linux")]
 mod host_view;
 #[cfg(target_os = "linux")]
+mod host_view_extra;
+#[cfg(target_os = "linux")]
 mod host_view_synth;
+#[cfg(target_os = "linux")]
+pub(crate) mod host_view_timens;
 #[cfg(target_os = "linux")]
 mod host_view_uptime;
 #[cfg(target_os = "linux")]
@@ -1971,7 +1975,7 @@ pub fn build(
     #[cfg(target_os = "macos")]
     {
         let _ = (guard, bridge_sockets);
-        if config.mask_host {
+        if config.mask_host || config.overlay_system {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
@@ -2007,7 +2011,7 @@ pub fn dry_run(
     #[cfg(target_os = "macos")]
     {
         let _ = (guard, bridge_sockets);
-        if config.mask_host {
+        if config.mask_host || config.overlay_system {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;

@@ -1198,6 +1198,7 @@ pub(crate) fn save_project_grants(
     grants.state_root = None;
     // `--mask-host` is invocation-scoped for the same reason.
     grants.mask_host = false;
+    grants.overlay_system = false;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1521,6 +1522,7 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("runtime_harnesses", Authority),
     excluded_policy!("state_root", Authority),
     excluded_policy!("mask_host", Restriction),
+    excluded_policy!("overlay_system", Restriction),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -2332,6 +2334,7 @@ mod tests {
         expected_excluded!("runtime_harnesses", Authority),
         expected_excluded!("state_root", Authority),
         expected_excluded!("mask_host", Restriction),
+        expected_excluded!("overlay_system", Restriction),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2449,6 +2452,9 @@ mod tests {
             }
             "mask_host" => {
                 config.mask_host = true;
+            }
+            "overlay_system" => {
+                config.overlay_system = true;
             }
             "command" => {
                 config.command =
