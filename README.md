@@ -716,6 +716,65 @@ The diagnostic labels this as an inference. macOS only reports signals the
 supervisor observed directly. Successful exits and `SIGHUP`, `SIGINT`,
 `SIGPIPE`, and `SIGTERM` produce no diagnostic. The exit code is unchanged.
 
+`--teardown-report` (Linux) deals with processes that outlive the command,
+such as a dev server or watcher left running in the background. When the
+command exits, ai-jail lists every process still alive in the sandbox,
+sends each SIGTERM (and SIGCONT, so a stopped one can act on it), waits up to
+a fixed 2000 ms grace, then sends SIGKILL to the rest and lists the sandbox
+once more. A process that listing finds was started meanwhile, such as a
+worker a supervisor respawns on SIGTERM: it is not signalled again (the
+pid-namespace teardown ends it) and the report says `survivors-respawned`. When
+there were survivors it prints one line on stderr with the count and names
+of those it stopped, at most ten and then `+N more`; with none it prints
+nothing and adds no delay. The line is printed even under `--exec`.
+
+```bash
+ai-jail --teardown-report --exec sh -c 'sleep 300 & exit 0'
+# ⚠ 1 process outlived the command and was stopped: sleep
+```
+
+Survivors are named by `comm` only, the kernel's short command name; their
+command lines and environments are never read. The command's exit code is
+returned unchanged, including death by a signal. The in-sandbox wrapper
+reports to the supervisor on a descriptor the command cannot see or reopen.
+If that report is missing, malformed or incomplete (for example
+`survivors-respawned`, or `/proc` could not be read), one
+`Teardown report incomplete: <reason>` line says so, and the kernel's
+pid-namespace teardown ends whatever is left. On macOS the flag
+is accepted and changes nothing.
+
+`--run-summary <PATH>` writes one JSON document per launch when the run ends,
+on every path once the launch is under way: a clean exit, a death by signal
+or limit, and a sandbox that failed to start. An invocation that ends earlier
+exits with its error and writes none, for example an argument error, a missing
+`bwrap`, a project config that cannot be read, a restricted SSH agent or a
+secret that fails to start, or a cancel (Ctrl-C) before the launch. A dry run
+writes none either. It implies `--teardown-report`.
+
+```bash
+ai-jail --run-summary /tmp/run.json --egress-log /tmp/egress.jsonl \
+  --allow-host api.anthropic.com claude
+jq '.exit, .network' /tmp/run.json
+```
+
+| Section      | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| top level    | `schema` (`ai-jail.run-summary`), `schema_version`, `run_id` (the same as the egress lines of this launch), `ai_jail_version`, `started_at`, `ended_at`, `duration_ms`, `program` (basename only, `null` when none)                                                                                                                                                                                                                                                                                            |
+| `exit`       | `code`, `signal`, `core_dumped`, `reason` (`exited`, `signaled`, `limit`, `start-failed`), `limit`, `evidence`, `status_source` (`reported` by the in-sandbox wrapper, `inferred` from a 128+N code, `direct` when the supervisor saw the signal itself, `exit-code` for an exit code taken as it is, or `none` when the command never started), `error`. `limit` names a limit ai-jail configured that is consistent with the signal, and `evidence` its configured value; neither says the limit was reached |
+| `resources`  | `cpu_user_ms`, `cpu_system_ms`, `peak_rss_kib` (the largest single process, `peak_rss_scope` `largest-process`) and `source`: `sandbox-wrapper` on Linux, measured inside the sandbox for the command and everything it left behind; `getrusage` on macOS; `unavailable`, with the figures `null`, when nothing measured them                                                                                                                                                                                  |
+| `network`    | `mode`, and in filtered mode the allowed, denied and errored connection counts and byte totals; `null` with the network off or full, where nothing observes it                                                                                                                                                                                                                                                                                                                                                 |
+| `filesystem` | `denied_accesses`, reserved: always `null` with source `unavailable`                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `teardown`   | `supported`, `active`, `complete`, `incomplete_reason`, `grace_ms`, `survivors` (`pid`, `ppid`, `comm`, `age_s`, `ended_by`)                                                                                                                                                                                                                                                                                                                                                                                   |
+
+The schema is `docs/run-summary.schema.json`. Adding an optional field keeps
+`schema_version`; removing, renaming, retyping or re-meaning one increments it,
+and the schema's `$id` names the version. The document is written to a 0600
+temporary file in the same directory and renamed over `PATH`, so a reader sees
+the previous summary or the new one, never a partial file. A symlink at `PATH`
+or a missing directory is a warning at startup, and the run goes on without a
+summary; a write failure at the end is an error message that leaves the exit
+code unchanged.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are
