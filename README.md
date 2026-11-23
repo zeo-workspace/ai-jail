@@ -878,6 +878,21 @@ sandbox:
 | `/sys/fs/cgroup` | only the sandbox's own cgroup, read-only, in its own cgroup namespace (`/proc/self/cgroup` reads `0::/`) |
 | `/sys/class/dmi`, `/sys/devices/virtual/dmi` | empty |
 | `/etc/machine-id` | the sandbox's own id: kept in `DIR/machine-id` under `--state-root DIR`, else random per launch |
+| `/proc/version`, `/proc/sys/kernel/{osrelease,version}` | the numeric release only (`7.3.5`, not `7.3.5-bentoo-dist`): no distribution suffix, builder, compiler or build date |
+| `/usr/lib/os-release` (and `/etc/os-release` when it is a file) | generic: `NAME="Linux"`, `ID=linux` |
+| `/proc/swaps` | the header only (no swap device) |
+| `/proc/sys/kernel/random/boot_id` | a random id per launch |
+| `/etc/crypttab`, `/etc/gentoo-release`, `/etc/lsb-release`, `/proc/{partitions,diskstats,zoneinfo,interrupts,schedstat}` | empty |
+| `/etc/portage`, `/proc/pressure`, `/sys/block`, `/sys/class/block`, `/sys/devices/system/{node,memory}`, `/usr/lib/modules`, `/usr/src` | empty |
+| `CLOCK_BOOTTIME`, `CLOCK_MONOTONIC`, `sysinfo().uptime` | start at the launch, in a time namespace (skipped with a warning on a kernel without `CONFIG_TIME_NS`) |
+
+A path the host lacks is skipped. `--overlay-system` (with `--mask-host`)
+also serves `/usr`, `/etc` and `/opt` through read-only overlays, so
+`/proc/self/mountinfo` names `overlay` instead of the host's disk and
+subvolume for them; it is separate because an overlay slows metadata walks
+(a `find` over `/usr` measured +21 %), and it needs a root that is not
+itself an overlay stacked too deep (inside a container it can fail with
+`Invalid argument`).
 
 The allowed CPUs are the `--cpus` set, else the process's affinity
 (`taskset`), trimmed to the cgroup's `cpu.max` rounded up to whole CPUs; the
@@ -897,7 +912,8 @@ so this changes behaviour only under `--no-landlock --no-seccomp`.
 **What it cannot hide.** This hides the easy answers; it does not isolate.
 The `cpuid` instruction, timing, the `uname(2)` kernel release, the CPU
 numbers `sched_getaffinity` and `/proc/self/status` return, and the mount
-sources in `/proc/self/mountinfo` stay the host's. Only a VM changes those.
+sources in `/proc/self/mountinfo` of the writable mounts (and of the system
+trees without `--overlay-system`) stay the host's. Only a VM changes those.
 
 ## Browsers
 
@@ -1032,6 +1048,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --cpus LIST                     pin the sandbox to CPUs, locked by seccomp
 --state-root DIR                $HOME, /tmp and Claude config on disk under DIR (Linux; not saved)
 --mask-host                     hardware view sized to the sandbox's limits (Linux; not saved; see Hiding the host)
+--overlay-system                with --mask-host: /usr, /etc, /opt through read-only overlays (Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit
