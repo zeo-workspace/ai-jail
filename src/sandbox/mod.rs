@@ -70,6 +70,15 @@ mod host_view_synth;
 #[cfg(target_os = "linux")]
 pub(crate) mod host_view_timens;
 #[cfg(target_os = "linux")]
+mod syscall_view;
+
+/// In the helper: install `--syscall-view`'s notify filter and hand its
+/// listener out over `fd`.
+#[cfg(target_os = "linux")]
+pub fn syscall_view_install(fd: i32) -> Result<(), String> {
+    syscall_view::install_in_jail(fd)
+}
+#[cfg(target_os = "linux")]
 mod host_view_uptime;
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -1996,7 +2005,7 @@ pub fn build(
         // No teardown report on macOS.
         let _ = (guard, bridge_sockets, teardown_report_fd);
         let _ = legacy_mask_mountable;
-        if config.mask_host || config.overlay_system {
+        if config.mask_host || config.overlay_system || config.syscall_view {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
@@ -2035,7 +2044,7 @@ pub fn dry_run(
     {
         // No wrapper on macOS: the teardown report is not supported there.
         let _ = (guard, bridge_sockets, teardown_report);
-        if config.mask_host || config.overlay_system {
+        if config.mask_host || config.overlay_system || config.syscall_view {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
