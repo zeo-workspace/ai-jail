@@ -706,12 +706,28 @@ namespace; DMI is hidden; `/etc/machine-id` is the sandbox's own.
   `/proc/meminfo` stays the host's.
 - Machine id: kept in `DIR/machine-id` under `--state-root DIR`, so it stays the
   same between launches; a fresh one per launch otherwise.
+- Identity: `/proc/version` and `/proc/sys/kernel/{osrelease,version}` carry
+  the numeric release only (no distribution suffix, builder, compiler or
+  date); `os-release` is generic (`ID=linux`); `/proc/swaps` lists no swap; the
+  boot id is the sandbox's own; `/etc/crypttab`, the partition, disk, NUMA,
+  memory-block, interrupt, scheduler and pressure files, `/etc/portage`, the
+  kernel's modules and sources are empty. A path the host lacks is skipped.
+- Clocks: `CLOCK_BOOTTIME`, `CLOCK_MONOTONIC` and `sysinfo().uptime` start at
+  the launch, in a time namespace (skipped with a warning without
+  `CONFIG_TIME_NS`).
+
+`--overlay-system` (with `--mask-host` only; never saved) serves `/usr`, `/etc`
+and `/opt` through read-only overlays, so the mount table names `overlay`
+instead of the host's disk for them. Metadata walks get slower (a `find` over
+`/usr` measured +21 %), and an overlay cannot sit on a root that is already
+stacked too deep (some containers: `Invalid argument`).
 
 A nested sandbox can no longer mount its own `/proc` under `--mask-host`; with
 ai-jail's default Landlock and seccomp a nested sandbox is refused anyway, so
 this matters only under `--no-landlock --no-seccomp`. The `cpuid` instruction,
 timing, `uname(2)`, the CPU numbers of `sched_getaffinity` and the mount
-sources in `/proc/self/mountinfo` stay the host's. Linux only, never saved to a
+sources in `/proc/self/mountinfo` of the writable mounts (and of the system
+trees without `--overlay-system`) stay the host's. Linux only, never saved to a
 profile: pass it on each launch.
 
 ## Migration and reapproval
