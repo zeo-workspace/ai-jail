@@ -50,7 +50,10 @@ fn dests(plan: &HostViewPlan) -> Vec<String> {
         .map(|m| match m {
             HostViewMount::File { dest, .. }
             | HostViewMount::Dir { dest, .. }
-            | HostViewMount::Tmpfs { dest } => dest.display().to_string(),
+            | HostViewMount::Tmpfs { dest }
+            | HostViewMount::RoOverlay { dest, .. } => {
+                dest.display().to_string()
+            }
         })
         .collect()
 }
@@ -129,6 +132,7 @@ fn explicit_cpus_win_over_affinity_and_keep_their_numbers() {
     let request = HostViewRequest {
         cpus: Some(pinned),
         machine_id_file: None,
+        overlay_system: false,
     };
     let plan = plan(
         &limited_host(),
