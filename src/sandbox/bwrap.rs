@@ -352,7 +352,7 @@ impl MountSet {
             "--unshare-uts".into(),
             "--unshare-ipc".into(),
             "--hostname".into(),
-            "ai-sandbox".into(),
+            super::syscall_view::JAIL_HOSTNAME.into(),
         ];
 
         if lockdown || should_use_new_session() {
@@ -633,6 +633,9 @@ pub struct SandboxGuard {
     /// `--mask-host`'s synthetic files, made on first use and removed
     /// with the guard, which outlives the sandbox.
     host_view: std::cell::OnceCell<super::host_view::HostView>,
+    /// `--syscall-view`'s supervisor, started on first use and stopped
+    /// with the guard, after the sandbox ended.
+    syscall_view: std::cell::OnceCell<super::syscall_view::Supervisor>,
 }
 
 impl SandboxGuard {
@@ -669,6 +672,17 @@ impl SandboxGuard {
 
     fn deny_dir_path(&self) -> &Path {
         &self.deny_dir_path
+    }
+
+    fn syscall_view(&self) -> Result<&super::syscall_view::Supervisor, String> {
+        if let Some(supervisor) = self.syscall_view.get() {
+            return Ok(supervisor);
+        }
+        let supervisor = super::syscall_view::Supervisor::start(
+            super::syscall_view::answers_for_host(),
+            std::time::Instant::now(),
+        )?;
+        Ok(self.syscall_view.get_or_init(|| supervisor))
     }
 
     fn host_view(
@@ -777,6 +791,7 @@ impl SandboxGuard {
             deny_file_path: PathBuf::from("/tmp/ai-jail-test-deny-file"),
             deny_dir_path: PathBuf::from("/tmp/ai-jail-test-deny-dir"),
             host_view: std::cell::OnceCell::new(),
+            syscall_view: std::cell::OnceCell::new(),
         }
     }
 }
@@ -1143,6 +1158,7 @@ pub fn prepare() -> Result<SandboxGuard, String> {
         deny_file_path,
         deny_dir_path,
         host_view: std::cell::OnceCell::new(),
+        syscall_view: std::cell::OnceCell::new(),
     })
 }
 
@@ -1466,6 +1482,8 @@ fn resolve_landlock_wrapper(
         // audit record still report them.
         && config.rlimit.is_empty()
         && config.cpus.is_none()
+        // --syscall-view's notify filter is installed by the wrapper.
+        && !config.syscall_view
     {
         return Ok(None);
     }
@@ -1775,12 +1793,22 @@ pub fn build(
     // accept the command from the fd).
     cmd.arg("--");
     if wrapper.is_some() {
-        for arg in landlock_wrapper_args(
+        let mut wrapper_args = landlock_wrapper_args(
             config,
             &map_args,
             verbose,
             teardown_report_fd.map(|fd| fd.to_string()),
-        ) {
+        );
+        // `--syscall-view`: the helper's end of the supervisor's socket
+        // pair, before the wrapper's own `--`.
+        if config.syscall_view {
+            let fd = guard.syscall_view()?.child_fd();
+            let separator = wrapper_args.pop();
+            wrapper_args.push(super::syscall_view::FD_FLAG.into());
+            wrapper_args.push(fd.to_string());
+            wrapper_args.extend(separator);
+        }
+        for arg in wrapper_args {
             cmd.arg(arg);
         }
     }

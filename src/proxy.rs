@@ -2137,7 +2137,10 @@ fn serve_published(control: &UnixStream, port: u16) {
 /// Send one byte carrying `fd` as SCM_RIGHTS ancillary data. std has no
 /// stable API for it, and nix's would pull in its `socket` feature.
 #[cfg(target_os = "linux")]
-fn send_fd(stream: &UnixStream, fd: &impl AsRawFd) -> io::Result<()> {
+pub(crate) fn send_fd(
+    stream: &UnixStream,
+    fd: &impl AsRawFd,
+) -> io::Result<()> {
     use nix::libc;
     let byte = [0_u8; 1];
     let mut iov = libc::iovec {
@@ -2181,7 +2184,7 @@ fn send_fd(stream: &UnixStream, fd: &impl AsRawFd) -> io::Result<()> {
 /// `Ok(None)` at end of stream; `InvalidData` for a byte that carried no
 /// descriptor. Extra descriptors in one message are closed.
 #[cfg(target_os = "linux")]
-fn recv_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
+pub(crate) fn recv_fd(stream: &UnixStream) -> io::Result<Option<OwnedFd>> {
     use nix::libc;
     let mut byte = [0_u8; 1];
     let mut iov = libc::iovec {
