@@ -716,6 +716,33 @@ The diagnostic labels this as an inference. macOS only reports signals the
 supervisor observed directly. Successful exits and `SIGHUP`, `SIGINT`,
 `SIGPIPE`, and `SIGTERM` produce no diagnostic. The exit code is unchanged.
 
+`--teardown-report` (Linux) deals with processes that outlive the command,
+such as a dev server or watcher left running in the background. When the
+command exits, ai-jail lists every process still alive in the sandbox,
+sends each SIGTERM (and SIGCONT, so a stopped one can act on it), waits up to
+a fixed 2000 ms grace, then sends SIGKILL to the rest and lists the sandbox
+once more. A process that listing finds was started meanwhile, such as a
+worker a supervisor respawns on SIGTERM: it is not signalled again (the
+pid-namespace teardown ends it) and the report says `survivors-respawned`. When
+there were survivors it prints one line on stderr with the count and names
+of those it stopped, at most ten and then `+N more`; with none it prints
+nothing and adds no delay. The line is printed even under `--exec`.
+
+```bash
+ai-jail --teardown-report --exec sh -c 'sleep 300 & exit 0'
+# ⚠ 1 process outlived the command and was stopped: sleep
+```
+
+Survivors are named by `comm` only, the kernel's short command name; their
+command lines and environments are never read. The command's exit code is
+returned unchanged, including death by a signal. The in-sandbox wrapper
+reports to the supervisor on a descriptor the command cannot see or reopen.
+If that report is missing, malformed or incomplete (for example
+`survivors-respawned`, or `/proc` could not be read), one
+`Teardown report incomplete: <reason>` line says so, and the kernel's
+pid-namespace teardown ends whatever is left. On macOS the flag
+is accepted and changes nothing.
+
 ## Project secrets
 
 The project directory is writable by default, so secrets inside it are
