@@ -157,6 +157,10 @@ pub struct Config {
     /// under `--mask-host`. Runtime only, never saved.
     #[serde(default, skip)]
     pub overlay_system: bool,
+    /// `--syscall-view`: uname/sysinfo answered by ai-jail under
+    /// `--mask-host`. Runtime only, never saved.
+    #[serde(default, skip)]
+    pub syscall_view: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2388,6 +2392,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     }
     config.mask_host = cli.mask_host;
     config.overlay_system = cli.overlay_system;
+    config.syscall_view = cli.syscall_view;
 
     expand_user_paths(&mut config);
 
@@ -4563,6 +4568,7 @@ no_gpu = true
             runtime_harnesses: Vec::new(),
             mask_host: false,
             overlay_system: false,
+            syscall_view: false,
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -7954,6 +7960,7 @@ hide_dotdirs = [".my_secrets"]
             runtime_harnesses: Vec::new(),
             mask_host: false,
             overlay_system: false,
+            syscall_view: false,
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
