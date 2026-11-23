@@ -185,6 +185,10 @@ pub(super) fn meminfo(
         .map(|k| (*k, true))
         .collect();
     }
+    // Every value is padded to the total's width: free memory never
+    // exceeds it, so the live rewrite of `MemFree`/`MemAvailable` keeps the
+    // file's length (see `host_view::live_meminfo`).
+    let w = kib(memory).to_string().len().max(8);
     let mut out = String::new();
     for (key, in_kb) in keys {
         let value = match key {
@@ -199,9 +203,9 @@ pub(super) fn meminfo(
         };
         let label = format!("{key}:");
         if in_kb {
-            out.push_str(&format!("{label:<16}{value:>8} kB\n"));
+            out.push_str(&format!("{label:<16}{value:>w$} kB\n"));
         } else {
-            out.push_str(&format!("{label:<16}{value:>8}\n"));
+            out.push_str(&format!("{label:<16}{value:>w$}\n"));
         }
     }
     out

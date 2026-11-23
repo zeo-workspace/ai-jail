@@ -35,8 +35,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::host_view_extra as extra;
 use super::host_view_synth as synth;
-use super::host_view_uptime::UptimeTicker;
+use super::host_view_uptime::{LiveFile, UptimeTicker};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const SYS_CPU: &str = "/sys/devices/system/cpu";
@@ -55,6 +56,9 @@ pub(crate) struct HostViewRequest {
     /// Where the jail's machine id is kept between launches. `None` gives
     /// every launch a fresh id.
     pub machine_id_file: Option<PathBuf>,
+    /// `--overlay-system`: serve `/usr`, `/etc` and `/opt` through
+    /// read-only overlays (see `host_view_extra::overlay_mounts`).
+    pub overlay_system: bool,
 }
 
 /// The host as the jail's limits frame it, read once per launch.
@@ -148,9 +152,23 @@ fn cgroup_ancestry(dir: &Path, file: &str) -> Vec<String> {
 /// One mount of the host view; `bwrap.rs` turns it into arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum HostViewMount {
-    File { src: PathBuf, dest: PathBuf },
-    Dir { src: PathBuf, dest: PathBuf },
-    Tmpfs { dest: PathBuf },
+    File {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    Dir {
+        src: PathBuf,
+        dest: PathBuf,
+    },
+    Tmpfs {
+        dest: PathBuf,
+    },
+    /// A read-only overlay of `lower` over the empty directory `empty`.
+    RoOverlay {
+        lower: PathBuf,
+        empty: PathBuf,
+        dest: PathBuf,
+    },
 }
 
 /// What to write (relative to the view's directory) and what to mount.
@@ -172,12 +190,7 @@ pub(super) fn plan(
     dir: &Path,
     exists: &dyn Fn(&Path) -> bool,
 ) -> HostViewPlan {
-    let base = request
-        .cpus
-        .clone()
-        .or_else(|| snap.affinity.clone())
-        .unwrap_or_else(|| snap.host_cpus.clone());
-    let ids = synth::jail_cpu_ids(&base, snap.quota_cpus);
+    let ids = cpu_ids(snap, request);
     let mut out = HostViewPlan {
         uptime_cpus: ids.len(),
         ..HostViewPlan::default()
@@ -250,6 +263,20 @@ pub(super) fn plan(
     out
 }
 
+/// The CPU ids the jail is shown: its pinned or allowed set, narrowed to
+/// its CPU quota.
+pub(super) fn cpu_ids(
+    snap: &HostSnapshot,
+    request: &HostViewRequest,
+) -> BTreeSet<usize> {
+    let base = request
+        .cpus
+        .clone()
+        .or_else(|| snap.affinity.clone())
+        .unwrap_or_else(|| snap.host_cpus.clone());
+    synth::jail_cpu_ids(&base, snap.quota_cpus)
+}
+
 /// The view of one launch: its temp directory (removed on drop) and the
 /// mounts that put it in place.
 #[derive(Debug)]
@@ -286,16 +313,33 @@ impl HostView {
             Ok(_) => true,
             Err(_) => false,
         };
-        let plan = plan(&snap, &request, &machine_id, &dir, &exists);
+        let mut plan = plan(&snap, &request, &machine_id, &dir, &exists);
+        let identity = extra::HostIdentity::read(boot_id()?);
+        let ids = cpu_ids(&snap, &request);
+        extra::extend_plan(&mut plan, &identity, &ids, &dir, &exists);
+        if request.overlay_system {
+            plan.mounts.extend(extra::overlay_mounts(&dir, &exists));
+        }
         let mut view = HostView {
             dir,
             written: false,
             mounts: plan.mounts,
             uptime: None,
         };
-        if write && let Some(file) = view.write(&plan.files)? {
-            view.uptime =
-                Some(UptimeTicker::start(file, start, plan.uptime_cpus)?);
+        if write {
+            let (uptime, meminfo) = view.write(&plan.files)?;
+            if request.overlay_system {
+                view.make_empty_dir("overlay-empty")?;
+            }
+            let live = meminfo.map(|file| live_meminfo(file, &snap));
+            if let Some(file) = uptime {
+                view.uptime = Some(UptimeTicker::start(
+                    file,
+                    start,
+                    plan.uptime_cpus,
+                    live,
+                )?);
+            }
         }
         Ok(view)
     }
@@ -304,12 +348,23 @@ impl HostView {
         &self.mounts
     }
 
-    /// Write the files; returns `uptime` still open for writing, since the
-    /// ticker could not reopen it once it is read-only.
+    /// The empty bottom layer of `--overlay-system`'s overlays.
+    fn make_empty_dir(&self, name: &str) -> Result<(), String> {
+        let path = self.dir.join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&path)
+            .map_err(|e| {
+                format!("--mask-host: cannot create {}: {e}", path.display())
+            })
+    }
+
+    /// Write the files; returns `uptime` and `meminfo` still open for
+    /// writing, since the ticker could not reopen them once read-only.
     fn write(
         &mut self,
         files: &[(PathBuf, String)],
-    ) -> Result<Option<std::fs::File>, String> {
+    ) -> Result<(Option<std::fs::File>, Option<std::fs::File>), String> {
         let fail = |what: &Path, e: std::io::Error| {
             format!("--mask-host: cannot write {}: {e}", what.display())
         };
@@ -318,7 +373,7 @@ impl HostView {
             .create(&self.dir)
             .map_err(|e| fail(&self.dir, e))?;
         self.written = true;
-        let mut uptime = None;
+        let (mut uptime, mut meminfo) = (None, None);
         for (rel, text) in files {
             let path = self.dir.join(rel);
             if let Some(parent) = path.parent() {
@@ -344,9 +399,11 @@ impl HostView {
             .map_err(|e| fail(&path, e))?;
             if rel == Path::new("uptime") {
                 uptime = Some(f);
+            } else if rel == Path::new("meminfo") {
+                meminfo = Some(f);
             }
         }
-        Ok(uptime)
+        Ok((uptime, meminfo))
     }
 }
 
@@ -357,6 +414,38 @@ impl Drop for HostView {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// `/proc/meminfo` kept current: free memory follows the cgroup's
+/// `memory.current`, the rest stays as planned. `synth::meminfo` pads every
+/// value to the total's width, so a rewrite never changes the length.
+fn live_meminfo(file: std::fs::File, snap: &HostSnapshot) -> LiveFile {
+    let (memory, swap, host) = (
+        snap.memory_max.unwrap_or(0),
+        snap.swap_max,
+        snap.meminfo.clone(),
+    );
+    let current = snap.cgroup_dir.as_ref().map(|d| d.join("memory.current"));
+    LiveFile {
+        file,
+        render: Box::new(move || {
+            let used = current
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            synth::meminfo(memory, used, swap, &host)
+        }),
+    }
+}
+
+/// A fresh boot id for the jail.
+fn boot_id() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| format!("--mask-host: cannot read /dev/urandom: {e}"))?;
+    Ok(extra::format_boot_id(bytes))
 }
 
 /// A machine id in systemd's format (32 lowercase hex digits).

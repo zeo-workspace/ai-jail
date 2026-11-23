@@ -214,3 +214,141 @@ fn mask_host_uptime_counts_from_the_jail_start() {
     }
     assert_eq!(field(&out, "uptime_rc"), "0");
 }
+
+const IDENTITY_PROBE: &str = r#"
+echo "version=$(cat /proc/version)"
+echo "osrelease=$(cat /proc/sys/kernel/osrelease)"
+echo "osid=$(. /etc/os-release; echo "$ID")"
+echo "swaps=$(wc -l < /proc/swaps)"
+echo "crypttab=$(wc -c < /etc/crypttab 2>/dev/null || echo absent)"
+echo "partitions=$(wc -c < /proc/partitions)"
+echo "sysblock=$(ls /sys/block | wc -l)"
+echo "modules=$(ls /usr/lib/modules 2>/dev/null | wc -l)"
+echo "bootid=$(cat /proc/sys/kernel/random/boot_id)"
+echo "lscpu_threads=$(lscpu 2>/dev/null | awk -F: '/^Thread\(s\) per core/ {gsub(/ /,"",$2); print $2}')"
+echo "quiet_env=${AI_JAIL_QUIET:-unset}"
+echo "procstart=$(awk '{print $22}' /proc/self/stat)"
+echo "clk_tck=$(getconf CLK_TCK)"
+"#;
+
+#[test]
+fn mask_host_hides_the_kernel_build_distribution_and_disks() {
+    require_bwrap!();
+    let out = stdout(&jail(true, IDENTITY_PROBE));
+    let release = field(&out, "osrelease");
+    assert!(
+        release.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        "kernel suffix leaked: {release}"
+    );
+    let version = field(&out, "version");
+    assert!(
+        version.starts_with(&format!("Linux version {release} #")),
+        "{version:?}"
+    );
+    for leak in ["(", "@", "gcc", "clang", ":"] {
+        assert!(!version.contains(leak), "build detail in {version:?}");
+    }
+    assert_eq!(field(&out, "osid"), "linux");
+    assert_eq!(field(&out, "swaps"), "1", "{out}");
+    let crypttab = field(&out, "crypttab");
+    assert!(crypttab == "0" || crypttab == "absent", "{out}");
+    assert_eq!(field(&out, "partitions"), "0", "{out}");
+    assert_eq!(field(&out, "sysblock"), "0", "{out}");
+    assert_eq!(field(&out, "modules"), "0", "{out}");
+    let host_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap_or_default();
+    assert_ne!(field(&out, "bootid"), host_boot.trim());
+    let threads = field(&out, "lscpu_threads");
+    assert!(threads.is_empty() || threads == "1", "{out}");
+}
+
+#[test]
+fn mask_host_starts_the_boot_clock_at_the_jail() {
+    require_bwrap!();
+    if !std::path::Path::new("/proc/self/ns/time").exists() {
+        eprintln!("SKIPPED: no time namespaces in this kernel");
+        return;
+    }
+    let out = stdout(&jail(true, IDENTITY_PROBE));
+    // A process's start time is counted in ticks since boot, in the time
+    // namespace's own boot clock.
+    let start: f64 = field(&out, "procstart").parse().unwrap();
+    let tck: f64 = field(&out, "clk_tck").parse().unwrap();
+    assert!(start / tck < 60.0, "boot clock is the host's:\n{out}");
+}
+
+#[test]
+fn the_agent_does_not_inherit_the_quiet_marker() {
+    require_bwrap!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let out = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-save-config",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "--exec",
+            "sh",
+            "-c",
+            "echo quiet_env=${AI_JAIL_QUIET:-unset}",
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    assert_eq!(field(&stdout(&out), "quiet_env"), "unset");
+}
+
+#[test]
+fn overlay_system_hides_the_disk_behind_the_system_trees() {
+    require_bwrap!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let script = r#"
+awk '$5=="/usr" || $5=="/etc" {print "src" $5 "=" $(NF-1)}' /proc/self/mountinfo
+echo "hosts=$(wc -c < /etc/hosts)"
+echo "crypttab=$(wc -c < /etc/crypttab 2>/dev/null || echo absent)"
+echo "usrmode=$(stat -c %a /usr)"
+git --version >/dev/null && echo git=ok
+"#;
+    let out = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-save-config",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "--mask-host",
+            "--overlay-system",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    let text = stdout(&out);
+    assert_eq!(field(&text, "src/usr"), "overlay", "{text}");
+    assert_eq!(field(&text, "src/etc"), "overlay", "{text}");
+    // Binds made inside /etc after the base mounts still land on top.
+    assert_ne!(field(&text, "hosts"), "0", "{text}");
+    let crypttab = field(&text, "crypttab");
+    assert!(crypttab == "0" || crypttab == "absent", "{text}");
+    assert_eq!(field(&text, "usrmode"), "755", "{text}");
+    assert_eq!(field(&text, "git"), "ok", "{text}");
+}
+
+#[test]
+fn overlay_system_alone_is_refused() {
+    let out = Command::new(ai_jail())
+        .args(["--clean", "--no-save-config", "--overlay-system", "true"])
+        .output()
+        .expect("failed to spawn ai-jail");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--mask-host"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

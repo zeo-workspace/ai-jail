@@ -68,6 +68,12 @@ enum Mount {
         work: PathBuf,
         dest: PathBuf,
     },
+    /// Read-only overlay of `layers`, lowest first (`--mask-host
+    /// --overlay-system`).
+    RoOverlay {
+        layers: Vec<PathBuf>,
+        dest: PathBuf,
+    },
 }
 
 impl Mount {
@@ -84,6 +90,10 @@ impl Mount {
                 work,
                 dest,
             } => vec![(lower, dest), (upper, dest), (work, dest)],
+            Mount::RoOverlay { layers, dest } => layers
+                .iter()
+                .map(|l| (l.as_path(), dest.as_path()))
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -98,7 +108,8 @@ impl Mount {
             | Mount::Proc { dest }
             | Mount::Tmpfs { dest }
             | Mount::Symlink { dest, .. }
-            | Mount::Overlay { dest, .. } => dest,
+            | Mount::Overlay { dest, .. }
+            | Mount::RoOverlay { dest, .. } => dest,
         }
     }
 
@@ -157,6 +168,18 @@ impl Mount {
                     work.display().to_string(),
                     dest.display().to_string(),
                 ]
+            }
+            Mount::RoOverlay { layers, dest } => {
+                // Each `--overlay-src` adds a layer above the previous one;
+                // `--ro-overlay` mounts them with no writable layer.
+                let mut args = Vec::new();
+                for layer in layers {
+                    args.push("--overlay-src".into());
+                    args.push(layer.display().to_string());
+                }
+                args.push("--ro-overlay".into());
+                args.push(dest.display().to_string());
+                args
             }
         }
     }
@@ -652,8 +675,11 @@ impl SandboxGuard {
 
 /// What the launch adds to the host view beyond the limits ai-jail reads
 /// from its own cgroup and affinity.
-fn host_view_request(_config: &Config) -> super::host_view::HostViewRequest {
-    super::host_view::HostViewRequest::default()
+fn host_view_request(config: &Config) -> super::host_view::HostViewRequest {
+    super::host_view::HostViewRequest {
+        overlay_system: config.overlay_system,
+        ..Default::default()
+    }
 }
 
 /// Put `--mask-host`'s view over the base mounts.
@@ -662,9 +688,25 @@ fn apply_host_view(
     view: &super::host_view::HostView,
 ) {
     use super::host_view::HostViewMount;
+    // An overlay replaces the base bind of its tree in place: appended
+    // after it, it would cover the binds made inside that tree since
+    // (/etc/hosts, resolv.conf) and the view's own masks.
+    for m in view.mounts() {
+        if let HostViewMount::RoOverlay { lower, empty, dest } = m {
+            for base in &mut mount_set.base {
+                if matches!(base, Mount::RoBind { dest: d, .. } if d == dest) {
+                    *base = Mount::RoOverlay {
+                        layers: vec![empty.clone(), lower.clone()],
+                        dest: dest.clone(),
+                    };
+                }
+            }
+        }
+    }
     mount_set.host_view = view
         .mounts()
         .iter()
+        .filter(|m| !matches!(m, HostViewMount::RoOverlay { .. }))
         .map(|m| match m {
             HostViewMount::File { src, dest } => Mount::FileRoBind {
                 src: src.clone(),
@@ -674,7 +716,8 @@ fn apply_host_view(
                 src: src.clone(),
                 dest: dest.clone(),
             },
-            HostViewMount::Tmpfs { dest } => {
+            HostViewMount::Tmpfs { dest }
+            | HostViewMount::RoOverlay { dest, .. } => {
                 Mount::Tmpfs { dest: dest.clone() }
             }
         })
@@ -1652,6 +1695,18 @@ pub fn build(
     // posix_spawn does not reliably pass a non-stdio fd through. (#147)
     let proc_path = std::ffi::CString::new(format!("/proc/self/fd/{args_fd}"))
         .map_err(|e| format!("building bwrap args fd path: {e}"))?;
+    // `--mask-host`: the jail's clocks start at its launch. The supervisor
+    // that execs bwrap enters the namespace (host_view_timens).
+    if config.mask_host {
+        match super::host_view_timens::TimeNamespace::prepare() {
+            Some(ns) => {
+                cmd.env(super::host_view_timens::ENV, ns.offsets());
+            }
+            None => crate::output::warn(
+                "--mask-host: no time namespaces in this kernel (CONFIG_TIME_NS); uptime and boot clocks stay the host's",
+            ),
+        }
+    }
     // SAFETY: the closure calls only async-signal-safe libc functions.
     unsafe {
         cmd.pre_exec(move || {

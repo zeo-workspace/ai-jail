@@ -5,6 +5,9 @@
 //! Every write has the same length (`synth::UPTIME_LEN`) and lands at offset
 //! 0 in one `pwrite`, so a reader sees one value or the next, never a file
 //! that shrank or grew. The thread lives exactly as long as the view.
+//!
+//! The same thread keeps `/proc/meminfo`'s free memory current when a
+//! memory limit applies (`LiveFile`), under the same fixed-length rule.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -16,6 +19,19 @@ use std::time::{Duration, Instant};
 use super::host_view_synth as synth;
 
 const TICK: Duration = Duration::from_secs(1);
+
+/// Another synthetic file rewritten every tick: `render` must always
+/// return text of one length.
+pub(super) struct LiveFile {
+    pub file: File,
+    pub render: Box<dyn Fn() -> String + Send>,
+}
+
+impl std::fmt::Debug for LiveFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveFile").finish_non_exhaustive()
+    }
+}
 
 /// Keeps one `/proc/uptime` file current; stopped and joined on drop.
 #[derive(Debug)]
@@ -31,6 +47,7 @@ impl UptimeTicker {
         file: File,
         start: Instant,
         cpus: usize,
+        live: Option<LiveFile>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -47,6 +64,10 @@ impl UptimeTicker {
                     // A failed write leaves the last value in place; the
                     // jail keeps running either way.
                     let _ = file.write_all_at(text.as_bytes(), 0);
+                    if let Some(live) = &live {
+                        let text = (live.render)();
+                        let _ = live.file.write_all_at(text.as_bytes(), 0);
+                    }
                 }
             })
             .map_err(|e| format!("--mask-host: cannot start uptime: {e}"))?;
