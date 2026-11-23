@@ -1930,6 +1930,17 @@ pub struct BridgeSockets {
     pub publish: Vec<(u16, PathBuf)>,
 }
 
+/// Transparent egress plumbing for one launch (Linux): the fds bwrap
+/// reports on and blocks on, and the resolv.conf naming the fake resolver.
+/// Read only by the bwrap path; macOS has no transparent egress.
+#[derive(Clone, Copy)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub struct TransparentFds<'a> {
+    pub info_fd: std::os::fd::RawFd,
+    pub block_fd: std::os::fd::RawFd,
+    pub resolv: &'a Path,
+}
+
 /// Build the sandbox command.
 ///
 /// `sandbox_tty` is the device the child will use as its terminal, when
@@ -1959,6 +1970,7 @@ pub fn build(
     proxy: Option<&crate::proxy::Proxy>,
     bridge_sockets: &BridgeSockets,
     teardown_report_fd: Option<std::os::fd::RawFd>,
+    transparent: Option<TransparentFds<'_>>,
 ) -> Result<Command, String> {
     #[cfg(target_os = "linux")]
     {
@@ -1971,12 +1983,13 @@ pub fn build(
             proxy.and_then(|p| p.unix_path()),
             bridge_sockets,
             teardown_report_fd,
+            transparent,
         )
     }
     #[cfg(target_os = "macos")]
     {
-        // No teardown report on macOS.
-        let _ = (guard, bridge_sockets, teardown_report_fd);
+        // No teardown report or transparent egress on macOS.
+        let _ = (guard, bridge_sockets, teardown_report_fd, transparent);
         let prepared = prepare_seatbelt_config(config)?;
         seatbelt::build(
             &prepared,
