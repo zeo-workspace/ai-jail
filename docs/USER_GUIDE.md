@@ -666,6 +666,16 @@ sandbox's host name, its age as uptime, no load, memory sized to `--memory`.
 Each of those calls costs a round trip to ai-jail; only the native
 architecture is trapped.
 
+`--minimal-etc` (with `--mask-host` only; never saved) makes `/etc` a
+read-only tmpfs holding only the host entries programs read at run time --
+accounts, name service, TLS roots, time zone and locale, the linker cache,
+shell startup, the system git and npm configuration, interpreter selection
+(`python-exec`, `java-config-2`, `eselect`, `alternatives`) and Claude Code's
+`managed-settings.json` -- so `hostname`, `fstab`, `ssh/` and every service's
+configuration are absent. Symlinks are recreated and resolve inside the
+sandbox. The full list, with the reason for each entry, is in
+`src/sandbox/minimal_etc.rs`.
+
 A nested sandbox can no longer mount its own `/proc` under `--mask-host`; with
 ai-jail's default Landlock and seccomp a nested sandbox is refused anyway, so
 this matters only under `--no-landlock --no-seccomp`. The `cpuid` instruction,
