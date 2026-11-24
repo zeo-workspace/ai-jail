@@ -74,6 +74,11 @@ enum Mount {
         layers: Vec<PathBuf>,
         dest: PathBuf,
     },
+    /// Make an earlier mount point read-only (`--minimal-etc`'s tmpfs,
+    /// once every mount inside it is made).
+    RemountRo {
+        dest: PathBuf,
+    },
 }
 
 impl Mount {
@@ -109,7 +114,8 @@ impl Mount {
             | Mount::Tmpfs { dest }
             | Mount::Symlink { dest, .. }
             | Mount::Overlay { dest, .. }
-            | Mount::RoOverlay { dest, .. } => dest,
+            | Mount::RoOverlay { dest, .. }
+            | Mount::RemountRo { dest } => dest,
         }
     }
 
@@ -144,6 +150,9 @@ impl Mount {
             }
             Mount::Tmpfs { dest } => {
                 vec!["--tmpfs".into(), dest.display().to_string()]
+            }
+            Mount::RemountRo { dest } => {
+                vec!["--remount-ro".into(), dest.display().to_string()]
             }
             Mount::Symlink { src, dest } => {
                 vec![
@@ -270,6 +279,10 @@ struct MountSet {
     /// inside the sandbox. Applied last so it sits on top of the
     /// project mount that contains it.
     overlay_hide: Vec<Mount>,
+    /// `--minimal-etc`: `--remount-ro /etc`, after every group, since a
+    /// later bind under `/etc` (the host view's, ssh's tmpfs) may need to
+    /// create its mount point in the tmpfs first.
+    etc_seal: Vec<Mount>,
 }
 
 impl MountSet {
@@ -291,7 +304,7 @@ impl MountSet {
             .chain(self.extra.iter())
             .chain(self.extra_inside.iter())
     }
-    fn ordered_mounts(&self) -> [&[Mount]; 30] {
+    fn ordered_mounts(&self) -> [&[Mount]; 31] {
         [
             &self.base,
             &self.sys_masks,
@@ -323,6 +336,7 @@ impl MountSet {
             &self.mask,
             &self.deny,
             &self.overlay_hide,
+            &self.etc_seal,
         ]
     }
 
@@ -713,8 +727,13 @@ fn host_view_request(config: &Config) -> super::host_view::HostViewRequest {
 fn apply_host_view(
     mount_set: &mut MountSet,
     view: &super::host_view::HostView,
+    minimal_etc: bool,
 ) {
     use super::host_view::HostViewMount;
+    // First, so the overlay below finds no /etc bind to replace.
+    if minimal_etc {
+        apply_minimal_etc(mount_set, Path::new("/etc"));
+    }
     // An overlay replaces the base bind of its tree in place: appended
     // after it, it would cover the binds made inside that tree since
     // (/etc/hosts, resolv.conf) and the view's own masks.
@@ -734,6 +753,13 @@ fn apply_host_view(
         .mounts()
         .iter()
         .filter(|m| !matches!(m, HostViewMount::RoOverlay { .. }))
+        .filter(|m| {
+            let (HostViewMount::File { dest, .. }
+            | HostViewMount::Dir { dest, .. }
+            | HostViewMount::Tmpfs { dest }
+            | HostViewMount::RoOverlay { dest, .. }) = m;
+            !minimal_etc || super::minimal_etc::keeps_host_view_mount(dest)
+        })
         .map(|m| match m {
             HostViewMount::File { src, dest } => Mount::FileRoBind {
                 src: src.clone(),
@@ -750,6 +776,34 @@ fn apply_host_view(
         })
         .collect();
     mount_set.unshare_cgroup = true;
+}
+
+/// `--minimal-etc`: replace the base bind of `/etc` with a tmpfs holding
+/// the allowlisted entries of `host_etc`, in place, so the binds the base
+/// makes inside `/etc` after it (hosts, resolv.conf) still land on top.
+/// A host without `/etc` is left alone.
+fn apply_minimal_etc(mount_set: &mut MountSet, host_etc: &Path) {
+    use super::minimal_etc::EtcEntry;
+    let etc = Path::new("/etc");
+    let Some(at) = mount_set
+        .base
+        .iter()
+        .position(|m| matches!(m, Mount::RoBind { dest, .. } if dest == etc))
+    else {
+        return;
+    };
+    let mut mounts = vec![Mount::Tmpfs { dest: etc.into() }];
+    mounts.extend(super::minimal_etc::entries(host_etc).into_iter().map(
+        |entry| match entry {
+            EtcEntry::Dir { src, dest } => Mount::RoBind { src, dest },
+            EtcEntry::File { src, dest } => Mount::FileRoBind { src, dest },
+            EtcEntry::Symlink { target, dest } => {
+                Mount::Symlink { src: target, dest }
+            }
+        },
+    ));
+    mount_set.base.splice(at..=at, mounts);
+    mount_set.etc_seal = vec![Mount::RemountRo { dest: etc.into() }];
 }
 
 impl Drop for SandboxGuard {
@@ -1666,7 +1720,11 @@ pub fn build(
     let mut mount_set =
         discover_mounts_full(config, project_dir, &sources, verbose)?;
     if config.mask_host {
-        apply_host_view(&mut mount_set, guard.host_view(config, true)?);
+        apply_host_view(
+            &mut mount_set,
+            guard.host_view(config, true)?,
+            config.minimal_etc,
+        );
         if verbose {
             crate::output::verbose(
                 "Host view: synthetic CPU, memory and load files, own cgroup, no DMI (--mask-host)",
@@ -1981,7 +2039,7 @@ fn build_dry_run_args_forwarded(
     let mut mount_set =
         discover_mounts_full(config, project_dir, sources, verbose)?;
     if let Some(view) = host_view {
-        apply_host_view(&mut mount_set, view);
+        apply_host_view(&mut mount_set, view, config.minimal_etc);
     }
     let map_args = mounted_map_args(mount_set.landlock_map_mounts());
     let lockdown = config.lockdown_enabled();
@@ -2336,6 +2394,8 @@ fn discover_mounts_full(
         mask: mask_mounts,
         deny: deny_mounts,
         overlay_hide: overlay_hide_v,
+        // Filled by apply_minimal_etc under --minimal-etc.
+        etc_seal: Vec::new(),
         // Filled by apply_host_view under --mask-host.
         host_view: Vec::new(),
         unshare_cgroup: false,
@@ -5459,6 +5519,113 @@ mod tests {
         .unwrap();
         assert!(!plain.iter().any(|a| a == "--unshare-cgroup"));
         assert!(!plain.iter().any(|a| a == "/proc/cpuinfo"));
+    }
+
+    #[test]
+    fn minimal_etc_replaces_the_etc_bind_in_place() {
+        let host_etc = std::env::temp_dir()
+            .join(format!("ai-jail-bwrap-minimal-etc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host_etc);
+        std::fs::create_dir_all(host_etc.join("ssl")).unwrap();
+        std::fs::write(host_etc.join("passwd"), "root:x:0:0::/:/bin/sh\n")
+            .unwrap();
+        std::fs::write(host_etc.join("hostname"), "host\n").unwrap();
+        std::os::unix::fs::symlink(
+            "../usr/share/zoneinfo/UTC",
+            host_etc.join("localtime"),
+        )
+        .unwrap();
+        let mut set = MountSet {
+            base: vec![
+                Mount::RoBind {
+                    src: "/usr".into(),
+                    dest: "/usr".into(),
+                },
+                Mount::RoBind {
+                    src: "/etc".into(),
+                    dest: "/etc".into(),
+                },
+                Mount::FileRoBind {
+                    src: "/tmp/hosts".into(),
+                    dest: "/etc/hosts".into(),
+                },
+            ],
+            ..MountSet::default()
+        };
+        apply_minimal_etc(&mut set, &host_etc);
+        let _ = std::fs::remove_dir_all(&host_etc);
+        let args = set.all_mount_args();
+        let at = |needle: &[&str]| {
+            args.windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {args:?}"))
+        };
+        let tmpfs = at(&["--tmpfs", "/etc"]);
+        let passwd = at(&[
+            "--ro-bind",
+            &host_etc.join("passwd").display().to_string(),
+            "/etc/passwd",
+        ]);
+        let ssl = at(&[
+            "--ro-bind",
+            &host_etc.join("ssl").display().to_string(),
+            "/etc/ssl",
+        ]);
+        let localtime =
+            at(&["--symlink", "../usr/share/zoneinfo/UTC", "/etc/localtime"]);
+        let hosts = at(&["--ro-bind", "/tmp/hosts", "/etc/hosts"]);
+        let seal = at(&["--remount-ro", "/etc"]);
+        assert!(at(&["--ro-bind", "/usr", "/usr"]) < tmpfs);
+        for entry in [passwd, ssl, localtime] {
+            assert!(tmpfs < entry && entry < hosts, "{args:?}");
+        }
+        assert_eq!(seal, args.len() - 2, "the seal comes last: {args:?}");
+        assert!(!args.iter().any(|a| a == "/etc/hostname"), "{args:?}");
+        assert!(
+            !args.windows(3).any(|w| w == ["--ro-bind", "/etc", "/etc"]),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn minimal_etc_without_an_etc_bind_changes_nothing() {
+        let mut set = MountSet::default();
+        apply_minimal_etc(&mut set, Path::new("/etc"));
+        assert!(set.all_mount_args().is_empty());
+    }
+
+    #[test]
+    fn minimal_etc_drops_the_host_view_masks_of_absent_entries() {
+        let guard =
+            SandboxGuard::test_with_hosts(PathBuf::from("/tmp/test-hosts"));
+        let config = Config {
+            mask_host: true,
+            minimal_etc: true,
+            ..minimal_test_config()
+        };
+        let sources = MountSources::from_guard(&guard);
+        let view = guard.host_view(&config, false).unwrap();
+        let args = build_dry_run_args_forwarded(
+            &config,
+            &std::env::temp_dir(),
+            &sources,
+            false,
+            None,
+            &crate::sandbox::BridgeSockets::default(),
+            Some(view),
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|w| w == ["--tmpfs", "/etc"]));
+        assert!(args.windows(2).any(|w| w == ["--remount-ro", "/etc"]));
+        for absent in ["/etc/crypttab", "/etc/portage", "/etc/gentoo-release"] {
+            assert!(!args.iter().any(|a| a == absent), "{absent}: {args:?}");
+        }
+        // The view's own machine-id still lands on top of the tmpfs.
+        if Path::new("/etc/machine-id").is_file() {
+            let tmpfs = args.iter().position(|a| a == "/etc").unwrap();
+            let id = args.iter().position(|a| a == "/etc/machine-id").unwrap();
+            assert!(id > tmpfs, "{args:?}");
+        }
     }
 
     #[test]
