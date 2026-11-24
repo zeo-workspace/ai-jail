@@ -83,8 +83,8 @@ or integration rather than saved sandbox authority.
 - Host view: `--mask-host` (a per-run choice made by the caller --
   typically a wrapper such as an editor -- not saved authority: no
   configuration key, refused on macOS; it only narrows what the sandbox
-  reads), and `--overlay-system` and `--syscall-view` with it (the same per-run
-  choice; each refused without `--mask-host`)
+  reads), and `--overlay-system`, `--syscall-view` and `--minimal-etc` with it
+  (the same per-run choice; each refused without `--mask-host`)
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

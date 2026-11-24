@@ -70,6 +70,8 @@ mod host_view_synth;
 #[cfg(target_os = "linux")]
 pub(crate) mod host_view_timens;
 #[cfg(target_os = "linux")]
+mod minimal_etc;
+#[cfg(target_os = "linux")]
 mod syscall_view;
 
 /// In the helper: install `--syscall-view`'s notify filter and hand its
@@ -1983,7 +1985,11 @@ pub fn build(
     #[cfg(target_os = "macos")]
     {
         let _ = (guard, bridge_sockets);
-        if config.mask_host || config.overlay_system || config.syscall_view {
+        if config.mask_host
+            || config.overlay_system
+            || config.syscall_view
+            || config.minimal_etc
+        {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
@@ -2019,7 +2025,11 @@ pub fn dry_run(
     #[cfg(target_os = "macos")]
     {
         let _ = (guard, bridge_sockets);
-        if config.mask_host || config.overlay_system || config.syscall_view {
+        if config.mask_host
+            || config.overlay_system
+            || config.syscall_view
+            || config.minimal_etc
+        {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
