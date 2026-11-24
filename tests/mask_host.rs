@@ -420,10 +420,11 @@ fn minimal_etc_keeps_only_the_allowlist_and_the_tools_working() {
     let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let script = r#"
 echo "count=$(ls -A /etc | wc -l)"
-for f in passwd hosts hostname fstab crypttab portage shadow; do
+for f in passwd hosts fstab crypttab portage shadow; do
   if [ -e /etc/$f ] || [ -L /etc/$f ]; then echo "$f=present"; else echo "$f=absent"; fi
 done
 echo "hosts_size=$(wc -c < /etc/hosts)"
+echo "etc_hostname=$(cat /etc/hostname 2>/dev/null || echo none)"
 echo "user=$(id -un 2>/dev/null || echo none)"
 echo "src=$(awk '$5=="/etc" {print $(NF-2)}' /proc/self/mountinfo | tail -1)"
 touch /etc/probe 2>/dev/null && echo writable=yes || echo writable=no
@@ -452,8 +453,12 @@ sh -lc 'echo login=ok'
     let host_count = std::fs::read_dir("/etc").map_or(0, Iterator::count);
     let count: usize = field(&text, "count").parse().unwrap();
     assert!(count < host_count || host_count < 40, "{count}: {text}");
-    for absent in ["hostname", "fstab", "crypttab", "portage", "shadow"] {
+    for absent in ["fstab", "crypttab", "portage", "shadow"] {
         assert_eq!(field(&text, absent), "absent", "{absent}: {text}");
+    }
+    // Not the host's: the sandbox's own, bound over the tmpfs.
+    if std::path::Path::new("/etc/hostname").exists() {
+        assert_eq!(field(&text, "etc_hostname"), "ai-sandbox", "{text}");
     }
     if std::path::Path::new("/etc/passwd").exists() {
         assert_eq!(field(&text, "passwd"), "present", "{text}");
@@ -479,6 +484,63 @@ fn minimal_etc_alone_is_refused() {
     assert!(
         String::from_utf8_lossy(&out.stderr)
             .contains("--minimal-etc requires --mask-host"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn hostname_names_the_jail_everywhere_it_reads_one() {
+    require_bwrap!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let script = r#"
+echo "uts=$(uname -n)"
+echo "etc_hostname=$(cat /etc/hostname 2>/dev/null || echo none)"
+grep -q ' desktop-k3f9a2$' /etc/hosts && echo hosts=named || echo hosts=other
+"#;
+    let out = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-save-config",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "--mask-host",
+            "--syscall-view",
+            "--hostname",
+            "desktop-k3f9a2",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    let text = stdout(&out);
+    // uname(2) here is answered by --syscall-view, so both halves agree.
+    assert_eq!(field(&text, "uts"), "desktop-k3f9a2", "{text}");
+    assert_eq!(field(&text, "hosts"), "named", "{text}");
+    if std::path::Path::new("/etc/hostname").exists() {
+        assert_eq!(field(&text, "etc_hostname"), "desktop-k3f9a2", "{text}");
+    }
+}
+
+#[test]
+fn hostname_that_is_not_one_label_is_refused() {
+    let out = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-save-config",
+            "--hostname",
+            "evil.example",
+            "true",
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--hostname"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
