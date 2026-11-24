@@ -37,9 +37,6 @@ use nix::libc;
 /// The internal flag that carries the helper's end of the socket pair.
 pub(crate) const FD_FLAG: &str = "--syscall-view-fd";
 
-/// The jail's host name, as bwrap's `--hostname` sets it.
-pub(crate) const JAIL_HOSTNAME: &str = "ai-sandbox";
-
 #[cfg(target_arch = "x86_64")]
 const NATIVE_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
 #[cfg(target_arch = "aarch64")]
@@ -58,6 +55,8 @@ const POLL: Duration = Duration::from_millis(200);
 /// What the jail is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Answers {
+    /// The jail's host name, as bwrap's `--hostname` sets it.
+    pub hostname: String,
     pub release: String,
     pub version: String,
     pub machine: String,
@@ -74,7 +73,7 @@ pub(super) fn utsname_bytes(a: &Answers) -> [u8; UTSNAME_LEN] {
     let mut out = [0u8; UTSNAME_LEN];
     for (i, value) in [
         "Linux",
-        JAIL_HOSTNAME,
+        a.hostname.as_str(),
         a.release.as_str(),
         a.version.as_str(),
         a.machine.as_str(),
@@ -424,7 +423,7 @@ fn answer_one(
 
 /// The answers for this host, from the same cleaning as the host view's
 /// files and the jail's cgroup limits.
-pub(crate) fn answers_for_host() -> Answers {
+pub(crate) fn answers_for_host(hostname: &str) -> Answers {
     let identity = super::host_view_extra::HostIdentity::read(String::new());
     let snap = super::host_view::HostSnapshot::read();
     // SAFETY: zeroed utsname is valid; uname fills it.
@@ -439,6 +438,7 @@ pub(crate) fn answers_for_host() -> Answers {
         }
     };
     Answers {
+        hostname: hostname.to_string(),
         release: super::host_view_extra::kernel_release(&identity.osrelease),
         version: super::host_view_extra::kernel_version(&identity.version),
         machine,
