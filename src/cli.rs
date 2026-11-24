@@ -224,6 +224,9 @@ OPTIONS:
     --syscall-view                 With --mask-host: answer uname(2) and sysinfo(2) from
                                    ai-jail, so the kernel release, memory, load and uptime
                                    they report match the host view (Linux; never saved)
+    --minimal-etc                  With --mask-host: /etc is a read-only tmpfs holding only
+                                   what programs read at run time (accounts, name service,
+                                   TLS roots, time zone, shell startup) (Linux; never saved)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -305,6 +308,7 @@ pub struct CliArgs {
     pub mask_host: bool,
     pub overlay_system: bool,
     pub syscall_view: bool,
+    pub minimal_etc: bool,
     /// Internal: the helper's end of the `--syscall-view` socket pair.
     pub syscall_view_fd: Option<i32>,
     pub agent_state: Option<bool>,
@@ -619,6 +623,9 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("syscall-view") => {
                 args.syscall_view = true;
+            }
+            Long("minimal-etc") => {
+                args.minimal_etc = true;
             }
             Long("syscall-view-fd") => {
                 if !args.landlock_exec {
@@ -1517,6 +1524,7 @@ const INTERFACE_UNDOCUMENTED_BASELINE: &[&str] = &[
     "--mask-host",
     "--overlay-system",
     "--syscall-view",
+    "--minimal-etc",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -3264,6 +3272,15 @@ mod tests {
         let args =
             parse_test(&["--mask-host", "--overlay-system", "claude"]).unwrap();
         assert!(args.mask_host && args.overlay_system);
+    }
+
+    #[test]
+    fn parse_minimal_etc() {
+        assert!(!parse_test(&["claude"]).unwrap().minimal_etc);
+        let args =
+            parse_test(&["--mask-host", "--minimal-etc", "claude"]).unwrap();
+        assert!(args.mask_host && args.minimal_etc);
+        assert!(HELP.contains("--minimal-etc"));
     }
 
     #[test]
