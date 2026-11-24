@@ -1564,6 +1564,7 @@ fn global_config_example_is_inert_and_documents_public_keys() {
                     | "overlay_system"
                     | "syscall_view"
                     | "minimal_etc"
+                    | "hostname"
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -11395,6 +11396,7 @@ mod profile_field_coverage_tests {
         "overlay_system",
         "syscall_view",
         "minimal_etc",
+        "hostname",
     ];
 
     fn config_fields() -> Vec<String> {
