@@ -202,6 +202,9 @@ OPTIONS:
     --minimal-etc                  With --mask-host: /etc is a read-only tmpfs holding only
                                    what programs read at run time (accounts, name service,
                                    TLS roots, time zone, shell startup) (Linux; never saved)
+    --hostname <NAME>              The jail's host name, one DNS label: uname, /etc/hosts,
+                                   /etc/hostname and --syscall-view all read it (Linux;
+                                   never saved; default ai-sandbox)
     --clean                        Ignore saved and legacy project policy, start fresh
     --dry-run                      Print the sandbox command without executing
     --init                         Create/update external per-project config and exit
@@ -272,6 +275,7 @@ pub struct CliArgs {
     pub overlay_system: bool,
     pub syscall_view: bool,
     pub minimal_etc: bool,
+    pub hostname: Option<String>,
     /// Internal: the helper's end of the `--syscall-view` socket pair.
     pub syscall_view_fd: Option<i32>,
     pub agent_state: Option<bool>,
@@ -529,6 +533,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("minimal-etc") => {
                 args.minimal_etc = true;
+            }
+            Long("hostname") => {
+                let val = parser.value().map_err(|e| e.to_string())?;
+                args.hostname = Some(val.to_string_lossy().into_owned());
             }
             Long("syscall-view-fd") => {
                 if !args.landlock_exec {
@@ -1173,6 +1181,7 @@ const SANDBOX_LONG_FLAGS: &[&str] = &[
     "--overlay-system",
     "--syscall-view",
     "--minimal-etc",
+    "--hostname",
     "--x11",
     "--no-x11",
     "--host-shm",
@@ -2760,6 +2769,16 @@ mod tests {
         let args =
             parse_test(&["--mask-host", "--overlay-system", "claude"]).unwrap();
         assert!(args.mask_host && args.overlay_system);
+    }
+
+    #[test]
+    fn parse_hostname() {
+        assert_eq!(parse_test(&["claude"]).unwrap().hostname, None);
+        let args =
+            parse_test(&["--hostname", "desktop-k3f9a2", "claude"]).unwrap();
+        assert_eq!(args.hostname.as_deref(), Some("desktop-k3f9a2"));
+        assert_eq!(args.command, vec!["claude".to_string()]);
+        assert!(HELP.contains("--hostname"));
     }
 
     #[test]

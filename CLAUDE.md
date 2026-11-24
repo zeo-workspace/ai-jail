@@ -177,7 +177,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 
 The bwrap command mounts are order-dependent. The sequence in `sandbox/bwrap.rs` must be:
 
-1. Base mounts (`/usr`, `/etc`, `/opt`, `/sys`, `/dev`, `/proc`, `/tmp`, `/run`). Under `--mask-host --minimal-etc` the `/etc` bind is replaced in place by a tmpfs and its allowlisted entries, so the hosts and resolv.conf binds that follow still land on it; a `--remount-ro /etc` is emitted after every discovered group, because later groups (the host view, ssh's `ssh_config.d` tmpfs) may create mount points inside it
+1. Base mounts (`/usr`, `/etc`, `/opt`, `/sys`, `/dev`, `/proc`, `/tmp`, `/run`). Under `--mask-host --minimal-etc` the `/etc` bind is replaced in place by a tmpfs and its allowlisted entries, so the hosts and resolv.conf binds that follow still land on it, as does the sandbox's `/etc/hostname` (naming `--hostname`, or `ai-sandbox`), bound last in the base; a `--remount-ro /etc` is emitted after every discovered group, because later groups (the host view, ssh's `ssh_config.d` tmpfs) may create mount points inside it
 2. Sensitive /sys masks (tmpfs over `/sys/firmware`, `/sys/kernel/security`, etc.)
 3. GPU devices, then KVM device (`--kvm`, `/dev/kvm`)
 4. Docker socket

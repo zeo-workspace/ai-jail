@@ -1192,6 +1192,7 @@ pub(crate) fn save_project_grants(
     grants.overlay_system = false;
     grants.syscall_view = false;
     grants.minimal_etc = false;
+    grants.hostname = None;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1503,6 +1504,7 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("overlay_system", Restriction),
     excluded_policy!("syscall_view", Restriction),
     excluded_policy!("minimal_etc", Restriction),
+    excluded_policy!("hostname", Preference),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -2284,6 +2286,7 @@ mod tests {
         expected_excluded!("overlay_system", Restriction),
         expected_excluded!("syscall_view", Restriction),
         expected_excluded!("minimal_etc", Restriction),
+        expected_excluded!("hostname", Preference),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2401,6 +2404,9 @@ mod tests {
             }
             "minimal_etc" => {
                 config.minimal_etc = true;
+            }
+            "hostname" => {
+                config.hostname = Some("desktop-k3f9a2".into());
             }
             "command" => {
                 config.command =

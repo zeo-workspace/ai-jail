@@ -817,6 +817,17 @@ the tmpfs is remounted read-only once the binds inside it are made. With
 `--overlay-system`, the entries bound into it still name the host's disk in
 `/proc/self/mountinfo`; `/etc` itself reads `tmpfs`.
 
+`--hostname NAME` gives the sandbox a host name other than `ai-sandbox`, so a
+caller can make each project look like a machine of its own. One name
+everywhere the sandbox can read one: `uname -n` and `hostname` (bwrap's UTS
+namespace), the sandbox's `/etc/hosts`, an `/etc/hostname` bound over the
+host's, and `uname(2)` under `--syscall-view`. That `/etc/hostname` is new for
+every sandbox: the host's, bound with the rest of `/etc`, named this machine,
+so even without `--hostname` it now reads `ai-sandbox`. The name must be one
+DNS label -- 1 to 63 lowercase letters, digits and hyphens, not starting or
+ending with a hyphen -- and is refused otherwise. It needs no `--mask-host`,
+is never saved, and is ignored on macOS.
+
 The allowed CPUs are the process's affinity (`taskset`), trimmed to the
 cgroup's `cpu.max` rounded up to whole CPUs; the memory limit is the
 smallest `memory.max` from the sandbox's cgroup up to the root. Run ai-jail
@@ -971,6 +982,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --overlay-system                with --mask-host: /usr, /etc, /opt through read-only overlays (Linux; not saved)
 --syscall-view                  with --mask-host: uname(2) and sysinfo(2) answered by ai-jail (Linux; not saved)
 --minimal-etc                   with --mask-host: /etc holds only a run-time allowlist (Linux; not saved)
+--hostname NAME                 the sandbox's host name, one DNS label (default ai-sandbox; Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit

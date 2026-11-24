@@ -69,6 +69,7 @@ mod host_view_extra;
 mod host_view_synth;
 #[cfg(target_os = "linux")]
 pub(crate) mod host_view_timens;
+pub(crate) mod hostname;
 #[cfg(target_os = "linux")]
 mod minimal_etc;
 #[cfg(target_os = "linux")]
@@ -1848,13 +1849,16 @@ pub fn check() -> Result<(), String> {
     }
 }
 
-pub fn prepare() -> Result<SandboxGuard, String> {
+/// `hostname` is the jail's host name ([`hostname::jail_hostname`]);
+/// macOS has no UTS namespace to give it.
+pub fn prepare(hostname: &str) -> Result<SandboxGuard, String> {
     #[cfg(target_os = "linux")]
     {
-        bwrap::prepare()
+        bwrap::prepare(hostname)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = hostname;
         Ok(seatbelt::SandboxGuard)
     }
 }
