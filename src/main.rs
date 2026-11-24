@@ -435,6 +435,11 @@ fn validate_overlay_system(config: &config::Config) -> Result<(), String> {
     if config.minimal_etc && !config.mask_host {
         return Err("--minimal-etc requires --mask-host".into());
     }
+    // Unlike the layers above, a name needs no --mask-host: it only replaces
+    // `ai-sandbox`. It is refused when it is not one DNS label.
+    if let Some(name) = &config.hostname {
+        sandbox::hostname::validate(name)?;
+    }
     Ok(())
 }
 
@@ -2313,7 +2318,7 @@ fn run(
         let config = launch_runner.config();
 
         // Prepare sandbox resources (temp hosts file on Linux, no-op on macOS)
-        let guard = sandbox::prepare()?;
+        let guard = sandbox::prepare(sandbox::hostname::jail_hostname(config))?;
 
         // Filtered egress: the CONNECT proxy runs as threads in this
         // supervisor process. On Linux the sandbox reaches it through the
@@ -3422,6 +3427,17 @@ mod tests {
             ..Config::default()
         };
         assert!(validate_overlay_system(&etc_masked).is_ok());
+        let named = Config {
+            hostname: Some("desktop-k3f9a2".into()),
+            ..Config::default()
+        };
+        assert!(validate_overlay_system(&named).is_ok(), "no --mask-host");
+        let dotted = Config {
+            hostname: Some("evil.example".into()),
+            ..Config::default()
+        };
+        let error = validate_overlay_system(&dotted).unwrap_err();
+        assert!(error.contains("--hostname"), "{error}");
         assert!(validate_overlay_system(&Config::default()).is_ok());
     }
 

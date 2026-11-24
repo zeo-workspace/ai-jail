@@ -104,6 +104,11 @@ or integration rather than saved sandbox authority.
   configuration key, refused on macOS; it only narrows what the sandbox
   reads), and `--overlay-system`, `--syscall-view` and `--minimal-etc` with it
   (the same per-run choice; each refused without `--mask-host`)
+- Host name: `--hostname` NAME (a per-run choice made by the caller, like
+  the host view -- an editor that gives each project a stable name of its
+  own; no configuration key, ignored on macOS, which has no UTS namespace;
+  refused unless one DNS label). It needs no `--mask-host`: it only
+  replaces `ai-sandbox`, and it narrows nothing
 - Backward-compatible rejected option: `--allow-tcp-port`
 
 ## Release rule

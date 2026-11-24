@@ -2,6 +2,7 @@ use super::*;
 
 fn answers() -> Answers {
     Answers {
+        hostname: "ai-sandbox".into(),
         release: "7.3.5".into(),
         version: "#1 SMP PREEMPT_DYNAMIC".into(),
         machine: "x86_64".into(),
@@ -27,6 +28,15 @@ fn utsname_names_the_jail_and_the_cleaned_kernel() {
     assert_eq!(field(&bytes, 3), "#1 SMP PREEMPT_DYNAMIC");
     assert_eq!(field(&bytes, 4), "x86_64");
     assert_eq!(field(&bytes, 5), "(none)");
+}
+
+#[test]
+fn utsname_answers_the_name_given_with_hostname() {
+    let a = Answers {
+        hostname: "desktop-k3f9a2".into(),
+        ..answers()
+    };
+    assert_eq!(field(&utsname_bytes(&a), 1), "desktop-k3f9a2");
 }
 
 #[test]
