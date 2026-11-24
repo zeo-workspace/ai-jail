@@ -763,6 +763,13 @@ configuration are absent. Symlinks are recreated and resolve inside the
 sandbox. The full list, with the reason for each entry, is in
 `src/sandbox/minimal_etc.rs`.
 
+`--hostname NAME` (never saved; needs no `--mask-host`) names the sandbox
+instead of `ai-sandbox`: `uname -n`, `/etc/hosts`, an `/etc/hostname` bound
+over the host's and, under `--syscall-view`, `uname(2)` all read it. The
+sandbox gets that `/etc/hostname` either way, so the host's own name no longer
+shows through it. The name is one DNS label -- lowercase letters, digits and
+hyphens, at most 63 -- and anything else is refused.
+
 A nested sandbox can no longer mount its own `/proc` under `--mask-host`; with
 ai-jail's default Landlock and seccomp a nested sandbox is refused anyway, so
 this matters only under `--no-landlock --no-seccomp`. The `cpuid` instruction,
