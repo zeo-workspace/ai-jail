@@ -1052,6 +1052,23 @@ sandbox's own task count (so `getconf _PHYS_PAGES` agrees with
 dies, they fail with `ENOSYS`, and bwrap ends the sandbox with it anyway.
 Only the native architecture is trapped.
 
+`--minimal-etc` (with `--mask-host`) replaces the read-only bind of the host's
+whole `/etc` with a tmpfs holding only what programs read at run time:
+accounts (`passwd`, `group`, `shells`), name service (`nsswitch.conf`,
+`hosts`, `resolv.conf`, `host.conf`, `gai.conf`, `protocols`, `services`),
+the time zone and locale, the dynamic linker's cache, TLS roots (`ssl`, `pki`,
+`ca-certificates`), shell startup (`profile*`, `env.d`, `environment`, `bash`,
+`bash.bashrc`, `inputrc`), `terminfo`, `mime.types`, the system `gitconfig`
+and `npmrc`, interpreter selection (Gentoo's `python-exec`, `java-config-2`,
+`eselect`; Debian's `alternatives`), Claude Code's managed settings
+(`claude-code`), `mtab` and `os-release`. An entry the host lacks is skipped;
+a symlink is recreated with its target text, so it resolves inside the
+sandbox. Everything else -- `hostname`, `fstab`, `ssh/`, the package
+manager's configuration, every service's -- is absent rather than masked, and
+the tmpfs is remounted read-only once the binds inside it are made. With
+`--overlay-system`, the entries bound into it still name the host's disk in
+`/proc/self/mountinfo`; `/etc` itself reads `tmpfs`.
+
 The allowed CPUs are the `--cpus` set, else the process's affinity
 (`taskset`), trimmed to the cgroup's `cpu.max` rounded up to whole CPUs; the
 memory limit is the smallest `memory.max` from the sandbox's cgroup up to the
@@ -1265,6 +1282,7 @@ ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
 --mask-host                     hardware view sized to the sandbox's limits (Linux; not saved; see Hiding the host)
 --overlay-system                with --mask-host: /usr, /etc, /opt through read-only overlays (Linux; not saved)
 --syscall-view                  with --mask-host: uname(2) and sysinfo(2) answered by ai-jail (Linux; not saved)
+--minimal-etc                   with --mask-host: /etc holds only a run-time allowlist (Linux; not saved)
 --browser[=hard|soft]           isolated browser profile (needs --network --display)
 --dry-run                       print the backend invocation
 --init                          write configuration and exit

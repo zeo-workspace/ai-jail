@@ -1202,6 +1202,7 @@ pub(crate) fn save_project_grants(
     grants.mask_host = false;
     grants.overlay_system = false;
     grants.syscall_view = false;
+    grants.minimal_etc = false;
     doc.directory_grants = approved_directory_grants.to_vec();
     doc.grants = grants;
     doc.approved_env_names = approved_env_names;
@@ -1528,6 +1529,7 @@ const CONFIG_FIELD_POLICY: &[ConfigFieldPolicy] = &[
     excluded_policy!("mask_host", Restriction),
     excluded_policy!("overlay_system", Restriction),
     excluded_policy!("syscall_view", Restriction),
+    excluded_policy!("minimal_etc", Restriction),
     static_policy!("command", Authority, Command),
     static_policy!("rw_maps", Authority, RwMaps),
     static_policy!("ro_maps", Authority, RoMaps),
@@ -2350,6 +2352,7 @@ mod tests {
         expected_excluded!("mask_host", Restriction),
         expected_excluded!("overlay_system", Restriction),
         expected_excluded!("syscall_view", Restriction),
+        expected_excluded!("minimal_etc", Restriction),
         expected_authority!("command", Authority, Command, ["command claude"]),
         expected_authority!(
             "rw_maps",
@@ -2473,6 +2476,9 @@ mod tests {
             }
             "syscall_view" => {
                 config.syscall_view = true;
+            }
+            "minimal_etc" => {
+                config.minimal_etc = true;
             }
             "command" => {
                 config.command =

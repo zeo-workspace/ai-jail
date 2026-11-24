@@ -413,3 +413,73 @@ fn mask_host_follows_the_stack_limits_and_keeps_the_id_per_state_root() {
     assert_eq!(field(&second, "machineid"), id, "one id per state root");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn minimal_etc_keeps_only_the_allowlist_and_the_tools_working() {
+    require_bwrap!();
+    let _lock = SANDBOX_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let script = r#"
+echo "count=$(ls -A /etc | wc -l)"
+for f in passwd hosts hostname fstab crypttab portage shadow; do
+  if [ -e /etc/$f ] || [ -L /etc/$f ]; then echo "$f=present"; else echo "$f=absent"; fi
+done
+echo "hosts_size=$(wc -c < /etc/hosts)"
+echo "user=$(id -un 2>/dev/null || echo none)"
+echo "src=$(awk '$5=="/etc" {print $(NF-2)}' /proc/self/mountinfo | tail -1)"
+touch /etc/probe 2>/dev/null && echo writable=yes || echo writable=no
+if [ -L /etc/localtime ]; then [ -e /etc/localtime ] && echo tz=ok || echo tz=dangling; else echo tz=ok; fi
+git --version >/dev/null && echo git=ok
+sh -lc 'echo login=ok'
+"#;
+    let out = Command::new(ai_jail())
+        .args([
+            "--clean",
+            "--no-save-config",
+            "--no-ssh",
+            "--no-gpu",
+            "--no-docker",
+            "--no-display",
+            "--no-status-bar",
+            "--mask-host",
+            "--minimal-etc",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .expect("failed to spawn ai-jail");
+    let text = stdout(&out);
+    let host_count = std::fs::read_dir("/etc").map_or(0, Iterator::count);
+    let count: usize = field(&text, "count").parse().unwrap();
+    assert!(count < host_count || host_count < 40, "{count}: {text}");
+    for absent in ["hostname", "fstab", "crypttab", "portage", "shadow"] {
+        assert_eq!(field(&text, absent), "absent", "{absent}: {text}");
+    }
+    if std::path::Path::new("/etc/passwd").exists() {
+        assert_eq!(field(&text, "passwd"), "present", "{text}");
+        assert_ne!(field(&text, "user"), "none", "{text}");
+    }
+    // Binds made inside /etc after the tmpfs still land on it.
+    assert_eq!(field(&text, "hosts"), "present", "{text}");
+    assert_ne!(field(&text, "hosts_size"), "0", "{text}");
+    assert_eq!(field(&text, "src"), "tmpfs", "{text}");
+    assert_eq!(field(&text, "writable"), "no", "{text}");
+    assert_eq!(field(&text, "tz"), "ok", "{text}");
+    assert_eq!(field(&text, "git"), "ok", "{text}");
+    assert_eq!(field(&text, "login"), "ok", "{text}");
+}
+
+#[test]
+fn minimal_etc_alone_is_refused() {
+    let out = Command::new(ai_jail())
+        .args(["--clean", "--no-save-config", "--minimal-etc", "true"])
+        .output()
+        .expect("failed to spawn ai-jail");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("--minimal-etc requires --mask-host"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

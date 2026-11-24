@@ -432,6 +432,9 @@ fn validate_overlay_system(config: &config::Config) -> Result<(), String> {
     if config.syscall_view && !config.mask_host {
         return Err("--syscall-view requires --mask-host".into());
     }
+    if config.minimal_etc && !config.mask_host {
+        return Err("--minimal-etc requires --mask-host".into());
+    }
     Ok(())
 }
 
@@ -3404,6 +3407,21 @@ mod tests {
         };
         let error = validate_overlay_system(&syscalls).unwrap_err();
         assert!(error.contains("--syscall-view"), "{error}");
+        let etc = Config {
+            minimal_etc: true,
+            ..Config::default()
+        };
+        let error = validate_overlay_system(&etc).unwrap_err();
+        assert!(
+            error.contains("--minimal-etc requires --mask-host"),
+            "{error}"
+        );
+        let etc_masked = Config {
+            minimal_etc: true,
+            mask_host: true,
+            ..Config::default()
+        };
+        assert!(validate_overlay_system(&etc_masked).is_ok());
         assert!(validate_overlay_system(&Config::default()).is_ok());
     }
 

@@ -70,6 +70,8 @@ mod host_view_synth;
 #[cfg(target_os = "linux")]
 pub(crate) mod host_view_timens;
 #[cfg(target_os = "linux")]
+mod minimal_etc;
+#[cfg(target_os = "linux")]
 mod syscall_view;
 
 /// In the helper: install `--syscall-view`'s notify filter and hand its
@@ -2009,7 +2011,11 @@ pub fn build(
     {
         // No teardown report or transparent egress on macOS.
         let _ = (guard, bridge_sockets, teardown_report_fd, transparent);
-        if config.mask_host || config.overlay_system || config.syscall_view {
+        if config.mask_host
+            || config.overlay_system
+            || config.syscall_view
+            || config.minimal_etc
+        {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
@@ -2048,7 +2054,11 @@ pub fn dry_run(
     {
         // No wrapper on macOS: the teardown report is not supported there.
         let _ = (guard, bridge_sockets, teardown_report);
-        if config.mask_host || config.overlay_system || config.syscall_view {
+        if config.mask_host
+            || config.overlay_system
+            || config.syscall_view
+            || config.minimal_etc
+        {
             return Err("--mask-host is Linux-only".into());
         }
         let prepared = prepare_seatbelt_config(config)?;
