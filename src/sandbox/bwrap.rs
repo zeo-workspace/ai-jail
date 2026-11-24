@@ -353,6 +353,7 @@ impl MountSet {
     fn isolation_args(
         &self,
         project_dir: &Path,
+        hostname: &str,
         lockdown: bool,
         network_enabled: bool,
         inherit_env: bool,
@@ -366,7 +367,7 @@ impl MountSet {
             "--unshare-uts".into(),
             "--unshare-ipc".into(),
             "--hostname".into(),
-            super::syscall_view::JAIL_HOSTNAME.into(),
+            hostname.into(),
         ];
 
         if lockdown || should_use_new_session() {
@@ -566,6 +567,8 @@ fn login_name_env(env_pass: &[String]) -> Vec<(&'static str, String)> {
 
 struct MountSources<'a> {
     hosts_mount: (&'a Path, &'a Path),
+    /// The sandbox's `/etc/hostname` and the host path it covers.
+    hostname_mount: Option<(&'a Path, &'a Path)>,
     resolv_mount: Option<(&'a Path, &'a Path)>,
     resolv_intermediate_mount: Option<(&'a Path, &'a Path)>,
     empty_path: &'a Path,
@@ -581,6 +584,7 @@ impl<'a> MountSources<'a> {
     fn from_guard(guard: &'a SandboxGuard) -> Self {
         Self {
             hosts_mount: guard.hosts_mount(),
+            hostname_mount: guard.hostname_mount(),
             resolv_mount: guard.resolv_mount(),
             resolv_intermediate_mount: guard.resolv_intermediate_mount(),
             empty_path: guard.empty_path(),
@@ -598,6 +602,7 @@ impl<'a> MountSources<'a> {
     ) -> Self {
         Self {
             hosts_mount,
+            hostname_mount: None,
             resolv_mount,
             resolv_intermediate_mount: None,
             empty_path,
@@ -610,6 +615,10 @@ impl<'a> MountSources<'a> {
 
 pub struct SandboxGuard {
     hosts_path: PathBuf,
+    /// The jail's host name (`--hostname`, or `ai-sandbox`).
+    hostname: String,
+    /// The sandbox's `/etc/hostname` and the host path it covers.
+    hostname_file: Option<(PathBuf, PathBuf)>,
     /// Where to mount the private hosts file inside the sandbox.
     /// If /etc/hosts is a symlink (e.g. NixOS), this is the symlink
     /// target so the symlink inherited from --ro-bind /etc resolves.
@@ -648,6 +657,12 @@ impl SandboxGuard {
         (&self.hosts_path, &self.hosts_dest)
     }
 
+    fn hostname_mount(&self) -> Option<(&Path, &Path)> {
+        self.hostname_file
+            .as_ref()
+            .map(|(src, dest)| (src.as_path(), dest.as_path()))
+    }
+
     fn resolv_mount(&self) -> Option<(&Path, &Path)> {
         match (&self.resolv_path, &self.resolv_dest) {
             (Some(src), Some(dest)) => Some((src, dest)),
@@ -679,7 +694,7 @@ impl SandboxGuard {
             return Ok(supervisor);
         }
         let supervisor = super::syscall_view::Supervisor::start(
-            super::syscall_view::answers_for_host(),
+            super::syscall_view::answers_for_host(&self.hostname),
             std::time::Instant::now(),
         )?;
         Ok(self.syscall_view.get_or_init(|| supervisor))
@@ -809,6 +824,9 @@ fn apply_minimal_etc(mount_set: &mut MountSet, host_etc: &Path) {
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.hosts_path);
+        if let Some((ref p, _)) = self.hostname_file {
+            let _ = std::fs::remove_file(p);
+        }
         if let Some(ref p) = self.resolv_path {
             let _ = std::fs::remove_file(p);
         }
@@ -824,6 +842,8 @@ impl SandboxGuard {
         SandboxGuard {
             hosts_path: path,
             hosts_dest: PathBuf::from("/etc/hosts"),
+            hostname: super::hostname::DEFAULT_HOSTNAME.into(),
+            hostname_file: None,
             resolv_path: None,
             resolv_dest: None,
             resolv_intermediate_dest: None,
@@ -1125,6 +1145,15 @@ fn trusted_binary_metadata(
 }
 
 fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
+    new_private_file("bwrap-hosts", "temp hosts file")
+}
+
+/// An owner-only tempfile named `<prefix>.<pid>.<nonce>.<attempt>`, created
+/// exclusively so no other process can have placed it first.
+fn new_private_file(
+    prefix: &str,
+    what: &str,
+) -> Result<(PathBuf, std::fs::File), String> {
     let tmp = std::env::temp_dir();
 
     for attempt in 0..128_u32 {
@@ -1132,7 +1161,7 @@ fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let name =
-            format!("bwrap-hosts.{}.{}.{}", std::process::id(), nonce, attempt);
+            format!("{prefix}.{}.{}.{}", std::process::id(), nonce, attempt);
         let path = tmp.join(name);
 
         match OpenOptions::new().create_new(true).write(true).open(&path) {
@@ -1145,7 +1174,7 @@ fn new_hosts_file() -> Result<(PathBuf, std::fs::File), String> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(format!("Failed to create temp hosts file: {e}"));
+                return Err(format!("Failed to create {what}: {e}"));
             }
         }
     }
@@ -1171,13 +1200,12 @@ pub fn check() -> Result<(), String> {
     }
 }
 
-pub fn prepare() -> Result<SandboxGuard, String> {
+pub fn prepare(hostname: &str) -> Result<SandboxGuard, String> {
     let (path, mut file) = new_hosts_file()?;
     let hosts_dest = resolved_hosts_dest();
-    let contents =
-        b"127.0.0.1 localhost ai-sandbox\n::1       localhost ai-sandbox\n";
+    let contents = super::hostname::hosts_contents(hostname);
 
-    file.write_all(contents)
+    file.write_all(contents.as_bytes())
         .map_err(|e| format!("Failed to create temp hosts file: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("Failed to sync temp hosts file: {e}"))?;
@@ -1187,10 +1215,13 @@ pub fn prepare() -> Result<SandboxGuard, String> {
     let empty_path = new_empty_file()?;
     let deny_file_path = new_deny_file()?;
     let deny_dir_path = new_deny_dir()?;
+    let hostname_file = new_hostname_file(hostname)?;
 
     Ok(SandboxGuard {
         hosts_path: path,
         hosts_dest,
+        hostname: hostname.to_string(),
+        hostname_file,
         resolv_path,
         resolv_dest,
         resolv_intermediate_dest,
@@ -1200,6 +1231,26 @@ pub fn prepare() -> Result<SandboxGuard, String> {
         host_view: std::cell::OnceCell::new(),
         syscall_view: std::cell::OnceCell::new(),
     })
+}
+
+/// The sandbox's `/etc/hostname`, naming the jail, with the path it covers.
+/// The host's, bound with the rest of `/etc`, named this machine. `None`
+/// when the host has no `/etc/hostname`: nothing would show it.
+fn new_hostname_file(
+    hostname: &str,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Ok(dest) = std::fs::canonicalize("/etc/hostname") else {
+        return Ok(None);
+    };
+    let (path, mut file) =
+        new_private_file("ai-jail-hostname", "temp hostname file")?;
+    file.write_all(super::hostname::hostname_contents(hostname).as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            format!("Failed to write temp hostname file: {e}")
+        })?;
+    Ok(Some((path, dest)))
 }
 
 fn resolved_hosts_dest() -> PathBuf {
@@ -1766,6 +1817,7 @@ pub fn build(
 
     opt_args.extend(mount_set.isolation_args(
         project_dir,
+        super::hostname::jail_hostname(config),
         lockdown,
         config.network_enabled(),
         config.inherit_env_enabled(),
@@ -2064,6 +2116,7 @@ fn build_dry_run_args_forwarded(
 
     args.extend(mount_set.isolation_args(
         project_dir,
+        super::hostname::jail_hostname(config),
         lockdown,
         config.network_enabled(),
         config.inherit_env_enabled(),
@@ -2314,12 +2367,24 @@ fn discover_mounts_full(
         (vec![], vec![])
     };
     let mut mounts = MountSet {
-        base: discover_base(
-            sources.hosts_mount,
-            sources.resolv_mount,
-            sources.resolv_intermediate_mount,
-            verbose,
-        ),
+        base: {
+            let mut base = discover_base(
+                sources.hosts_mount,
+                sources.resolv_mount,
+                sources.resolv_intermediate_mount,
+                verbose,
+            );
+            // Last in the base, like /etc/hosts after the /etc bind it
+            // covers: --minimal-etc and --overlay-system replace that bind
+            // in place, so this still lands on top of either.
+            if let Some((src, dest)) = sources.hostname_mount {
+                base.push(Mount::FileRoBind {
+                    src: src.into(),
+                    dest: dest.into(),
+                });
+            }
+            base
+        },
         sys_masks: {
             let mut masks = discover_sys_masks(lockdown);
             if (!display_mounts.is_empty() || !systemd_mounts.is_empty())
@@ -8672,6 +8737,7 @@ mod tests {
 
         let args = set.isolation_args(
             Path::new("/home/u/project"),
+            "ai-sandbox",
             false,
             true,
             false,
@@ -8949,10 +9015,56 @@ mod tests {
 
     #[test]
     fn prepare_creates_private_hosts_file() {
-        let guard = prepare().unwrap();
+        let guard = prepare("ai-sandbox").unwrap();
         let meta = std::fs::metadata(guard.hosts_path()).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn prepare_names_the_jail_in_hosts_and_hostname() {
+        let guard = prepare("desktop-k3f9a2").unwrap();
+        let hosts = std::fs::read_to_string(guard.hosts_path()).unwrap();
+        assert!(hosts.contains("localhost desktop-k3f9a2"), "{hosts}");
+        assert!(!hosts.contains("ai-sandbox"), "{hosts}");
+        match guard.hostname_mount() {
+            Some((src, dest)) => {
+                assert_eq!(
+                    std::fs::read_to_string(src).unwrap(),
+                    "desktop-k3f9a2\n"
+                );
+                assert_eq!(
+                    dest,
+                    std::fs::canonicalize("/etc/hostname").unwrap()
+                );
+                let mode = std::fs::metadata(src).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "owner-only, like hosts");
+            }
+            None => assert!(
+                std::fs::canonicalize("/etc/hostname").is_err(),
+                "only a host without /etc/hostname gets none"
+            ),
+        }
+        let src = guard.hostname_mount().map(|(src, _)| src.to_path_buf());
+        drop(guard);
+        if let Some(src) = src {
+            assert!(!src.exists(), "the guard removes it");
+        }
+    }
+
+    #[test]
+    fn isolation_args_give_bwrap_the_jail_name() {
+        let set = MountSet::default();
+        let args = set.isolation_args(
+            Path::new("/home/u/project"),
+            "desktop-k3f9a2",
+            false,
+            true,
+            false,
+            &[],
+        );
+        let at = args.iter().position(|a| a == "--hostname").unwrap();
+        assert_eq!(args[at + 1], "desktop-k3f9a2");
     }
 
     #[test]

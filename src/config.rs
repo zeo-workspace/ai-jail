@@ -203,6 +203,10 @@ pub struct Config {
     /// host's entries, under `--mask-host`. Runtime only, never saved.
     #[serde(default, skip)]
     pub minimal_etc: bool,
+    /// `--hostname`: the jail's host name (`ai-sandbox` without it).
+    /// Runtime only, never saved: a caller passes it on every launch.
+    #[serde(default, skip)]
+    pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2667,6 +2671,7 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     config.overlay_system = cli.overlay_system;
     config.syscall_view = cli.syscall_view;
     config.minimal_etc = cli.minimal_etc;
+    config.hostname = cli.hostname.clone();
 
     expand_user_paths(&mut config);
 
@@ -4996,6 +5001,7 @@ no_gpu = true
             overlay_system: false,
             syscall_view: false,
             minimal_etc: false,
+            hostname: None,
             command: vec!["claude".into()],
             rw_maps: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             ro_maps: vec![PathBuf::from("/opt/data")],
@@ -8401,6 +8407,7 @@ hide_dotdirs = [".my_secrets"]
             overlay_system: false,
             syscall_view: false,
             minimal_etc: false,
+            hostname: None,
             command: vec!["codex".into()],
             rw_maps: vec![PathBuf::from("/tmp/shared")],
             ro_maps: vec![],
