@@ -934,7 +934,6 @@ DNS label -- 1 to 63 lowercase letters, digits and hyphens, not starting or
 ending with a hyphen -- and is refused otherwise. It needs no `--mask-host`,
 is never saved, and is ignored on macOS.
 
-
 The allowed CPUs are the `--cpus` set, else the process's affinity
 (`taskset`), trimmed to the cgroup's `cpu.max` rounded up to whole CPUs; the
 memory limit is the smallest `memory.max` from the sandbox's cgroup up to the
