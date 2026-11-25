@@ -3749,8 +3749,8 @@ mod interface_profile_tests {
     rw_maps overlay_maps hide_dotdirs mask deny_paths mask_exceptions
     deny_path_exceptions no_gpu no_docker tailscale no_display audio
     aws kube gcloud docker_config kvm prompt_hosts macos_host_ipc
-    macos_chromium macos_trustd macos_pasteboard allow_pty
-    allow_loopback_listen terminal_appearance
+    macos_chromium macos_trustd allow_pty
+    allow_loopback_listen
     allow_loopback_connect x11 host_shm terminal_passthrough
     no_worktree no_mise no_toolchains no_save_config no_hide_config
     pictures browser_profile private_home no_landlock no_status_bar
@@ -3768,9 +3768,9 @@ mod interface_profile_tests {
     --audio --no-audio --no-github --aws --no-aws --kube --no-kube
     --gcloud --no-gcloud --docker-config --no-docker-config --kvm
     --no-kvm --prompt-hosts --no-prompt-hosts --network --no-network
-    --macos-host-ipc --no-macos-host-ipc --macos-chromium
+    --no-macos-host-ipc --macos-chromium
     --no-macos-chromium --macos-trustd --no-macos-trustd
-    --macos-pasteboard --no-macos-pasteboard --allow-pty
+    --allow-pty
     --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
