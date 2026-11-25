@@ -3719,8 +3719,9 @@ mod interface_profile_tests {
     const CONFIG_RS: &str = include_str!("config.rs");
 
     /// `Config` fields that no user sets: runtime state, never parsed.
-    const INTERNAL_FIELDS: &[&str] =
-        &["runtime_harnesses", "rlimit_source", "cpus_source"];
+    /// The same list the parity test uses, so a runtime-only launch flag
+    /// (`--state-root`, `--mask-host`...) is classified once.
+    const INTERNAL_FIELDS: &[&str] = super::INTERFACE_INTERNAL_FIELDS;
 
     /// `Config` fields already missing from the guide at f0dc67e.
     const UNDOCUMENTED_FIELDS_AT_F0DC67E: &str = r"
@@ -3757,7 +3758,7 @@ mod interface_profile_tests {
     --rw-map --ro-map --overlay-map --map --mask --deny-path
     --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
     --allow-private-host --systemd-user --no-systemd-user
-    --worktree --no-worktree --browser --no-browser --claude-dir --x11
+    --worktree --no-worktree --browser --no-browser --x11
     --no-x11 --host-shm --no-host-shm --terminal-passthrough
     --no-terminal-passthrough --agent-state --no-agent-state
     --publish-port --inherit-env --no-inherit-env --update-check
