@@ -2925,19 +2925,15 @@ pub(crate) fn merge_layer_report(
         crate::limits::tighten_number(c.max_tasks, local.max_tasks);
     c.max_tasks = max_tasks;
     if dropped {
-        warnings.push(weakens(
-            "max_tasks",
-            local.max_tasks.map(|n| n.to_string()),
-        ));
+        warnings
+            .push(weakens("max_tasks", local.max_tasks.map(|n| n.to_string())));
     }
     let (cpu_quota, dropped) =
         crate::limits::tighten_number(c.cpu_quota, local.cpu_quota);
     c.cpu_quota = cpu_quota;
     if dropped {
-        warnings.push(weakens(
-            "cpu_quota",
-            local.cpu_quota.map(|n| n.to_string()),
-        ));
+        warnings
+            .push(weakens("cpu_quota", local.cpu_quota.map(|n| n.to_string())));
     }
     // These three name or carry secrets: `granted` holds key names only
     // and the text holds none, so neither can leak a value.
