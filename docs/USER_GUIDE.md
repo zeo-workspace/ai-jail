@@ -746,6 +746,13 @@ instead of the host's disk for them. Metadata walks get slower (a `find` over
 `/usr` measured +21 %), and an overlay cannot sit on a root that is already
 stacked too deep (some containers: `Invalid argument`).
 
+`--syscall-view` (with `--mask-host` only; never saved) answers `uname(2)` and
+`sysinfo(2)` from ai-jail through a seccomp user-notify filter, so `uname -r`
+and `getconf _PHYS_PAGES` agree with the files above: the numeric release, the
+sandbox's host name, its age as uptime, no load, memory sized to `--memory`.
+Each of those calls costs a round trip to ai-jail; only the native
+architecture is trapped.
+
 A nested sandbox can no longer mount its own `/proc` under `--mask-host`; with
 ai-jail's default Landlock and seccomp a nested sandbox is refused anyway, so
 this matters only under `--no-landlock --no-seccomp`. The `cpuid` instruction,
