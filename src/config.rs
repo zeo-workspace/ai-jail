@@ -1543,7 +1543,15 @@ fn global_config_example_is_inert_and_documents_public_keys() {
         .filter(|key| {
             !matches!(
                 *key,
-                "runtime_harnesses" | "rlimit_source" | "cpus_source"
+                "runtime_harnesses"
+                    | "rlimit_source"
+                    | "cpus_source"
+                    | "state_root"
+                    | "mask_host"
+                    | "overlay_system"
+                    | "syscall_view"
+                    | "minimal_etc"
+                    | "hostname"
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -11379,6 +11387,14 @@ mod profile_field_coverage_tests {
         "status_bar_style",
         "resize_redraw_key",
         "no_save_config",
+        // `serde(skip)` launch-only state: never read from a file, so a
+        // profile cannot carry them.
+        "state_root",
+        "mask_host",
+        "overlay_system",
+        "syscall_view",
+        "minimal_etc",
+        "hostname",
     ];
 
     fn config_fields() -> Vec<String> {
@@ -11413,6 +11429,12 @@ mod profile_field_coverage_tests {
             "[4242]",
             "{ AJ_PROFILE_KEY = \"x.example\" }",
             "{ nofile = \"unlimited\" }",
+            // The cgroup limits widen only from a lower value to a higher
+            // one, so each needs two values of its own shape.
+            "\"1G\"",
+            "\"2G\"",
+            "100",
+            "200",
         ];
         let fields = config_fields();
         assert!(fields.len() > 40, "scanner found {fields:?}");

@@ -85,6 +85,11 @@
 # Linux only: pin the sandbox to these CPUs (needs seccomp)
 # cpus = "0-3"
 
+# Linux only: whole-sandbox cgroup limits (need a systemd user session)
+# memory_max = "8G"
+# max_tasks = 2000
+# cpu_quota = 400
+
 # Legacy compatibility only. An empty list grants no repository trust.
 # trust_project_config = []
 
