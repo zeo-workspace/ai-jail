@@ -1375,6 +1375,7 @@ const INTERFACE_INTERNAL_FIELDS: &[&str] = &[
     "state_root",
     "mask_host",
     "overlay_system",
+    "syscall_view",
 ];
 
 /// Names already missing from docs/USER_GUIDE.md at upstream v3.3.0
