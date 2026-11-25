@@ -488,15 +488,12 @@ fn deliberate_signal(sig: i32) -> bool {
     matches!(sig, 1 | 2 | 13 | 15)
 }
 
-fn signal_name(sig: i32) -> String {
-    nix::sys::signal::Signal::try_from(sig)
-        .map(|s| s.as_str().to_string())
-        .unwrap_or_else(|_| format!("signal {sig}"))
-}
-
-/// Explain an exit that the exit code alone does not. `None` when there
-/// is nothing to say (clean exit, or a deliberate signal with no limit
-/// involved).
+/// What the sandbox's cgroup adds to the exit line `exit_reason` already
+/// prints (upstream v3.6.0, #247): an OOM kill at `--memory`, forks refused
+/// at `--max-tasks`, and whether a SIGKILL was this sandbox's memory limit.
+/// A death the signal alone explains (SIGXCPU, SIGXFSZ, SIGSEGV...) is
+/// `exit_reason`'s line only, so no launch prints the same signal twice.
+/// `None` when the cgroup has nothing to add.
 pub fn describe_exit(
     exit_code: i32,
     limits: &ResourceLimits,
@@ -533,26 +530,14 @@ pub fn describe_exit(
 
     match signal {
         Some(sig) if !lines.is_empty() || deliberate_signal(sig) => {}
-        Some(24) => lines
-            .push("killed by SIGXCPU: the CPU-time rlimit was reached".into()),
-        Some(25) => lines.push(
-            "killed by SIGXFSZ: the file-size rlimit was reached \
-             (1 GiB under --lockdown)"
-                .into(),
-        ),
         Some(9) if limits.memory.is_some() => lines.push(
-            "killed by SIGKILL, not by the sandbox memory limit (no OOM \
-             kill was counted in the sandbox cgroup)"
+            "the SIGKILL was not the sandbox memory limit (no OOM kill was \
+             counted in the sandbox cgroup)"
                 .into(),
         ),
-        Some(9) => lines.push(
-            "killed by SIGKILL; ai-jail set no memory limit, so the usual \
-             cause is the host OOM killer (`journalctl -k | grep -i oom`) \
-             -- --memory caps the sandbox and makes this report exact"
-                .into(),
-        ),
-        Some(sig) => lines.push(format!("killed by {}", signal_name(sig))),
-        None => {}
+        // Without --memory nothing proves the cause, and upstream names a
+        // SIGKILL alone (run_observability: exit_sigkill_names_the_signal_alone).
+        Some(_) | None => {}
     }
 
     if lines.is_empty() {
@@ -792,17 +777,26 @@ mod tests {
     }
 
     #[test]
-    fn exit_report_explains_an_unlimited_sigkill() {
-        let msg = describe_exit(137, &ResourceLimits::default(), None).unwrap();
-        assert!(msg.contains("host OOM killer"), "{msg}");
+    fn exit_report_guesses_no_cause_for_an_unlimited_sigkill() {
+        // No --memory, no cgroup evidence: exit_reason's "killed by
+        // SIGKILL" is the whole story.
+        assert_eq!(describe_exit(137, &ResourceLimits::default(), None), None);
     }
 
     #[test]
-    fn exit_report_names_rlimit_signals() {
+    fn exit_report_leaves_signal_only_deaths_to_exit_reason() {
+        // exit_reason already prints "sandbox exited with N: killed by
+        // SIG..." for these; a second line would repeat it.
         let none = ResourceLimits::default();
-        assert!(describe_exit(152, &none, None).unwrap().contains("SIGXCPU"));
-        assert!(describe_exit(153, &none, None).unwrap().contains("SIGXFSZ"));
-        assert!(describe_exit(139, &none, None).unwrap().contains("SIGSEGV"));
+        assert_eq!(describe_exit(152, &none, None), None, "SIGXCPU");
+        assert_eq!(describe_exit(153, &none, None), None, "SIGXFSZ");
+        assert_eq!(describe_exit(139, &none, None), None, "SIGSEGV");
+        // ...unless the cgroup counted something the signal does not say.
+        let report = CgroupReport {
+            oom_kills: 1,
+            ..CgroupReport::default()
+        };
+        assert!(describe_exit(139, &none, Some(&report)).is_some());
     }
 
     #[test]
