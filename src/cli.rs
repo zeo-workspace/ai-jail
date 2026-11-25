@@ -3773,7 +3773,7 @@ mod interface_profile_tests {
     --no-allow-pty --allow-loopback-listen --no-allow-loopback-listen
     --allow-loopback-connect --no-allow-loopback-connect --no-gpu
     --gpu --no-docker --docker --tailscale --no-tailscale --landlock
-    --no-landlock --seccomp --no-seccomp --rlimits --no-rlimits --ssh
+    --seccomp --rlimits --no-rlimits --ssh
     --no-ssh --pictures --no-pictures --clean
     --rw-map --ro-map --overlay-map --map --mask --deny-path
     --mask-except --deny-path-except --hide-dotdir --allow-tcp-port
