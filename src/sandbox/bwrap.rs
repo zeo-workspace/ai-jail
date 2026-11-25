@@ -2165,6 +2165,7 @@ fn build_dry_run_args_full(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_dry_run_args_forwarded(
     config: &Config,
     project_dir: &Path,
