@@ -508,6 +508,7 @@ impl Drop for Proxy {
         if let Some(path) = &self.unix_path {
             let _ = std::fs::remove_file(path);
             crate::tls_inject::remove_bundle(path);
+            crate::ssh_hosts::remove_known_hosts(path);
         }
     }
 }
@@ -2304,8 +2305,24 @@ where
         let _ = io::copy(&mut input, &mut upstream);
         let _ = upstream.shutdown(Shutdown::Write);
     });
-    let _ = io::copy(&mut tunnel, &mut output);
-    let _ = output.flush();
+    // Flushed after every read: stdout is line-buffered, and an SSH packet
+    // carries no newline, so `io::copy` would hold the server's key exchange
+    // back and the session would wait forever (measured against github.com).
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        match tunnel.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if output
+                    .write_all(&chunk[..n])
+                    .and_then(|()| output.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
     // The server ended the session; the client closes our input next.
     drop(up);
     Ok(())
@@ -4186,6 +4203,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, b"SSH-2.0-fixture\r\nhello");
+    }
+
+    #[test]
+    fn proxy_connect_hands_on_a_packet_without_a_newline_at_once() {
+        // An SSH key exchange: the server sends a binary packet and waits
+        // for the client's answer, which the client only sends once it has
+        // the packet. A line-buffered output that is not flushed holds the
+        // packet back and both sides wait forever.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(b"\x01\x02").unwrap();
+            let mut answer = [0_u8; 2];
+            conn.read_exact(&mut answer).unwrap();
+            conn.write_all(b"done").unwrap();
+        });
+        let proxy = Proxy::start(test_config(&["127.0.0.1"]), None).unwrap();
+        let (client_in, mut client_answers) = std::io::pipe().unwrap();
+        let (mut client_reads, server_bytes) = std::io::pipe().unwrap();
+        let client = thread::spawn(move || {
+            let mut packet = [0_u8; 2];
+            client_reads.read_exact(&mut packet).unwrap();
+            client_answers.write_all(b"ok").unwrap();
+            drop(client_answers);
+            let mut rest = Vec::new();
+            client_reads.read_to_end(&mut rest).unwrap();
+            rest
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let output = std::io::LineWriter::new(server_bytes);
+            let result = proxy_connect_with(
+                "127.0.0.1",
+                server_port,
+                proxy.port(),
+                client_in,
+                output,
+            );
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the packet was held back: the session deadlocked");
+        result.unwrap();
+        assert_eq!(client.join().unwrap(), b"done");
     }
 
     #[test]

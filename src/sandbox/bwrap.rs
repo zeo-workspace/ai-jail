@@ -2269,6 +2269,20 @@ fn proxy_socket_mount_args(
                     );
                 }
             }
+            // SSH host keys for the allowlisted :22 hosts, read-only; with
+            // none, ssh's strict checking refuses the host, which is safe.
+            let known_hosts = crate::ssh_hosts::known_hosts_path(sock);
+            if known_hosts.is_file() {
+                args.extend(
+                    Mount::RoBind {
+                        src: known_hosts,
+                        dest: PathBuf::from(
+                            crate::ssh_hosts::IN_SANDBOX_KNOWN_HOSTS,
+                        ),
+                    }
+                    .to_args(),
+                );
+            }
             Ok(args)
         }
         // Filtered egress without the outer proxy would silently mean
@@ -2297,15 +2311,18 @@ fn ssh_proxy_env(config: &Config) -> Vec<(String, String)> {
         return Vec::new();
     }
     let command = crate::proxy::ssh_proxy_command();
-    let mut vars =
-        vec![("AI_JAIL_SSH_PROXY_COMMAND".to_string(), command.clone())];
+    let options = crate::ssh_hosts::ssh_options();
+    let mut vars = vec![
+        ("AI_JAIL_SSH_PROXY_COMMAND".to_string(), command.clone()),
+        ("AI_JAIL_SSH_OPTIONS".to_string(), options.clone()),
+    ];
     let user_sets_git_ssh = crate::config::env_pass_names(&config.env_pass)
         .iter()
         .any(|name| name == "GIT_SSH_COMMAND");
     if !user_sets_git_ssh {
         vars.push((
             "GIT_SSH_COMMAND".to_string(),
-            format!("ssh -o ProxyCommand='{command}'"),
+            format!("ssh -o ProxyCommand='{command}' {options}"),
         ));
     }
     vars
@@ -6227,7 +6244,9 @@ mod tests {
         assert_eq!(
             get("GIT_SSH_COMMAND").as_deref(),
             Some(
-                "ssh -o ProxyCommand='/tmp/.ai-jail-landlock --proxy-connect %h %p'"
+                "ssh -o ProxyCommand='/tmp/.ai-jail-landlock --proxy-connect %h %p' \
+                 -F /dev/null -o UserKnownHostsFile=/tmp/.ai-jail-known-hosts \
+                 -o StrictHostKeyChecking=yes"
             )
         );
         // The user's own GIT_SSH_COMMAND wins.

@@ -25,6 +25,7 @@ mod run_summary;
 mod sandbox;
 mod secret;
 mod signals;
+mod ssh_hosts;
 mod ssh_restricted;
 mod state_root;
 mod statusbar;
@@ -2301,6 +2302,7 @@ fn run(
         let mut allowlist = config.allow_hosts().to_vec();
         allowlist.extend(config.allow_private_hosts().iter().cloned());
         proxy::validate_allowlist(&allowlist)?;
+        let allowlist_for_ssh = allowlist.clone();
         let mut proxy_config = proxy::ProxyConfig::new(allowlist);
         proxy_config.allow_private_hosts =
             config.allow_private_hosts().to_vec();
@@ -2337,6 +2339,22 @@ fn run(
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
+        // SSH through the proxy: the keys of exactly the allowlisted :22
+        // hosts, for the sandbox's strict host checking.
+        let ssh_hosts = ssh_hosts::ssh_hosts(&allowlist_for_ssh);
+        if !ssh_hosts.is_empty() {
+            let user_known_hosts = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".ssh/known_hosts");
+            if let Err(e) = ssh_hosts::write_known_hosts(
+                &socket,
+                &user_known_hosts,
+                &ssh_hosts,
+            ) {
+                output::warn(&format!("SSH host keys for the sandbox: {e}"));
+            }
+        }
         Some(proxy)
     } else {
         if config.prompt_hosts_enabled() {

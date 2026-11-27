@@ -392,6 +392,12 @@ port by port, with DNS pinning and the address-range guard:
 - `AI_JAIL_SSH_PROXY_COMMAND` holds it for anything else:
   `ssh -o ProxyCommand="$AI_JAIL_SSH_PROXY_COMMAND" host cmd`.
 
+Host keys come from your own `~/.ssh/known_hosts`, filtered: `ssh-keygen -F`
+picks out the lines of exactly the allowlisted `:22` hosts (hashed entries
+included) into a file mounted read-only at `/tmp/.ai-jail-known-hosts`, and
+`ssh` checks them strictly -- so the sandbox never learns the other hosts you
+know, and a host you have never trusted outside stays unreachable inside.
+
 It opens a path, not a credential: keys and agents stay outside unless you map
 them. A refused host or port ends the command with the proxy's status line.
 
