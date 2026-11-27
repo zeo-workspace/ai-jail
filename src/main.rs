@@ -2165,6 +2165,7 @@ fn run(
     {
         let mut allowlist = config.allow_hosts().to_vec();
         allowlist.extend(config.allow_private_hosts().iter().cloned());
+        proxy::validate_allowlist(&allowlist)?;
         let mut proxy_config = proxy::ProxyConfig::new(allowlist);
         proxy_config.allow_private_hosts =
             config.allow_private_hosts().to_vec();
@@ -2175,6 +2176,7 @@ fn run(
         // (`cargo build --release`, `cargo install`) has neither the env-var
         // read nor the string, so they cannot be reached at runtime.
         proxy_config.danger_allow_private = test_allow_private();
+        proxy_config.danger_any_port = test_allow_private();
         proxy_config.danger_extra_roots = test_extra_roots();
         // The audit handle is supervisor-side; the sandbox never sees
         // the file it appends to.
@@ -2201,6 +2203,7 @@ fn run(
     {
         let mut allowlist = config.allow_hosts().to_vec();
         allowlist.extend(config.allow_private_hosts().iter().cloned());
+        proxy::validate_allowlist(&allowlist)?;
         let mut proxy_config = proxy::ProxyConfig::new(allowlist);
         proxy_config.allow_private_hosts =
             config.allow_private_hosts().to_vec();

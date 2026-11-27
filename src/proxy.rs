@@ -71,7 +71,9 @@ pub(crate) struct ProxyConfig {
     /// Allowed CONNECT targets. An entry `example.com` matches
     /// `example.com` and any subdomain of it; IP-literal entries match
     /// only themselves. Matching is case-insensitive and trailing-dot
-    /// normalized (see [`allowlist_matches`]).
+    /// normalized (see [`allowlist_matches`]). An entry opens ports 443
+    /// and 80 unless it names one (`github.com:22`, `[::1]:8443`), see
+    /// [`allowlist_permits`].
     pub allowlist: Vec<String>,
     /// Trusted hosts allowed to resolve to private/CGNAT addresses. These
     /// entries are also present in `allowlist`; this second list only grants
@@ -88,6 +90,12 @@ pub(crate) struct ProxyConfig {
     /// tests can CONNECT to loopback fixture servers. Must never become
     /// settable from config or CLI in later phases.
     pub danger_allow_private: bool,
+    /// Test-only escape hatch, the sibling of `danger_allow_private`: a
+    /// listed host is reachable on any port, because the loopback fixture
+    /// servers tests dial listen on ports the kernel picks. Same rule:
+    /// never config- or CLI-exposable. The port policy's own tests run
+    /// with it off.
+    pub danger_any_port: bool,
     /// Shared audit-log handle (phase 5): when the launch audit log is
     /// on, each CONNECT appends a verdict record. The file is
     /// supervisor-side; the sandbox never sees it.
@@ -134,6 +142,7 @@ impl ProxyConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
             danger_allow_private: false,
+            danger_any_port: false,
             audit: None,
             secrets: Vec::new(),
             danger_extra_roots: Vec::new(),
@@ -897,13 +906,28 @@ fn handle_conn<S: ClientStream>(
     // bytes.
     conn.record.target(&host, port);
 
-    let allowlisted = allowlist_matches(&shared.config.allowlist, &host);
-    let prompting = !allowlisted
+    let host_listed = allowlist_matches(&shared.config.allowlist, &host);
+    let allowlisted = if shared.config.danger_any_port {
+        host_listed
+    } else {
+        allowlist_permits(&shared.config.allowlist, &host, port)
+    };
+    // The prompt answers for a host, so it only ever opens the default
+    // ports: a listed host on an unlisted port is refused, never asked,
+    // and an approved host does not gain its SSH port.
+    let prompting = !host_listed
         && shared.config.prompt.is_some()
-        && promptable_host(&host);
+        && promptable_host(&host)
+        && (shared.config.danger_any_port
+            || DEFAULT_ALLOWED_PORTS.contains(&port));
     if !allowlisted && !prompting {
-        audit_verdict(&shared, &host, port, "deny", "not-in-allowlist");
-        conn.record.verdict(Verdict::Deny, "not-in-allowlist");
+        let reason = if host_listed {
+            "port-not-allowed"
+        } else {
+            "not-in-allowlist"
+        };
+        audit_verdict(&shared, &host, port, "deny", reason);
+        conn.record.verdict(Verdict::Deny, reason);
         reject(&mut client, &Reject::ForbiddenHost);
         return;
     }
@@ -1203,26 +1227,119 @@ fn normalize_host(host: &str) -> String {
     host.trim_end_matches('.').to_lowercase()
 }
 
+/// Ports an allowlist entry that names none opens: HTTPS, and HTTP for
+/// the absolute-form requests the proxy terminates. Any other port has to
+/// be named (`github.com:22`): allowing a host for its web API used to
+/// open every service it runs, SSH included, and nothing said so.
+pub(crate) const DEFAULT_ALLOWED_PORTS: [u16; 2] = [443, 80];
+
+/// An allowlist entry split into its host and the port it names, if any.
+/// `host:port` and `[v6]:port` name a port; a bare host or an IP literal
+/// names none -- an IPv6 literal's colons are never read as a port, so a
+/// port on one needs the brackets. Port 0, an empty host, a non-numeric
+/// port and an unbracketed `v6:port` are refused rather than guessed at.
+pub(crate) fn split_allow_entry(
+    entry: &str,
+) -> Result<(&str, Option<u16>), String> {
+    let refuse =
+        |why: &str| Err(format!("invalid allowlist entry {entry:?}: {why}"));
+    let parse_port = |text: &str| match text.parse::<u16>() {
+        Ok(0) | Err(_) => None,
+        Ok(port) => Some(port),
+    };
+    if let Some(rest) = entry.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return refuse("unclosed '['");
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return refuse("brackets hold an IPv6 address only");
+        }
+        return match after {
+            "" => Ok((host, None)),
+            _ => match after.strip_prefix(':').and_then(parse_port) {
+                Some(port) => Ok((host, Some(port))),
+                None => refuse("the port must be 1-65535"),
+            },
+        };
+    }
+    if entry.parse::<IpAddr>().is_ok() {
+        return Ok((entry, None));
+    }
+    match entry.rsplit_once(':') {
+        None if entry.is_empty() => refuse("empty host"),
+        None => Ok((entry, None)),
+        Some(("", _)) => refuse("empty host"),
+        Some((host, _)) if host.contains(':') => {
+            refuse("an IPv6 address with a port needs brackets: [addr]:port")
+        }
+        Some((host, port)) => match parse_port(port) {
+            Some(port) => Ok((host, Some(port))),
+            None => refuse("the port must be 1-65535"),
+        },
+    }
+}
+
+/// Whether `host` is `entry_host` or one of its subdomains. IP literals
+/// match only themselves. Case-insensitive, trailing-dot normalized.
+fn host_matches_entry(entry_host: &str, host: &str) -> bool {
+    let host = normalize_host(host);
+    let entry = normalize_host(entry_host);
+    if let Ok(entry_ip) = entry.parse::<IpAddr>() {
+        return host.parse::<IpAddr>().is_ok_and(|ip| ip == entry_ip);
+    }
+    if host == entry {
+        return true;
+    }
+    host.len() > entry.len()
+        && host.ends_with(&entry)
+        && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+}
+
 /// Allowlist semantics: an entry `example.com` matches `example.com`
 /// itself and any subdomain (`api.example.com`), so `notexample.com`
 /// and `example.com.evil.com` never match it. Entries that are IP
 /// literals match only that exact IP -- no suffix rule for addresses.
 /// Matching is case-insensitive and trailing-dot normalized on both
-/// sides.
+/// sides. This answers for the host alone, whatever port an entry names;
+/// a connection is decided by [`allowlist_permits`]. An entry
+/// [`split_allow_entry`] refuses matches nothing (launch refuses it
+/// first, see [`validate_allowlist`]).
 pub(crate) fn allowlist_matches(allowlist: &[String], host: &str) -> bool {
-    let host = normalize_host(host);
     allowlist.iter().any(|entry| {
-        let entry = normalize_host(entry);
-        if let Ok(entry_ip) = entry.parse::<IpAddr>() {
-            return host.parse::<IpAddr>().is_ok_and(|ip| ip == entry_ip);
-        }
-        if host == entry {
-            return true;
-        }
-        host.len() > entry.len()
-            && host.ends_with(&entry)
-            && host.as_bytes()[host.len() - entry.len() - 1] == b'.'
+        split_allow_entry(entry)
+            .is_ok_and(|(entry_host, _)| host_matches_entry(entry_host, host))
     })
+}
+
+/// Whether the allowlist lets a connection reach `host:port`: an entry
+/// matches the host (as in [`allowlist_matches`]) and either names this
+/// port or names none and the port is one of [`DEFAULT_ALLOWED_PORTS`].
+pub(crate) fn allowlist_permits(
+    allowlist: &[String],
+    host: &str,
+    port: u16,
+) -> bool {
+    allowlist
+        .iter()
+        .any(|entry| match split_allow_entry(entry) {
+            Ok((entry_host, entry_port)) => {
+                host_matches_entry(entry_host, host)
+                    && match entry_port {
+                        Some(named) => named == port,
+                        None => DEFAULT_ALLOWED_PORTS.contains(&port),
+                    }
+            }
+            Err(_) => false,
+        })
+}
+
+/// Refuse a launch whose allowlist holds an entry [`split_allow_entry`]
+/// cannot read, so a typo such as `github.com:2a` fails loudly instead
+/// of silently matching nothing.
+pub(crate) fn validate_allowlist(allowlist: &[String]) -> Result<(), String> {
+    allowlist
+        .iter()
+        .try_for_each(|entry| split_allow_entry(entry).map(|_| ()))
 }
 
 /// SSRF guard: the refused class of an address, or None if dialable.
@@ -1491,8 +1608,12 @@ fn handle_http_termination<S: ClientStream>(
         .secrets
         .iter()
         .find(|b| b.host.eq_ignore_ascii_case(&host));
-    if !allowlist_matches(&shared.config.allowlist, &host) || binding.is_none()
-    {
+    let permitted = if shared.config.danger_any_port {
+        allowlist_matches(&shared.config.allowlist, &host)
+    } else {
+        allowlist_permits(&shared.config.allowlist, &host, port)
+    };
+    if !permitted || binding.is_none() {
         reject(&mut client, &Reject::MethodNotAllowed);
         return;
     }
@@ -2255,6 +2376,84 @@ mod tests {
     }
 
     #[test]
+    fn allow_entry_names_a_port_or_none() {
+        assert_eq!(split_allow_entry("github.com"), Ok(("github.com", None)));
+        assert_eq!(
+            split_allow_entry("github.com:22"),
+            Ok(("github.com", Some(22)))
+        );
+        assert_eq!(
+            split_allow_entry("93.184.216.34:8443"),
+            Ok(("93.184.216.34", Some(8443)))
+        );
+        // An IPv6 literal's colons are never a port; a port needs brackets.
+        assert_eq!(
+            split_allow_entry("2606:4700:4700::1111"),
+            Ok(("2606:4700:4700::1111", None))
+        );
+        assert_eq!(split_allow_entry("[::1]"), Ok(("::1", None)));
+        assert_eq!(split_allow_entry("[::1]:22"), Ok(("::1", Some(22))));
+    }
+
+    #[test]
+    fn allow_entry_refuses_what_it_cannot_read() {
+        for bad in [
+            "",
+            ":22",
+            "github.com:",
+            "github.com:0",
+            "github.com:65536",
+            "github.com:2a",
+            "[::1",
+            "[::1]22",
+            "[::1]:",
+            "[github.com]:22",
+            "fe80::1:x:22",
+        ] {
+            assert!(split_allow_entry(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(
+            validate_allowlist(&entries(&["github.com", "github.com:22"]))
+                .is_ok()
+        );
+        let err =
+            validate_allowlist(&entries(&["github.com", "github.com:2a"]))
+                .unwrap_err();
+        assert!(err.contains("github.com:2a"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_entry_opens_only_the_default_ports() {
+        let allowlist = entries(&["github.com"]);
+        assert!(allowlist_permits(&allowlist, "github.com", 443));
+        assert!(allowlist_permits(&allowlist, "api.github.com", 80));
+        // Before ports were explicit this was open, and nothing said so.
+        assert!(!allowlist_permits(&allowlist, "github.com", 22));
+        assert!(!allowlist_permits(&allowlist, "github.com", 8443));
+        // The host still counts as listed, for the callers that ask that.
+        assert!(allowlist_matches(&allowlist, "github.com"));
+    }
+
+    #[test]
+    fn a_named_port_opens_that_port_alone() {
+        let allowlist = entries(&["github.com:22"]);
+        assert!(allowlist_permits(&allowlist, "github.com", 22));
+        assert!(allowlist_permits(&allowlist, "ssh.github.com", 22));
+        assert!(!allowlist_permits(&allowlist, "github.com", 443));
+        assert!(!allowlist_permits(&allowlist, "notgithub.com", 22));
+        let both = entries(&["github.com", "github.com:22"]);
+        assert!(allowlist_permits(&both, "github.com", 443));
+        assert!(allowlist_permits(&both, "github.com", 22));
+        let v6 = entries(&["[2606:4700:4700::1111]:853"]);
+        assert!(allowlist_permits(&v6, "2606:4700:4700::1111", 853));
+        assert!(!allowlist_permits(&v6, "2606:4700:4700::1111", 443));
+        // An unreadable entry matches nothing at all.
+        let broken = entries(&["github.com:2a"]);
+        assert!(!allowlist_matches(&broken, "github.com"));
+        assert!(!allowlist_permits(&broken, "github.com", 443));
+    }
+
+    #[test]
     fn allowlist_case_and_trailing_dot_normalized() {
         let allowlist = entries(&["Example.COM."]);
         assert!(allowlist_matches(&allowlist, "example.com"));
@@ -2495,6 +2694,7 @@ mod tests {
         // Tests CONNECT to loopback fixture servers, which the real
         // SSRF guard would refuse; this knob is test-only.
         config.danger_allow_private = true;
+        config.danger_any_port = true;
         config
     }
 
@@ -3712,6 +3912,7 @@ mod tests {
         let mut config =
             ProxyConfig::new(allowlist.iter().map(|s| s.to_string()).collect());
         config.danger_allow_private = true;
+        config.danger_any_port = true;
         config
     }
 
@@ -3890,6 +4091,45 @@ mod tests {
         assert_eq!(got[0]["bytes_down"], 5);
         let t = h.stats.snapshot();
         assert_eq!((t.allowed, t.bytes_up, t.bytes_down), (1, 5, 5));
+    }
+
+    #[test]
+    fn a_listed_host_on_an_unlisted_port_is_refused() {
+        // The port policy itself: no danger_any_port here.
+        let echo = echo_server();
+        let mut config = ProxyConfig::new(entries(&["127.0.0.1"]));
+        config.danger_allow_private = true;
+        let h = harness("port-deny", config);
+        let s = send(
+            h.proxy.port(),
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert!(read_head(&s).contains("403"));
+        let got = wait_lines(&h.path, 1);
+        assert_eq!(got[0]["verdict"], "deny");
+        assert_eq!(got[0]["reason"], "port-not-allowed");
+        assert_eq!(got[0]["port"], echo);
+    }
+
+    #[test]
+    fn a_named_port_is_reachable() {
+        let echo = echo_server();
+        let mut config = ProxyConfig::new(vec![format!("127.0.0.1:{echo}")]);
+        config.danger_allow_private = true;
+        let h = harness("port-allow", config);
+        let s = send(
+            h.proxy.port(),
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(read_head(&s), REPLY_OK);
+        (&s).write_all(b"hello").unwrap();
+        let mut buf = [0_u8; 5];
+        (&mut &s).read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+        drop(s);
+        let got = wait_lines(&h.path, 1);
+        assert_eq!(got[0]["verdict"], "allow");
+        assert_eq!(got[0]["reason"], "in-allowlist");
     }
 
     #[test]

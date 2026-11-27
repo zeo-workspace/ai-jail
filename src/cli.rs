@@ -184,9 +184,10 @@ OPTIONS:
     --allow-tcp-port <PORT>        Deprecated and rejected at launch (UDP cannot be
                                    isolated); use --allow-host for filtered egress
                                    instead (still parsed for back-compat)
-    --allow-host <HOST>            Allow CONNECT egress to HOST and its subdomains via the
-                                   built-in filtered proxy (repeatable; implies filtered
-                                   network mode; cannot combine with --network)
+    --allow-host <HOST[:PORT]>     Allow CONNECT egress to HOST and its subdomains via the
+                                   built-in filtered proxy, on ports 443 and 80, or on PORT
+                                   alone when named (github.com:22, [::1]:8443; repeatable;
+                                   implies filtered network mode; cannot combine with --network)
     --prompt-hosts / --no-prompt-hosts
                                    In filtered egress mode, ask through a desktop
                                    notification (notify-send) before refusing a host
@@ -526,6 +527,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 if host.is_empty() {
                     return Err("--allow-host requires a non-empty host".into());
                 }
+                crate::proxy::split_allow_entry(&host)
+                    .map_err(|e| format!("--allow-host: {e}"))?;
                 args.allow_hosts.push(host.into_owned());
             }
             Long("allow-private-host") => {
@@ -536,6 +539,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                         "--allow-private-host requires a non-empty host".into(),
                     );
                 }
+                crate::proxy::split_allow_entry(&host)
+                    .map_err(|e| format!("--allow-private-host: {e}"))?;
                 args.allow_private_hosts.push(host.into_owned());
             }
             Long("forward-port") => {

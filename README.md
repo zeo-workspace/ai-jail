@@ -301,7 +301,12 @@ strictest mode:
 `--allow-host HOST` (repeatable, or `allow_hosts = [...]` in trusted config)
 enables filtered egress instead: the sandbox keeps no route off the host
 except a built-in CONNECT proxy that dials exactly the listed hosts — an
-entry matches the host itself and its subdomains. On Linux the fence is a
+entry matches the host itself and its subdomains, on ports 443 and 80. Any
+other port has to be named in the entry, and then only that port opens:
+`github.com:22` for SSH, `[2001:db8::1]:8443` for an IPv6 address (the
+brackets keep its colons from being read as a port). An entry ai-jail cannot
+read refuses the launch. The interactive prompt (`--prompt-hosts`) only ever
+opens 443 and 80. On Linux the fence is a
 private network namespace whose only reachable endpoint is an in-sandbox
 bridge; on macOS it is a seatbelt endpoint rule allowing outbound only to
 the proxy's loopback port. It is TCP/CONNECT-only:
@@ -773,7 +778,7 @@ flag is CLI-only; no configuration key enables it.
 | `run_id`                         | 32 hex characters, the same for every line of one launch                                                                                                                                                                                                                                           |
 | `host`, `port`                   | the requested target; `null` when no request was parsed                                                                                                                                                                                                                                            |
 | `verdict`                        | `allow`, `deny` (refused by policy) or `error` (the connection failed: a malformed or oversized request, or an upstream or client that could not be reached or written to)                                                                                                                         |
-| `reason`                         | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
+| `reason`                         | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `port-not-allowed`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
 | `bytes_up`, `bytes_down`         | bytes relayed to and from the upstream, counted even when the transfer ends early                                                                                                                                                                                                                  |
 | `duration_ms`                    | from accept to close                                                                                                                                                                                                                                                                               |
 | `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS                                                                                                                                                                                                            |
