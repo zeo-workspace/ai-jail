@@ -324,16 +324,26 @@ kernel does (32-bit) so a high-bit variant cannot slip past the filter.
 On kernels ≥ 6.12 Landlock also scopes abstract Unix sockets and signals
 (best-effort) as a further backstop.
 
-Phantom credentials (`--secret KEY=host[,host...]`, filtered egress only)
-shift part of the trust boundary to the supervisor: the sandbox env holds an
-`AIJAIL-PHANTOM-…` placeholder, new for every launch, and the egress proxy
-substitutes the real value only in the request head — `Authorization: Basic`
-decoded and re-encoded — of requests to a bound host: plain-HTTP proxy
-requests, and on Linux HTTPS through CONNECT. Placeholders are not credentials
-— knowing one authorizes nothing — and real values live only in supervisor
-memory, never in any config file, the audit log, or the sandbox. Substitution
-is scoped per host: a placeholder sent to a host its key is not bound to goes
-out unchanged.
+Phantom credentials (`--secret KEY=host[,host...][?param,...]`, filtered
+egress only) shift part of the trust boundary to the supervisor: the sandbox
+env holds an `AIJAIL-PHANTOM-…` placeholder, new for every launch, and the
+egress proxy substitutes the real value in requests to a bound host —
+plain-HTTP proxy requests, and on Linux HTTPS through CONNECT on port 443 —
+and only where a credential belongs: the `Authorization` header
+(`Basic` decoded and re-encoded), the `x-api-key` header, and the values of the
+query parameters named after `?` (percent-encoded). A placeholder anywhere else
+in the request head — the path, an unnamed parameter, any other header —
+refuses the request with `400` before any dial, because a server that reflects
+that place (a redirect, an error page, `Access-Control-Allow-Origin`) would
+hand the real value back to the sandbox. So does a `Host` header that does not
+name the bound origin (domain fronting on a shared front end). The response
+head is scrubbed of the real value, raw and percent-encoded; the response body
+is not rewritten, so a host that echoes a credential in its body — and a named
+query parameter is the most echoed place — can still reveal it: bind a secret
+only to hosts that do not. Placeholders are not credentials — knowing one
+authorizes nothing — and real values live only in supervisor memory, never in
+any config file, the audit log, or the sandbox. Substitution is scoped per
+host: a placeholder sent to a host its key is not bound to goes out unchanged.
 
 HTTPS injection works by interception, and its trust anchor is narrow on
 purpose. The supervisor makes one CA per launch; its private key and every

@@ -206,12 +206,27 @@ fn prepare_secrets(
     let session = secret::session_nonce();
     let mut bindings = Vec::new();
     for (key, hosts_value) in bindings_spec {
-        let hosts = secret::split_hosts(&hosts_value);
+        let (hosts, query_params) = secret::split_spec(&hosts_value);
         if hosts.is_empty() {
             return Err(format!("--secret {key}: names no host"));
         }
+        if hosts_value.contains('?') && query_params.is_empty() {
+            return Err(format!(
+                "--secret {key}: names no query parameter after '?'"
+            ));
+        }
+        if let Some(bad) =
+            query_params.iter().find(|p| !secret::valid_query_param(p))
+        {
+            return Err(format!(
+                "--secret {key}: query parameter {bad:?} must be letters, digits, '_', '-' or '.'"
+            ));
+        }
         for host in &hosts {
-            if host.contains("://") || host.contains('/') || host.contains(':')
+            if host.contains("://")
+                || host.contains('/')
+                || host.contains(':')
+                || host.contains('?')
             {
                 return Err(format!(
                     "--secret {key}: host must be a bare hostname, not {host:?}"
@@ -258,6 +273,7 @@ fn prepare_secrets(
             .iter()
             .map(|host| {
                 secret::SecretBinding::with_session(&key, &real, host, &session)
+                    .with_query_params(query_params.clone())
             })
             .collect();
         // Remove EVERY entry for this key, then insert exactly one placeholder,

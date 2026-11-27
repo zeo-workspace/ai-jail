@@ -145,13 +145,18 @@ OPTIONS:
     --env-from-file <PATH>          Read KEY=VALUE lines from PATH (repeatable; file
                                     must be user-owned, mode 0600, outside the project;
                                     applies like --env, which wins on conflicts)
-    --secret <KEY=host[,host...]>   Keep KEY's real value out of the sandbox: the child
+    --secret <KEY=host[,host...][?param,...]>
+                                    Keep KEY's real value out of the sandbox: the child
                                     sees a per-launch placeholder; the egress proxy
                                     substitutes the real value only in requests to the
                                     named hosts, over HTTP or HTTPS (it trusts a CA made
-                                    for this launch and those hosts alone; Linux), Basic
-                                    auth included (repeatable; every host must be in
-                                    --allow-host, no port; requires filtered egress)
+                                    for this launch and those hosts alone; Linux, port
+                                    443), and only in the Authorization (Basic included)
+                                    and x-api-key headers and the query parameters named
+                                    after '?'; a placeholder anywhere else, or a Host
+                                    header naming another origin, refuses the request
+                                    (repeatable; every host must be in --allow-host, no
+                                    port; requires filtered egress)
     --inherit-env / --no-inherit-env
                                     Inherit the full host environment (default: off —
                                     only a safe allowlist is passed)

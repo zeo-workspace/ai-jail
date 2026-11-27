@@ -9,6 +9,15 @@
 //! proxy decrypts with a per-launch CA ([`crate::tls_inject`]). Every
 //! other CONNECT tunnel stays opaque and untouched.
 //!
+//! Inside that head the substitution is scoped to where a credential
+//! belongs: the `Authorization` and `x-api-key` header values, and the
+//! query parameters the binding names (`--secret KEY=host?param`). A
+//! placeholder anywhere else -- the path, another header -- refuses the
+//! request, because a server that reflects that place (a redirect, a 404
+//! page, CORS's `Access-Control-Allow-Origin`) would hand the real value
+//! back to the sandbox. The response head is scrubbed of the real value
+//! on its way back, as defence in depth.
+//!
 //! A placeholder is `AIJAIL-PHANTOM-<16 hex>`, derived from the key, the
 //! value and a per-launch session nonce: two launches never share one,
 //! so a placeholder seen in one session's logs says nothing about the
@@ -28,6 +37,10 @@ pub(crate) struct SecretBinding {
     pub placeholder: String,
     pub real: String,
     pub host: String,
+    /// Query parameters whose values may carry the placeholder, from the
+    /// `?param,param` suffix of the `--secret` value. Empty by default:
+    /// no query parameter is a credential unless the binding says so.
+    pub query_params: Vec<String>,
 }
 
 impl SecretBinding {
@@ -53,7 +66,14 @@ impl SecretBinding {
             placeholder: format!("AIJAIL-PHANTOM-{}", &digest[..16]),
             real: real.to_string(),
             host: host.to_string(),
+            query_params: Vec::new(),
         }
+    }
+
+    /// The same binding, also allowed in the query parameters `params`.
+    pub(crate) fn with_query_params(mut self, params: Vec<String>) -> Self {
+        self.query_params = params;
+        self
     }
 }
 
@@ -65,6 +85,7 @@ impl std::fmt::Debug for SecretBinding {
             .field("placeholder", &self.placeholder)
             .field("real", &"[redacted]")
             .field("host", &self.host)
+            .field("query_params", &self.query_params)
             .finish()
     }
 }
@@ -97,56 +118,200 @@ pub(crate) fn split_hosts(value: &str) -> Vec<String> {
     hosts
 }
 
-/// Byte-replace every placeholder occurrence in `head` (the request
-/// line and headers only -- never the body) with the real value,
-/// returning the rewritten bytes and the substitution count for
-/// auditing. Multiple bindings stack; a placeholder that never appears
-/// costs nothing.
+/// The hosts and the query parameters a `secret_hosts` value names:
+/// `host[,host...][?param[,param...]]`. The parameter list applies to
+/// every host of the value. A value without `?` names no parameter, which
+/// is every value written before parameters existed.
+pub(crate) fn split_spec(value: &str) -> (Vec<String>, Vec<String>) {
+    match value.split_once('?') {
+        Some((hosts, params)) => (split_hosts(hosts), split_hosts(params)),
+        None => (split_hosts(value), Vec::new()),
+    }
+}
+
+/// Whether `name` can be a query parameter a binding names: a non-empty
+/// run of ASCII letters, digits, `_`, `-` and `.`, so it never needs
+/// percent-decoding to be compared.
+pub(crate) fn valid_query_param(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+}
+
+/// The request was refused: a placeholder sat outside the places its
+/// binding allows, and substituting it there could reflect the real value.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OutOfScope;
+
+/// Headers whose value is a credential, and the only ones substituted.
+const CREDENTIAL_HEADERS: [&[u8]; 2] = [b"authorization", b"x-api-key"];
+
+/// Substitute each binding's placeholder in `head` (the request line and
+/// headers only -- never the body) where a credential belongs: the
+/// [`CREDENTIAL_HEADERS`] values (Basic auth decoded and re-encoded) and
+/// the values of the query parameters the binding names (the real value
+/// percent-encoded). Returns the rewritten head and the substitution
+/// count for auditing, or [`OutOfScope`] when a placeholder remains
+/// anywhere else. A placeholder that never appears costs nothing.
 pub(crate) fn rewrite_head(
     head: &[u8],
     bindings: &[SecretBinding],
-) -> (Vec<u8>, usize) {
-    let (mut out, mut substitutions) = rewrite_basic_auth(head, bindings);
-    for binding in bindings {
-        let (rewritten, count) = replace_all(
-            &out,
-            binding.placeholder.as_bytes(),
-            binding.real.as_bytes(),
-        );
-        out = rewritten;
-        substitutions += count;
-    }
-    (out, substitutions)
-}
-
-/// `Authorization: Basic` carries `base64(user:password)`, so a
-/// placeholder used as the password -- `git push` over HTTPS with a token
-/// does exactly that -- is invisible to a byte search. Decode each Basic
-/// credential in the head, substitute, and re-encode it. Any other
-/// header passes through unchanged; a credential that does not decode,
-/// or holds no placeholder, is left byte for byte.
-fn rewrite_basic_auth(
-    head: &[u8],
-    bindings: &[SecretBinding],
-) -> (Vec<u8>, usize) {
+) -> Result<(Vec<u8>, usize), OutOfScope> {
     let mut out = Vec::with_capacity(head.len());
     let mut substitutions = 0;
     let mut rest = head;
+    let mut first = true;
     loop {
         let line_end = find_subslice(rest, b"\r\n").unwrap_or(rest.len());
         let line = &rest[..line_end];
-        out.extend_from_slice(&rewrite_basic_line(
-            line,
-            bindings,
-            &mut substitutions,
-        ));
+        let rewritten = if first {
+            rewrite_request_line(line, bindings, &mut substitutions)
+        } else {
+            rewrite_header_line(line, bindings, &mut substitutions)
+        };
+        out.extend_from_slice(&rewritten);
+        first = false;
         if line_end == rest.len() {
             break;
         }
         out.extend_from_slice(b"\r\n");
         rest = &rest[line_end + 2..];
     }
-    (out, substitutions)
+    let leftover = bindings.iter().any(|binding| {
+        find_subslice(&out, binding.placeholder.as_bytes()).is_some()
+    });
+    if leftover {
+        return Err(OutOfScope);
+    }
+    Ok((out, substitutions))
+}
+
+/// Replace each binding's real value in a response head with its
+/// placeholder, raw and percent-encoded: a server that echoes the
+/// credential (a `Location` carrying the query, a debug header) must not
+/// hand it to the sandbox. Only the head is passed here; the body's
+/// length is the server's to state.
+pub(crate) fn scrub_response_head(
+    head: &[u8],
+    bindings: &[SecretBinding],
+) -> Vec<u8> {
+    let mut out = head.to_vec();
+    for binding in bindings {
+        if binding.real.is_empty() {
+            continue;
+        }
+        let encoded = percent_encode(binding.real.as_bytes());
+        for real in [binding.real.as_bytes(), encoded.as_slice()] {
+            out = replace_all(&out, real, binding.placeholder.as_bytes()).0;
+        }
+    }
+    out
+}
+
+/// The request line `METHOD SP target SP version`: only the values of
+/// the query parameters a binding names are substituted.
+fn rewrite_request_line(
+    line: &[u8],
+    bindings: &[SecretBinding],
+    substitutions: &mut usize,
+) -> Vec<u8> {
+    let mut parts = line.splitn(3, |b| *b == b' ');
+    let (Some(method), Some(target), Some(version)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return line.to_vec();
+    };
+    let Some(query_at) = target.iter().position(|b| *b == b'?') else {
+        return line.to_vec();
+    };
+    let (path, query) = (&target[..=query_at], &target[query_at + 1..]);
+    let mut rebuilt_query = Vec::with_capacity(query.len());
+    for (index, pair) in query.split(|b| *b == b'&').enumerate() {
+        if index > 0 {
+            rebuilt_query.push(b'&');
+        }
+        let Some(eq) = pair.iter().position(|b| *b == b'=') else {
+            rebuilt_query.extend_from_slice(pair);
+            continue;
+        };
+        let (name, value) = (&pair[..eq], &pair[eq + 1..]);
+        let mut value = value.to_vec();
+        for binding in bindings {
+            if binding.query_params.iter().any(|p| p.as_bytes() == name) {
+                let (rewritten, n) = replace_all(
+                    &value,
+                    binding.placeholder.as_bytes(),
+                    &percent_encode(binding.real.as_bytes()),
+                );
+                value = rewritten;
+                *substitutions += n;
+            }
+        }
+        rebuilt_query.extend_from_slice(name);
+        rebuilt_query.push(b'=');
+        rebuilt_query.extend_from_slice(&value);
+    }
+    let mut out = method.to_vec();
+    out.push(b' ');
+    out.extend_from_slice(path);
+    out.extend_from_slice(&rebuilt_query);
+    out.push(b' ');
+    out.extend_from_slice(version);
+    out
+}
+
+/// A header line: substituted only when its name is one of the
+/// [`CREDENTIAL_HEADERS`], and then only in its value.
+fn rewrite_header_line(
+    line: &[u8],
+    bindings: &[SecretBinding],
+    substitutions: &mut usize,
+) -> Vec<u8> {
+    let Some(colon) = line.iter().position(|b| *b == b':') else {
+        return line.to_vec();
+    };
+    let name = &line[..colon];
+    if !CREDENTIAL_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+    {
+        return line.to_vec();
+    }
+    let line = rewrite_basic_line(line, bindings, substitutions);
+    let colon = line.iter().position(|b| *b == b':').unwrap_or(line.len());
+    let mut value = line[colon..].to_vec();
+    for binding in bindings {
+        let (rewritten, n) = replace_all(
+            &value,
+            binding.placeholder.as_bytes(),
+            binding.real.as_bytes(),
+        );
+        value = rewritten;
+        *substitutions += n;
+    }
+    let mut out = line[..colon].to_vec();
+    out.extend_from_slice(&value);
+    out
+}
+
+/// RFC 3986 percent-encoding of everything outside the unreserved set,
+/// so a real value with `&`, `=`, `+` or `/` stays one query value.
+fn percent_encode(input: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = Vec::with_capacity(input.len());
+    for &b in input {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b);
+        } else {
+            out.extend_from_slice(&[
+                b'%',
+                HEX[usize::from(b >> 4)],
+                HEX[usize::from(b & 15)],
+            ]);
+        }
+    }
+    out
 }
 
 fn rewrite_basic_line(
@@ -158,8 +323,7 @@ fn rewrite_basic_line(
         return line.to_vec();
     };
     let (name, value) = (&line[..colon], &line[colon + 1..]);
-    let is_auth = name.eq_ignore_ascii_case(b"authorization")
-        || name.eq_ignore_ascii_case(b"proxy-authorization");
+    let is_auth = name.eq_ignore_ascii_case(b"authorization");
     let trimmed = value.trim_ascii_start();
     let scheme_len = b"basic ".len();
     if !is_auth
@@ -308,7 +472,7 @@ mod tests {
              \r\n",
             b.placeholder, b.placeholder
         );
-        let (out, count) = rewrite_head(head.as_bytes(), &[binding()]);
+        let (out, count) = rewrite_head(head.as_bytes(), &[binding()]).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert_eq!(count, 2);
         assert!(!out.contains(&b.placeholder));
@@ -318,7 +482,7 @@ mod tests {
     #[test]
     fn rewrite_head_noop_without_placeholder() {
         let head = b"GET / HTTP/1.1\r\nhost: example.com\r\n\r\n";
-        let (out, count) = rewrite_head(head, &[binding()]);
+        let (out, count) = rewrite_head(head, &[binding()]).unwrap();
         assert_eq!(count, 0);
         assert_eq!(out, head);
     }
@@ -379,7 +543,7 @@ mod tests {
              Host: github.com\r\n\
              Authorization: Basic {credential}\r\n\r\n"
         );
-        let (out, count) = rewrite_head(head.as_bytes(), &[binding()]);
+        let (out, count) = rewrite_head(head.as_bytes(), &[binding()]).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert_eq!(count, 1);
         let expected = base64_encode(b"x-access-token:sk-ant-real");
@@ -393,7 +557,7 @@ mod tests {
     #[test]
     fn basic_auth_without_a_placeholder_is_left_byte_for_byte() {
         let head = b"GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\nX-Other: Basic AIJAIL\r\n\r\n";
-        let (out, count) = rewrite_head(head, &[binding()]);
+        let (out, count) = rewrite_head(head, &[binding()]).unwrap();
         assert_eq!(count, 0);
         assert_eq!(out, head);
     }
@@ -403,13 +567,90 @@ mod tests {
         // A placeholder straddling a multibyte boundary still matches;
         // non-UTF-8 bytes elsewhere pass through untouched.
         let b = binding();
-        let mut head = b"GET / HTTP/1.1\r\nx-k: ".to_vec();
+        let mut head = b"GET / HTTP/1.1\r\nx-api-key: ".to_vec();
         head.extend_from_slice(&[0xff, 0xfe]);
         head.extend_from_slice(b.placeholder.as_bytes());
         head.extend_from_slice(b"\r\n\r\n");
-        let (out, count) = rewrite_head(&head, &[binding()]);
+        let (out, count) = rewrite_head(&head, &[binding()]).unwrap();
         assert_eq!(count, 1);
         assert!(out.windows(2).any(|w| w == [0xff, 0xfe]));
         assert!(String::from_utf8_lossy(&out).contains("sk-ant-real"));
+    }
+
+    #[test]
+    fn a_placeholder_outside_a_credential_place_refuses_the_request() {
+        // Each of these places is one a server may reflect back.
+        let b = binding();
+        let p = &b.placeholder;
+        for head in [
+            format!("GET /{p}/ HTTP/1.1\r\nhost: a.example\r\n\r\n"),
+            format!("GET /?q={p} HTTP/1.1\r\nhost: a.example\r\n\r\n"),
+            format!("GET / HTTP/1.1\r\norigin: https://{p}.x\r\n\r\n"),
+            format!(
+                "GET / HTTP/1.1\r\nproxy-authorization: Bearer {p}\r\n\r\n"
+            ),
+            format!("GET / HTTP/1.1\r\nx-api-key: {p}\r\nx-echo: {p}\r\n\r\n"),
+        ] {
+            assert_eq!(
+                rewrite_head(head.as_bytes(), &[binding()]),
+                Err(OutOfScope),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_query_parameter_carries_the_value_percent_encoded() {
+        let b = SecretBinding::new("MAPS_KEY", "a&b=c/d+e", "maps.example")
+            .with_query_params(vec!["key".into()]);
+        let head = format!(
+            "GET /geo?x=1&key={}&y=2 HTTP/1.1\r\nhost: maps.example\r\n\r\n",
+            b.placeholder
+        );
+        let (out, count) =
+            rewrite_head(head.as_bytes(), std::slice::from_ref(&b)).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "GET /geo?x=1&key=a%26b%3Dc%2Fd%2Be&y=2 HTTP/1.1\r\nhost: maps.example\r\n\r\n"
+        );
+        // Another parameter, even on the same binding, is not a credential.
+        let other = format!(
+            "GET /geo?q={} HTTP/1.1\r\nhost: maps.example\r\n\r\n",
+            b.placeholder
+        );
+        assert_eq!(
+            rewrite_head(other.as_bytes(), std::slice::from_ref(&b)),
+            Err(OutOfScope)
+        );
+    }
+
+    #[test]
+    fn the_response_head_loses_the_real_value() {
+        let b = SecretBinding::new("K", "s3cr&t", "a.example");
+        let head = b"HTTP/1.1 302 Found\r\nlocation: /x?key=s3cr%26t\r\nx-debug: s3cr&t\r\n\r\n";
+        let out = String::from_utf8(scrub_response_head(
+            head,
+            std::slice::from_ref(&b),
+        ))
+        .unwrap();
+        assert!(!out.contains("s3cr"), "{out}");
+        assert_eq!(out.matches(&b.placeholder).count(), 2);
+    }
+
+    #[test]
+    fn a_secret_value_names_hosts_then_query_parameters() {
+        assert_eq!(
+            split_spec("a.example,b.example?key,api_key"),
+            (
+                vec!["a.example".to_string(), "b.example".to_string()],
+                vec!["key".to_string(), "api_key".to_string()]
+            )
+        );
+        assert_eq!(split_spec("a.example"), (vec!["a.example".into()], vec![]));
+        assert!(valid_query_param("api_key.v-2"));
+        for bad in ["", "a b", "a=b", "a&b", "k%20"] {
+            assert!(!valid_query_param(bad), "{bad:?}");
+        }
     }
 }
