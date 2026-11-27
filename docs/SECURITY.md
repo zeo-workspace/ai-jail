@@ -339,6 +339,14 @@ Tunnels to every other host stay opaque and carry no substitution. Not
 covered: macOS (no interception), WebSocket and other upgrades on a bound
 host, and more than one request per connection.
 
+SSH under filtered egress goes through the same proxy as HTTPS: an allowlist
+entry naming port 22 (`github.com:22`) gives the sandbox a ProxyCommand
+(`ai-jail --proxy-connect %h %p`, run from the in-sandbox copy of the binary)
+that asks the egress proxy for a CONNECT tunnel. The proxy applies its usual
+checks -- allowlist and port, DNS pinning, the address-range guard -- so no
+other host or port opens, and the tunnel is opaque like any other. The mode
+holds no privilege: it is a client of the in-sandbox bridge.
+
 The egress log (`--egress-log PATH`, Linux only, CLI-only) is written by the
 supervisor, never by the sandbox. What a line **can** contain: the line
 version, a UTC timestamp, the run id, the requested host and port, the verdict

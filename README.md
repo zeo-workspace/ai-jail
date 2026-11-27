@@ -379,6 +379,22 @@ version: one request per connection (`Connection: close`), no WebSocket or
 other upgrade on a bound host, and no HTTPS injection on macOS. The supervisor
 sees the plaintext of requests to bound hosts, by construction.
 
+### SSH through filtered egress: `--allow-host HOST:22`
+
+Filtered egress carries HTTP(S) tunnels, and `ssh` has no proxy setting of its
+own. When an allowlist entry opens some host's port 22
+(`--allow-host github.com:22`), the sandbox gets a ProxyCommand that tunnels
+`ssh` through the same egress proxy -- which still decides host by host and
+port by port, with DNS pinning and the address-range guard:
+
+- `GIT_SSH_COMMAND` is set to use it, so `git push` over SSH works as is,
+  unless you pass your own `GIT_SSH_COMMAND`;
+- `AI_JAIL_SSH_PROXY_COMMAND` holds it for anything else:
+  `ssh -o ProxyCommand="$AI_JAIL_SSH_PROXY_COMMAND" host cmd`.
+
+It opens a path, not a credential: keys and agents stay outside unless you map
+them. A refused host or port ends the command with the proxy's status line.
+
 ### Host loopback services: `--forward-port PORT`
 
 Without `--network` the sandbox has its own loopback, so services listening

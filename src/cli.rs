@@ -324,6 +324,10 @@ pub struct CliArgs {
     /// as (loopback port, outer proxy's Unix socket path). Spawned by
     /// the --landlock-exec wrapper before it restricts itself.
     pub proxy_bridge: Option<(u16, PathBuf)>,
+    /// Internal: `--proxy-connect HOST PORT`, the `ssh` ProxyCommand inside
+    /// a filtered-egress sandbox -- a CONNECT through the in-sandbox bridge,
+    /// then stdin/stdout piped through the tunnel.
+    pub proxy_connect: Option<(String, u16)>,
     /// Internal: run the in-sandbox end of a `--publish-port`, as
     /// (sandbox loopback port, supervisor's Unix socket path). Spawned
     /// by the --landlock-exec wrapper before it restricts itself.
@@ -818,6 +822,28 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 let sock: PathBuf =
                     parser.value().map_err(|e| e.to_string())?.into();
                 args.proxy_bridge = Some((port, sock));
+            }
+            Long("proxy-connect") => {
+                let host = parser
+                    .value()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                let val = parser.value().map_err(|e| e.to_string())?;
+                let port_text = val.to_string_lossy();
+                let port: u16 = port_text
+                    .parse()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| {
+                        format!("invalid proxy-connect port: {port_text}")
+                    })?;
+                if host.is_empty() || host.starts_with('-') {
+                    return Err(format!(
+                        "invalid proxy-connect host: {host:?}"
+                    ));
+                }
+                args.proxy_connect = Some((host, port));
             }
             Long("publish-bridge") => {
                 let val = parser.value().map_err(|e| e.to_string())?;
@@ -2907,6 +2933,19 @@ mod tests {
             parse_test(&["bash", "--allow-private-host=gitlab.example.com"])
                 .unwrap_err()
                 .contains("after command")
+        );
+    }
+
+    #[test]
+    fn parse_proxy_connect_internal_mode() {
+        let args =
+            parse_test(&["--proxy-connect", "github.com", "22"]).unwrap();
+        assert_eq!(args.proxy_connect, Some(("github.com".into(), 22)));
+        assert!(parse_test(&["--proxy-connect", "github.com", "0"]).is_err());
+        assert!(parse_test(&["--proxy-connect", "github.com", "ssh"]).is_err());
+        assert!(parse_test(&["--proxy-connect", "github.com"]).is_err());
+        assert!(
+            parse_test(&["--proxy-connect", "-oProxyCommand=x", "22"]).is_err()
         );
     }
 
