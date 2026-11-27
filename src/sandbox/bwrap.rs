@@ -1592,7 +1592,7 @@ pub fn build(
         opt_args.extend(m.to_args());
     }
 
-    opt_args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    opt_args.extend(proxy_socket_mount_args(config, proxy_socket, true)?);
     opt_args.extend(bridge_socket_mount_args(config, bridge_sockets)?);
 
     opt_args.extend(mount_set.isolation_args(
@@ -1940,18 +1940,53 @@ fn write_bwrap_args_fd(args: &[String]) -> Result<std::os::fd::RawFd, String> {
 /// the /tmp tmpfs already exists (the same constraint as the Landlock
 /// wrapper binary mount above). Writable bind: the bridge connect()s to
 /// it, and Unix socket connect does not cross network namespaces.
+///
+/// `launch` is false for a dry run, which shows the mounts a launch would
+/// make without a proxy having written the CA files.
 fn proxy_socket_mount_args(
     config: &Config,
     proxy_socket: Option<&Path>,
+    launch: bool,
 ) -> Result<Vec<String>, String> {
     let filtered =
         config.network_mode() == crate::config::NetworkMode::Filtered;
     match (filtered, proxy_socket) {
-        (true, Some(sock)) => Ok(Mount::Bind {
-            src: sock.to_path_buf(),
-            dest: PathBuf::from(crate::proxy::IN_SANDBOX_SOCK_PATH),
+        (true, Some(sock)) => {
+            let mut args = Mount::Bind {
+                src: sock.to_path_buf(),
+                dest: PathBuf::from(crate::proxy::IN_SANDBOX_SOCK_PATH),
+            }
+            .to_args();
+            // HTTPS injection: the trust bundle and the CA the proxy wrote
+            // beside its socket, read-only. A secret without them would
+            // send its placeholder over an unverifiable tunnel, so a
+            // missing file refuses the sandbox rather than dropping it.
+            if !config.secret_hosts.is_empty() {
+                let (bundle, ca) = crate::tls_inject::bundle_paths(sock);
+                for (src, dest) in [
+                    (bundle, crate::tls_inject::IN_SANDBOX_BUNDLE_PATH),
+                    (ca, crate::tls_inject::IN_SANDBOX_CA_PATH),
+                ] {
+                    if launch
+                        && std::fs::symlink_metadata(&src)
+                            .map_or(true, |m| !m.file_type().is_file())
+                    {
+                        return Err(format!(
+                            "--secret needs the proxy's CA file {}",
+                            src.display()
+                        ));
+                    }
+                    args.extend(
+                        Mount::RoBind {
+                            src,
+                            dest: PathBuf::from(dest),
+                        }
+                        .to_args(),
+                    );
+                }
+            }
+            Ok(args)
         }
-        .to_args()),
         // Filtered egress without the outer proxy would silently mean
         // "no egress at all" -- refuse to build the sandbox instead.
         (true, None) => {
@@ -2096,7 +2131,7 @@ fn build_dry_run_args_forwarded(
         args.extend(m.to_args());
     }
 
-    args.extend(proxy_socket_mount_args(config, proxy_socket)?);
+    args.extend(proxy_socket_mount_args(config, proxy_socket, false)?);
     args.extend(bridge_socket_mount_args(config, bridge_sockets)?);
 
     args.extend(mount_set.isolation_args(
@@ -2273,6 +2308,11 @@ fn discover_mounts_full(
                     vars.push((key.clone(), value));
                 }
             }
+        }
+        // HTTPS injection: point the child's TLS clients at the mounted
+        // bundle (system roots plus the launch's CA).
+        if !config.secret_hosts.is_empty() {
+            vars.extend(crate::tls_inject::env_vars());
         }
         vars
     } else {
@@ -5547,6 +5587,36 @@ mod tests {
                 && w[1] == "KEY"
                 && !w[2].starts_with("AIJAIL-PHANTOM-")
         }));
+        // HTTPS injection: the CA files are mounted read-only and named
+        // by the TLS clients' environment.
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--ro-bind"
+                && w[1] == "/tmp/ai-jail-proxy-test.sock.ca-bundle.pem"
+                && w[2] == crate::tls_inject::IN_SANDBOX_BUNDLE_PATH
+        }));
+        assert!(args.windows(3).any(|w| {
+            w[0] == "--setenv"
+                && w[1] == "NODE_EXTRA_CA_CERTS"
+                && w[2] == crate::tls_inject::IN_SANDBOX_CA_PATH
+        }));
+    }
+
+    #[test]
+    fn a_launch_with_a_secret_refuses_missing_ca_files() {
+        let mut config = Config {
+            allow_hosts: vec!["api.anthropic.com".into()],
+            ..minimal_test_config()
+        };
+        config
+            .secret_hosts
+            .insert("KEY".into(), "api.anthropic.com".into());
+        let sock = std::env::temp_dir()
+            .join(format!("ai-jail-no-ca-{}.sock", std::process::id()));
+        let error =
+            proxy_socket_mount_args(&config, Some(&sock), true).unwrap_err();
+        assert!(error.contains("CA file"), "{error}");
+        // A dry run shows the mounts without the files.
+        assert!(proxy_socket_mount_args(&config, Some(&sock), false).is_ok());
     }
 
     #[test]

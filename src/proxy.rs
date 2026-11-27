@@ -105,6 +105,13 @@ pub(crate) struct ProxyConfig {
     /// placeholders rewritten to the real values, and re-originated
     /// over TLS.
     pub secrets: Vec<crate::secret::SecretBinding>,
+    /// The launch's HTTPS injection CA (Linux): a CONNECT to a host it
+    /// covers -- a secret-bound host -- is terminated with a leaf it
+    /// mints, its request head rewritten like the plain-HTTP path's, and
+    /// re-originated over real TLS. `None` keeps every tunnel opaque.
+    /// When set with a Unix socket, [`Proxy::start`] writes the trust
+    /// bundle beside the socket and `Drop` removes it.
+    pub inject_ca: Option<Arc<crate::tls_inject::InjectCa>>,
     /// Test-only escape hatch: extra TLS trust roots for the
     /// self-signed fixture in tests/. Same rule as
     /// `danger_allow_private`: never config- or CLI-exposable.
@@ -145,6 +152,7 @@ impl ProxyConfig {
             danger_any_port: false,
             audit: None,
             secrets: Vec::new(),
+            inject_ca: None,
             danger_extra_roots: Vec::new(),
             prompt: None,
             egress: None,
@@ -387,6 +395,14 @@ impl Proxy {
                 path,
                 std::fs::Permissions::from_mode(0o600),
             )?;
+            // The injection trust bundle lives beside the socket and shares
+            // its lifetime: the sandbox mounts both, and Drop removes both.
+            if let Some(ca) = &shared.config.inject_ca
+                && let Err(e) = crate::tls_inject::write_bundle(ca, path)
+            {
+                let _ = std::fs::remove_file(path);
+                return Err(io::Error::other(e));
+            }
             shared.keep_listener(
                 unix_listener.try_clone().map(DrainListener::Unix),
             );
@@ -491,6 +507,7 @@ impl Drop for Proxy {
     fn drop(&mut self) {
         if let Some(path) = &self.unix_path {
             let _ = std::fs::remove_file(path);
+            crate::tls_inject::remove_bundle(path);
         }
     }
 }
@@ -932,6 +949,18 @@ fn handle_conn<S: ClientStream>(
         return;
     }
 
+    // HTTPS injection: only an allowlisted (never a prompted) host that
+    // the launch's CA covers, which is to say a secret-bound one. Every
+    // other tunnel below stays opaque.
+    if allowlisted
+        && let Some(ca) = shared.config.inject_ca.clone()
+        && ca.covers(&host)
+    {
+        let _ = client.set_read_timeout(Some(shared.config.read_timeout));
+        handle_tls_injection(client, &host, port, &shared, &mut conn, &ca);
+        return;
+    }
+
     // One resolution serves both the prompt and the dial (DNS pinning):
     // the addresses the user approves are the ones dialed.
     let addrs = match resolve(&host, port) {
@@ -1138,8 +1167,8 @@ enum ReadFail {
 /// Read one CONNECT request through its `\r\n\r\n` terminator, capped
 /// at `cap` bytes. Headers after the request line are consumed but
 /// ignored -- nothing beyond the CONNECT line is ever forwarded.
-fn read_request<S: ClientStream>(
-    stream: &mut S,
+fn read_request<R: Read>(
+    stream: &mut R,
     cap: usize,
 ) -> Result<Vec<u8>, ReadFail> {
     let mut buf = Vec::with_capacity(1024);
@@ -1523,32 +1552,177 @@ fn parse_absolute_form(buf: &[u8]) -> Option<(String, u16)> {
     }
 }
 
-/// One header field parsed from a request head: whether the request
-/// body is chunked, and the Content-Length when present.
-fn head_body_framing(head: &[u8]) -> (bool, Option<u64>) {
-    let mut chunked = false;
-    let mut content_length = None;
+/// How a terminated request's body is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyFraming {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// Longest chunk-size or trailer line accepted in a chunked body.
+const CHUNK_LINE_CAP: u64 = 4096;
+
+/// Read a request head's body framing, refusing every shape on which the
+/// proxy and the upstream server could disagree -- the classic request
+/// smuggling ambiguities (RFC 9112 §6.3): Transfer-Encoding together
+/// with Content-Length, a transfer coding other than exactly `chunked`,
+/// Content-Length values that conflict or do not parse, a header name
+/// with whitespace before its colon, and obsolete line folding. The
+/// proxy forwards the head as received, so the upstream must read the
+/// same framing this returns. The `Err` is the egress reason.
+fn body_framing(head: &[u8]) -> Result<BodyFraming, &'static str> {
     // read_request may include body bytes from the same socket read. They
     // can be binary or look like headers, but cannot define HTTP framing.
     let end = head
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .unwrap_or(head.len());
-    let head = &head[..end];
-    let Ok(text) = std::str::from_utf8(head) else {
-        return (chunked, content_length);
-    };
+    let text =
+        std::str::from_utf8(&head[..end]).map_err(|_| "malformed-request")?;
+    let mut codings = Vec::new();
+    let mut length: Option<u64> = None;
     for line in text.split("\r\n").skip(1) {
+        if line.starts_with([' ', '\t']) {
+            return Err("ambiguous-framing");
+        }
         let Some((name, value)) = line.split_once(':') else {
-            continue;
+            return Err("malformed-request");
         };
-        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
-            chunked = true;
-        } else if name.trim().eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse().ok();
+        if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
+            return Err("ambiguous-framing");
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            codings.extend(
+                value.split(',').map(|c| c.trim().to_ascii_lowercase()),
+            );
+        } else if name.eq_ignore_ascii_case("content-length") {
+            for item in value.split(',') {
+                let item = item.trim();
+                if item.is_empty() || !item.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err("ambiguous-framing");
+                }
+                let parsed: u64 =
+                    item.parse().map_err(|_| "ambiguous-framing")?;
+                if length.is_some_and(|known| known != parsed) {
+                    return Err("ambiguous-framing");
+                }
+                length = Some(parsed);
+            }
         }
     }
-    (chunked, content_length)
+    match (codings.as_slice(), length) {
+        ([], None) => Ok(BodyFraming::None),
+        ([], Some(n)) => Ok(BodyFraming::Length(n)),
+        ([only], None) if only == "chunked" => Ok(BodyFraming::Chunked),
+        _ => Err("ambiguous-framing"),
+    }
+}
+
+/// Forward a request body to `out` exactly as framed: `already` is what
+/// the head read took past the terminator, `rest` the client stream it
+/// continues on. A chunked body is checked chunk by chunk and passed
+/// through byte for byte, so the upstream sees the framing
+/// [`body_framing`] agreed to and nothing past its end -- bytes after it
+/// (a pipelined second request) are dropped, the connection being
+/// `Connection: close`. Every forwarded byte is added to `count`.
+fn forward_body<R: Read, W: Write>(
+    framing: BodyFraming,
+    already: &[u8],
+    rest: R,
+    out: &mut W,
+    count: &AtomicU64,
+) -> io::Result<()> {
+    let mut source = io::BufReader::new(already.chain(rest));
+    match framing {
+        BodyFraming::None => Ok(()),
+        BodyFraming::Length(n) => copy_exact(&mut source, out, n, count),
+        BodyFraming::Chunked => forward_chunked(&mut source, out, count),
+    }
+}
+
+fn copy_exact<R: Read, W: Write>(
+    source: &mut R,
+    out: &mut W,
+    n: u64,
+    count: &AtomicU64,
+) -> io::Result<()> {
+    let copied = io::copy(&mut source.take(n), out)?;
+    count.fetch_add(copied, Ordering::Relaxed);
+    if copied < n {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
+fn forward_chunked<R: io::BufRead, W: Write>(
+    source: &mut R,
+    out: &mut W,
+    count: &AtomicU64,
+) -> io::Result<()> {
+    let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what);
+    loop {
+        let line = read_crlf_line(source)?;
+        let size_text = &line[..line.len() - 2];
+        let size_text =
+            size_text.split(|b| *b == b';').next().unwrap_or_default();
+        if size_text.is_empty()
+            || size_text.len() > 16
+            || !size_text.iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(invalid("bad chunk size"));
+        }
+        let size = u64::from_str_radix(
+            std::str::from_utf8(size_text).map_err(|_| invalid("chunk"))?,
+            16,
+        )
+        .map_err(|_| invalid("bad chunk size"))?;
+        out.write_all(&line)?;
+        count.fetch_add(line.len() as u64, Ordering::Relaxed);
+        if size == 0 {
+            // Trailer section, ended by an empty line; capped as a whole.
+            let mut trailer_bytes = 0_usize;
+            loop {
+                let trailer = read_crlf_line(source)?;
+                trailer_bytes += trailer.len();
+                if trailer_bytes > REQUEST_CAP {
+                    return Err(invalid("trailers too large"));
+                }
+                out.write_all(&trailer)?;
+                count.fetch_add(trailer.len() as u64, Ordering::Relaxed);
+                if trailer == b"\r\n" {
+                    return Ok(());
+                }
+            }
+        }
+        copy_exact(source, out, size, count)?;
+        let mut crlf = [0_u8; 2];
+        source.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(invalid("chunk data not followed by CRLF"));
+        }
+        out.write_all(&crlf)?;
+        count.fetch_add(2, Ordering::Relaxed);
+    }
+}
+
+/// One line ending in CRLF, at most [`CHUNK_LINE_CAP`] bytes. A bare LF
+/// or a line that runs past the cap is refused.
+fn read_crlf_line<R: io::BufRead>(source: &mut R) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    io::BufRead::read_until(
+        &mut source.by_ref().take(CHUNK_LINE_CAP),
+        b'\n',
+        &mut line,
+    )?;
+    if !line.ends_with(b"\r\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunk line without CRLF",
+        ));
+    }
+    Ok(line)
 }
 
 /// Strip any client `Connection:` header and pin `Connection: close`:
@@ -1619,15 +1793,16 @@ fn handle_http_termination<S: ClientStream>(
     }
     let binding = binding.expect("binding checked above");
 
-    let (chunked, content_length) = head_body_framing(&request);
-    if chunked {
-        // Unsupported framing: the request is refused before any dial.
-        conn.record.verdict(Verdict::Error, "malformed-request");
-        // API clients send Content-Length; chunked bodies are out of
-        // scope for v1 rather than silently mishandled.
-        reject(&mut client, &Reject::NotImplemented);
-        return;
-    }
+    let framing = match body_framing(&request) {
+        Ok(framing) => framing,
+        Err(reason) => {
+            // Refused before any dial: the upstream never sees a request
+            // whose framing it could read differently.
+            conn.record.verdict(Verdict::Error, reason);
+            reject(&mut client, &Reject::BadRequest);
+            return;
+        }
+    };
 
     // Split head from any body bytes already read (read_request reads
     // in 1 KiB chunks and can overshoot into the body).
@@ -1668,27 +1843,18 @@ fn handle_http_termination<S: ClientStream>(
     conn.record.verdict(Verdict::Allow, "secret-termination");
     let (up, down) = conn.record.counters();
 
-    // The forwarded head, body bytes already read and the rest of the
-    // body all go through one counting reader: the record gets a byte
-    // count, never the bytes.
-    let body_len = content_length.unwrap_or(0) as usize;
+    // The forwarded head and body are counted as they go: the record
+    // gets a byte count, never the bytes.
     let write_result = (|| -> io::Result<()> {
-        let rest = body_len.saturating_sub(body_so_far.len()) as u64;
-        let body_rest: Box<dyn Read> = if rest > 0 {
-            Box::new(client.try_clone_stream()?.take(rest))
-        } else {
-            Box::new(io::empty())
-        };
-        let mut forwarded = CountingReader::new(
-            rewritten.as_slice().chain(body_so_far).chain(body_rest),
-            up,
-        );
-        io::copy(&mut forwarded, &mut upstream)?;
+        upstream.write_all(&rewritten)?;
+        up.fetch_add(rewritten.len() as u64, Ordering::Relaxed);
+        let body_rest = client.try_clone_stream()?;
+        forward_body(framing, body_so_far, body_rest, &mut upstream, &up)?;
         upstream.flush()?;
         Ok(())
     })();
     if write_result.is_err() {
-        return;
+        finish_request_early(&mut upstream, shared.config.read_timeout);
     }
 
     // Upstream closes at the end of the response (Connection: close),
@@ -1699,6 +1865,164 @@ fn handle_http_termination<S: ClientStream>(
         &mut client_writer,
     );
     let _ = client_writer.shutdown_both();
+}
+
+/// Rewrite a request head for `host` with every binding of that host and
+/// nothing else, auditing each key's substitution count (never a value).
+/// Scoped like the plain-HTTP path: a placeholder of a key bound to
+/// another host passes through untouched.
+fn rewrite_for_host(head: &[u8], host: &str, shared: &Shared) -> Vec<u8> {
+    let mut out = head.to_vec();
+    for binding in shared
+        .config
+        .secrets
+        .iter()
+        .filter(|b| b.host.eq_ignore_ascii_case(host))
+    {
+        let (rewritten, substitutions) =
+            crate::secret::rewrite_head(&out, std::slice::from_ref(binding));
+        out = rewritten;
+        if let Some(log) = &shared.config.audit {
+            log.record(crate::audit::secret_inject_record(
+                host,
+                &binding.key,
+                substitutions,
+            ));
+        }
+    }
+    force_connection_close(&out)
+}
+
+/// Answer a reply on the decrypted side of an intercepted tunnel and end
+/// it: the same minimal replies `reject` writes on a plain stream.
+fn reject_tls<S: ClientStream>(
+    tls: &mut rustls::StreamOwned<rustls::ServerConnection, S>,
+    why: &Reject,
+) {
+    let (code, reason) = why.status();
+    let _ =
+        tls.write_all(format!("HTTP/1.1 {code} {reason}\r\n\r\n").as_bytes());
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    let _ = tls.sock.shutdown_both();
+}
+
+/// HTTPS credential injection (§6.53): the CONNECT target is a
+/// secret-bound allowlisted host, so instead of an opaque tunnel the
+/// proxy answers the TLS handshake itself with a leaf from the launch's
+/// CA, reads one request, rewrites its head with that host's bindings,
+/// and re-originates it over real, verified TLS to the same host and
+/// port -- DNS pinning and the SSRF guard come with `tls_connect`. One
+/// request per connection (`Connection: close`), as on the plain-HTTP
+/// path; an upgrade (WebSocket) is not carried.
+fn handle_tls_injection<S: ClientStream>(
+    mut client: S,
+    host: &str,
+    port: u16,
+    shared: &Shared,
+    conn: &mut Conn,
+    ca: &crate::tls_inject::InjectCa,
+) {
+    let server_config = match ca.server_config(host) {
+        Ok(config) => config,
+        Err(_) => {
+            conn.record.verdict(Verdict::Error, "inject-ca-failed");
+            reject(&mut client, &Reject::BadGateway);
+            return;
+        }
+    };
+    let server = match rustls::ServerConnection::new(server_config) {
+        Ok(server) => server,
+        Err(_) => {
+            conn.record.verdict(Verdict::Error, "inject-ca-failed");
+            reject(&mut client, &Reject::BadGateway);
+            return;
+        }
+    };
+    if client.write_all(REPLY_OK.as_bytes()).is_err() {
+        conn.record.verdict(Verdict::Error, "client-write-failed");
+        return;
+    }
+    let mut tls = rustls::StreamOwned::new(server, client);
+
+    // The handshake and the head share the slowloris read timeout set by
+    // the caller; the body does not, as on the plain-HTTP path.
+    let request = match read_request(&mut tls, REQUEST_CAP) {
+        Ok(request) => request,
+        Err(ReadFail::TooLarge) => {
+            conn.record.verdict(Verdict::Error, "request-too-large");
+            reject_tls(&mut tls, &Reject::TooLarge);
+            return;
+        }
+        Err(ReadFail::Io) => {
+            conn.record.verdict(Verdict::Error, "client-read-failed");
+            return;
+        }
+    };
+    let _ = tls.sock.set_read_timeout(None);
+    let framing = match body_framing(&request) {
+        Ok(framing) => framing,
+        Err(reason) => {
+            conn.record.verdict(Verdict::Error, reason);
+            reject_tls(&mut tls, &Reject::BadRequest);
+            return;
+        }
+    };
+    let head_end = request
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(request.len());
+    let (head, body_so_far) = request.split_at(head_end);
+    let rewritten = rewrite_for_host(head, host, shared);
+
+    conn.record.upstream(host, port);
+    let mut upstream = match tls_connect(host, port, &shared.config) {
+        Ok(stream) => stream,
+        Err(why) => {
+            let (verdict, reason) = dial_failure_verdict(&why);
+            conn.record.verdict(verdict, reason);
+            reject_tls(&mut tls, &why);
+            return;
+        }
+    };
+    audit_verdict(shared, host, port, "allow", "secret-injection");
+    conn.register_tcp(&upstream.sock);
+    conn.record.verdict(Verdict::Allow, "secret-injection");
+    let (up, down) = conn.record.counters();
+
+    let sent = (|| -> io::Result<()> {
+        upstream.write_all(&rewritten)?;
+        up.fetch_add(rewritten.len() as u64, Ordering::Relaxed);
+        forward_body(framing, body_so_far, &mut tls, &mut upstream, &up)?;
+        upstream.flush()
+    })();
+    if sent.is_err() {
+        finish_request_early(&mut upstream, shared.config.read_timeout);
+    }
+    // Upstream closes at the end of the response (Connection: close). A
+    // server that drops TCP without close_notify still delivered what it
+    // sent, so the copy's error is not a failure of this exchange.
+    let _ = io::copy(&mut CountingReader::new(&mut upstream, down), &mut tls);
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
+    let _ = tls.sock.shutdown_both();
+}
+
+/// The request could not be sent whole -- the client's body ended or
+/// broke, or the server stopped reading. A server that answers before
+/// the body ends (a 401 or 413 is the usual case) has already written
+/// its reply, so it is still relayed: end the upstream's write half,
+/// then read with the slowloris timeout, because the request the server
+/// holds may be incomplete and it could otherwise wait for it forever.
+fn finish_request_early(
+    upstream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    timeout: Duration,
+) {
+    upstream.conn.send_close_notify();
+    let _ = upstream.flush();
+    let _ = upstream.sock.shutdown(Shutdown::Write);
+    let _ = upstream.sock.set_read_timeout(Some(timeout));
 }
 
 /// TLS to the checked upstream: DNS pinning and the SSRF guard are
@@ -3383,23 +3707,59 @@ mod tests {
     }
 
     #[test]
-    fn head_body_framing_parses_content_length_and_chunked() {
-        let (chunked, len) =
-            head_body_framing(b"POST / HTTP/1.1\r\nContent-Length: 42\r\n\r\n");
-        assert!(!chunked);
-        assert_eq!(len, Some(42));
-        let (chunked, len) = head_body_framing(
-            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+    fn body_framing_reads_length_chunked_and_none() {
+        assert_eq!(
+            body_framing(b"POST / HTTP/1.1\r\nContent-Length: 42\r\n\r\n"),
+            Ok(BodyFraming::Length(42))
         );
-        assert!(chunked);
-        assert_eq!(len, None);
-        let (chunked, len) = head_body_framing(b"GET / HTTP/1.1\r\n\r\n");
-        assert!(!chunked);
-        assert_eq!(len, None);
+        assert_eq!(
+            body_framing(
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n"
+            ),
+            Ok(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            body_framing(b"GET / HTTP/1.1\r\n\r\n"),
+            Ok(BodyFraming::None)
+        );
+        // Repeated identical lengths are one length (RFC 9112 §6.3).
+        assert_eq!(
+            body_framing(
+                b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\
+                  Content-Length: 5, 5\r\n\r\n"
+            ),
+            Ok(BodyFraming::Length(5))
+        );
     }
 
     #[test]
-    fn head_body_framing_ignores_bytes_after_the_header_terminator() {
+    fn body_framing_refuses_every_smuggling_ambiguity() {
+        for head in [
+            // TE and CL together.
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\
+             Content-Length: 4\r\n\r\n",
+            // A coding other than exactly chunked, or chunked twice.
+            "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\
+             Transfer-Encoding: chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: identity\r\n\r\n",
+            // Conflicting or unparsable lengths.
+            "POST / HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: +4\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 4x\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+            // Whitespace before the colon, and obsolete line folding.
+            "POST / HTTP/1.1\r\nTransfer-Encoding : chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nX-A: 1\r\n Transfer-Encoding: chunked\r\n\r\n",
+            // A header line without a colon.
+            "POST / HTTP/1.1\r\nTransfer-Encoding chunked\r\n\r\n",
+        ] {
+            assert!(body_framing(head.as_bytes()).is_err(), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn body_framing_ignores_bytes_after_the_header_terminator() {
         for body in [
             b"\xff\x00\xfe".as_slice(),
             b"Transfer-Encoding: chunked\r\n".as_slice(),
@@ -3412,10 +3772,63 @@ mod tests {
             .into_bytes();
             request.extend_from_slice(body);
             assert_eq!(
-                head_body_framing(&request),
-                (false, Some(body.len() as u64))
+                body_framing(&request),
+                Ok(BodyFraming::Length(body.len() as u64))
             );
         }
+    }
+
+    fn forwarded(
+        framing: BodyFraming,
+        already: &[u8],
+        rest: &[u8],
+    ) -> (io::Result<()>, Vec<u8>, u64) {
+        let count = AtomicU64::new(0);
+        let mut out = Vec::new();
+        let result = forward_body(framing, already, rest, &mut out, &count);
+        (result, out, count.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn forward_body_passes_a_chunked_body_through_and_stops_at_its_end() {
+        let body = b"4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\nX-T: 1\r\n\r\n";
+        let mut rest = body[6..].to_vec();
+        // A pipelined second request after the body is not forwarded.
+        rest.extend_from_slice(b"GET /smuggled HTTP/1.1\r\n\r\n");
+        let (result, out, count) =
+            forwarded(BodyFraming::Chunked, &body[..6], &rest);
+        result.unwrap();
+        assert_eq!(out, body);
+        assert_eq!(count, body.len() as u64);
+    }
+
+    #[test]
+    fn forward_body_refuses_a_malformed_chunked_body() {
+        for body in [
+            b"z\r\n".as_slice(),        // not hex
+            b"4\nWiki\r\n0\r\n\r\n",    // bare LF
+            b"4\r\nWikiXX0\r\n\r\n",    // data not followed by CRLF
+            b"4\r\nWi",                 // truncated
+            b"11111111111111111\r\n",   // 17 hex digits
+            b" 4\r\nWiki\r\n0\r\n\r\n", // whitespace before the size
+        ] {
+            let (result, _, _) = forwarded(BodyFraming::Chunked, &[], body);
+            assert!(result.is_err(), "{:?}", String::from_utf8_lossy(body));
+        }
+    }
+
+    #[test]
+    fn forward_body_copies_exactly_content_length() {
+        let (result, out, count) =
+            forwarded(BodyFraming::Length(5), b"he", b"lloEXTRA");
+        result.unwrap();
+        assert_eq!(out, b"hello");
+        assert_eq!(count, 5);
+        let (result, _, _) = forwarded(BodyFraming::Length(9), b"he", b"llo");
+        assert!(result.is_err(), "a short body is an error, not a pad");
+        let (result, out, _) = forwarded(BodyFraming::None, b"", b"ignored");
+        result.unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -3495,6 +3908,18 @@ mod tests {
                         )
                         .as_bytes(),
                     );
+                    // The fixture answers on the head alone. Closing with
+                    // request body bytes still unread would make the kernel
+                    // reset the connection, and a reset can discard the
+                    // reply before the proxy reads it -- TCP, not the code
+                    // under test. So end cleanly and drain what is left.
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                    let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+                    let _ =
+                        tls.sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut sink = [0_u8; 4096];
+                    while matches!(tls.sock.read(&mut sink), Ok(n) if n > 0) {}
                 });
             }
         });
@@ -3670,23 +4095,206 @@ mod tests {
     }
 
     #[test]
-    fn e2e_http_termination_rejects_chunked_with_501() {
+    fn e2e_http_termination_forwards_a_chunked_body() {
         let fixture = tls_fixture();
         let binding =
             crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let placeholder = binding.placeholder.clone();
         let mut config = test_config(&["127.0.0.1"]);
         config.secrets = vec![binding];
         config.danger_extra_roots = vec![fixture_root()];
         let proxy = Proxy::start(config, None).unwrap();
         let request = format!(
             "POST http://127.0.0.1:{fixture}/ HTTP/1.1\r\n\
-             Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+             x-test-key: {placeholder}\r\n\
+             Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
         );
         let stream = connect_and_send(proxy.port(), request.as_bytes());
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("key=real"), "{response}");
+    }
+
+    #[test]
+    fn e2e_http_termination_relays_a_reply_sent_before_the_body_ended() {
+        // The client promises 100 bytes and stops after 3: the request
+        // cannot be sent whole, but the server already answered on the
+        // head, and that answer still reaches the client.
+        let fixture = tls_fixture();
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let placeholder = binding.placeholder.clone();
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.danger_extra_roots = vec![fixture_root()];
+        let proxy = Proxy::start(config, None).unwrap();
+        let request = format!(
+            "POST http://127.0.0.1:{fixture}/ HTTP/1.1\r\n\
+             x-test-key: {placeholder}\r\nContent-Length: 100\r\n\r\nabc"
+        );
+        let stream = connect_and_send(proxy.port(), request.as_bytes());
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        (&mut &stream).read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("key=real"), "{response}");
+    }
+
+    #[test]
+    fn e2e_http_termination_refuses_ambiguous_framing_with_400() {
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        let proxy = Proxy::start(config, None).unwrap();
+        // Refused before any dial: port 1 would otherwise be a 502.
+        let stream = connect_and_send(
+            proxy.port(),
+            b"POST http://127.0.0.1:1/ HTTP/1.1\r\n\
+              Transfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n",
+        );
         assert_eq!(
             read_reply_head(&stream),
-            "HTTP/1.1 501 Not Implemented\r\n\r\n"
+            "HTTP/1.1 400 Bad Request\r\n\r\n"
         );
+    }
+
+    /// CONNECT through the proxy, then speak TLS on the tunnel trusting
+    /// `root` only, send `request`, and return the whole response.
+    fn https_through_proxy(
+        proxy_port: u16,
+        target: u16,
+        root: rustls::pki_types::CertificateDer<'static>,
+        request: &[u8],
+    ) -> String {
+        let stream = connect_and_send(
+            proxy_port,
+            &connect_request(&format!("127.0.0.1:{target}")),
+        );
+        let head = read_reply_head(&stream);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name =
+            rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(client_config), name)
+            .unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        tls.write_all(request).unwrap();
+        let mut response = Vec::new();
+        // A peer closing without close_notify still sent its bytes.
+        let _ = tls.read_to_end(&mut response);
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    fn inject_ca_pem_root(
+        ca: &crate::tls_inject::InjectCa,
+    ) -> rustls::pki_types::CertificateDer<'static> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_slice(
+            ca.cert_pem().as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn e2e_https_injection_substitutes_secret_inside_the_tunnel() {
+        let fixture = tls_fixture();
+        let binding = crate::secret::SecretBinding::new(
+            "X_KEY",
+            "real-secret",
+            "127.0.0.1",
+        );
+        let placeholder = binding.placeholder.clone();
+        let ca = Arc::new(
+            crate::tls_inject::InjectCa::generate(&["127.0.0.1".into()])
+                .unwrap(),
+        );
+        let root = inject_ca_pem_root(&ca);
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.inject_ca = Some(ca);
+        config.danger_extra_roots = vec![fixture_root()];
+        let proxy = Proxy::start(config, None).unwrap();
+
+        // The child sends its placeholder in a chunked POST; the fixture
+        // (the real host, behind real TLS) receives the real value.
+        let request = format!(
+            "POST /v1/test HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             x-test-key: {placeholder}\r\nConnection: keep-alive\r\n\
+             Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"
+        );
+        let response = https_through_proxy(
+            proxy.port(),
+            fixture,
+            root,
+            request.as_bytes(),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("key=real-secret"), "{response}");
+        assert!(!response.contains(&placeholder), "{response}");
+    }
+
+    #[test]
+    fn e2e_https_injection_leaves_an_uncovered_tunnel_opaque() {
+        // The CA covers another host, so the tunnel to the fixture is
+        // the usual opaque one: the client must trust the fixture's own
+        // certificate, and the placeholder goes through untouched.
+        let fixture = tls_fixture();
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "api.example");
+        let placeholder = binding.placeholder.clone();
+        let ca = Arc::new(
+            crate::tls_inject::InjectCa::generate(&["api.example".into()])
+                .unwrap(),
+        );
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.inject_ca = Some(ca);
+        let proxy = Proxy::start(config, None).unwrap();
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nx-test-key: {placeholder}\r\n\r\n"
+        );
+        let response = https_through_proxy(
+            proxy.port(),
+            fixture,
+            fixture_root(),
+            request.as_bytes(),
+        );
+        assert!(
+            response.contains(&format!("key={placeholder}")),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn e2e_https_injection_refuses_ambiguous_framing_inside_the_tunnel() {
+        let binding =
+            crate::secret::SecretBinding::new("X_KEY", "real", "127.0.0.1");
+        let ca = Arc::new(
+            crate::tls_inject::InjectCa::generate(&["127.0.0.1".into()])
+                .unwrap(),
+        );
+        let root = inject_ca_pem_root(&ca);
+        let mut config = test_config(&["127.0.0.1"]);
+        config.secrets = vec![binding];
+        config.inject_ca = Some(ca);
+        let proxy = Proxy::start(config, None).unwrap();
+        // Port 1: nothing listens, so a dial would answer 502, not 400.
+        let response = https_through_proxy(
+            proxy.port(),
+            1,
+            root,
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\
+              Content-Length: 4\r\n\r\n",
+        );
+        assert_eq!(response, "HTTP/1.1 400 Bad Request\r\n\r\n");
     }
 
     #[test]

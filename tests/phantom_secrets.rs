@@ -180,6 +180,39 @@ fn phantom_proxy_substitutes_real_value_over_tls() {
 }
 
 #[test]
+fn phantom_https_is_injected_inside_the_tunnel() {
+    // The usual client path: HTTPS through CONNECT, trusting only what
+    // ai-jail mounted. curl reads CURL_CA_BUNDLE (system roots plus the
+    // launch's CA); the proxy answers the bound host with a leaf from that
+    // CA and puts the real value in before re-originating the request.
+    // `--noproxy ''`: loopback is in no_proxy, and the fixture listens on
+    // it. Basic auth is checked by the proxy's own tests.
+    require_sandbox!();
+    let fixture = tls_fixture();
+    let script = format!(
+        "test \"$CURL_CA_BUNDLE\" = /tmp/.ai-jail-ca-bundle.pem || exit 3; \
+         curl --noproxy '' -sS --retry 20 --retry-delay 0 \
+         --retry-connrefused --max-time 20 -H \"x-test-key: $X_TEST_KEY\" \
+         https://127.0.0.1:{fixture}/v1/models"
+    );
+    let output = phantom_run(fixture, false, &script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "run failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains(&format!("key={REAL}")),
+        "real value not substituted over HTTPS: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("AIJAIL-PHANTOM"),
+        "placeholder reached upstream: {stdout:?}"
+    );
+}
+
+#[test]
 fn phantom_lockdown_still_substitutes() {
     require_sandbox!();
     require_lockdown_tools!("bash", "curl");

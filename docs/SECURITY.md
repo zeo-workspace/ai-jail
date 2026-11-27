@@ -306,22 +306,44 @@ kernel does (32-bit) so a high-bit variant cannot slip past the filter.
 On kernels ≥ 6.12 Landlock also scopes abstract Unix sockets and signals
 (best-effort) as a further backstop.
 
-Phantom credentials (`--secret KEY=host`, filtered egress only) shift part of
-the trust boundary to the supervisor: the sandbox env holds an
-`AIJAIL-PHANTOM-…` placeholder, and the egress proxy substitutes the real
-value only in the request head of plain-HTTP proxy requests terminating at the
-bound host, re-originating them over TLS. Placeholders are not credentials —
-knowing one authorizes nothing — and real values live only in supervisor
-memory, never in any config file, the audit log, or the sandbox. The cost:
-for secret-bound hosts the supervisor (and the proxy's TLS endpoint) sees the
-request plaintext, by construction. CONNECT tunnels to any host stay opaque
-and carry no substitution.
+Phantom credentials (`--secret KEY=host[,host...]`, filtered egress only)
+shift part of the trust boundary to the supervisor: the sandbox env holds an
+`AIJAIL-PHANTOM-…` placeholder, new for every launch, and the egress proxy
+substitutes the real value only in the request head — `Authorization: Basic`
+decoded and re-encoded — of requests to a bound host: plain-HTTP proxy
+requests, and on Linux HTTPS through CONNECT. Placeholders are not credentials
+— knowing one authorizes nothing — and real values live only in supervisor
+memory, never in any config file, the audit log, or the sandbox. Substitution
+is scoped per host: a placeholder sent to a host its key is not bound to goes
+out unchanged.
+
+HTTPS injection works by interception, and its trust anchor is narrow on
+purpose. The supervisor makes one CA per launch; its private key and every
+leaf key stay in supervisor memory and are never written anywhere. The CA
+carries X.509 name constraints permitting the bound hosts only (and their
+subdomains, which is how a DNS constraint reads — the proxy still intercepts
+the exact bound hosts alone), and excluding every IP address unless one is
+bound, so even a stolen key could not vouch for another site. The files the
+sandbox mounts read-only — the bundle (system roots plus the CA) and the CA —
+hold public certificates only, are created `O_EXCL | O_NOFOLLOW` mode `0600`
+beside the proxy socket, and are removed with it; a launch with a secret
+whose files are missing is refused. Upstream TLS is verified against the
+built-in web PKI roots with DNS pinning and the address-range guard, as for
+any tunnel. A request whose body framing the upstream could read differently
+from the proxy — Transfer-Encoding with Content-Length, a coding other than
+exactly `chunked`, conflicting lengths, whitespace before a header colon,
+obsolete line folding — is refused before any dial; a chunked body is
+checked chunk by chunk and nothing past its end is forwarded. The cost: for
+bound hosts the supervisor sees the request plaintext, by construction.
+Tunnels to every other host stay opaque and carry no substitution. Not
+covered: macOS (no interception), WebSocket and other upgrades on a bound
+host, and more than one request per connection.
 
 The egress log (`--egress-log PATH`, Linux only, CLI-only) is written by the
 supervisor, never by the sandbox. What a line **can** contain: the line
 version, a UTC timestamp, the run id, the requested host and port, the verdict
-and its reason, the byte counts and the duration. For a terminated `--secret`
-request it adds the host and port the proxy itself dialed (`upstream_host`,
+and its reason, the byte counts and the duration. For a terminated or injected
+`--secret` request it adds the host and port the proxy itself dialed (`upstream_host`,
 `upstream_port`). What it **cannot** contain: any request content — no path,
 query, method, header, body, credential, `--secret` placeholder, key name, or
 real value — and nothing from inside a CONNECT tunnel, which stays opaque. The
