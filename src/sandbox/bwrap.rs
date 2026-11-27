@@ -2280,6 +2280,37 @@ fn proxy_socket_mount_args(
     }
 }
 
+/// SSH through filtered egress: when an allowlist entry opens some host's
+/// port 22 (`github.com:22`), `ssh` gets a ProxyCommand that tunnels through
+/// the egress proxy, which still decides host by host and port by port.
+/// `AI_JAIL_SSH_PROXY_COMMAND` carries it for `ssh -o ProxyCommand=...`, and
+/// `GIT_SSH_COMMAND` uses it so `git push` over SSH works as is -- unless the
+/// user passes their own `GIT_SSH_COMMAND`, which then wins.
+fn ssh_proxy_env(config: &Config) -> Vec<(String, String)> {
+    let opens_ssh = config
+        .allow_hosts()
+        .iter()
+        .chain(config.allow_private_hosts())
+        .filter_map(|entry| crate::proxy::split_allow_entry(entry).ok())
+        .any(|(_, port)| port == Some(22));
+    if !opens_ssh {
+        return Vec::new();
+    }
+    let command = crate::proxy::ssh_proxy_command();
+    let mut vars =
+        vec![("AI_JAIL_SSH_PROXY_COMMAND".to_string(), command.clone())];
+    let user_sets_git_ssh = crate::config::env_pass_names(&config.env_pass)
+        .iter()
+        .any(|name| name == "GIT_SSH_COMMAND");
+    if !user_sets_git_ssh {
+        vars.push((
+            "GIT_SSH_COMMAND".to_string(),
+            format!("ssh -o ProxyCommand='{command}'"),
+        ));
+    }
+    vars
+}
+
 /// Port forwards and publishes: bind each host-side bridge socket into
 /// the sandbox at its fixed per-port path. Same placement and reasoning
 /// as the proxy socket above. Fails closed when a configured port has no
@@ -2611,6 +2642,7 @@ fn discover_mounts_full(
         if !config.secret_hosts.is_empty() {
             vars.extend(crate::tls_inject::env_vars());
         }
+        vars.extend(ssh_proxy_env(config));
         vars
     } else {
         vec![]
@@ -6174,6 +6206,37 @@ mod tests {
                 && w[1] == "NODE_EXTRA_CA_CERTS"
                 && w[2] == crate::tls_inject::IN_SANDBOX_CA_PATH
         }));
+    }
+
+    #[test]
+    fn an_allowlisted_ssh_port_gives_ssh_a_proxy_command() {
+        assert_eq!(LANDLOCK_WRAPPER_DEST, crate::proxy::IN_SANDBOX_SELF_PATH);
+        let mut config = Config {
+            allow_hosts: vec!["github.com".into()],
+            ..minimal_test_config()
+        };
+        assert!(ssh_proxy_env(&config).is_empty(), "443/80 only: no ssh");
+        config.allow_hosts.push("github.com:22".into());
+        let vars = ssh_proxy_env(&config);
+        let get =
+            |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(
+            get("AI_JAIL_SSH_PROXY_COMMAND").as_deref(),
+            Some("/tmp/.ai-jail-landlock --proxy-connect %h %p")
+        );
+        assert_eq!(
+            get("GIT_SSH_COMMAND").as_deref(),
+            Some(
+                "ssh -o ProxyCommand='/tmp/.ai-jail-landlock --proxy-connect %h %p'"
+            )
+        );
+        // The user's own GIT_SSH_COMMAND wins.
+        config.env_pass.push("GIT_SSH_COMMAND=ssh -v".into());
+        assert!(get_from(&ssh_proxy_env(&config), "GIT_SSH_COMMAND").is_none());
+    }
+
+    fn get_from(vars: &[(String, String)], key: &str) -> Option<String> {
+        vars.iter().find(|(n, _)| n == key).map(|(_, v)| v.clone())
     }
 
     #[test]

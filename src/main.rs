@@ -1567,6 +1567,14 @@ fn run(
     if let Some((port, socket)) = &cli.proxy_bridge {
         return proxy::run_bridge(*port, socket).map(|()| 0);
     }
+    // Internal: `ssh`'s ProxyCommand inside a filtered-egress sandbox
+    // (§6.9 of Zeo's proposal). Unprivileged by construction -- a client of
+    // the in-sandbox bridge, which only reaches what the outer proxy allows
+    // -- so it needs no marker: run anywhere else it simply finds no bridge.
+    if let Some((host, port)) = &cli.proxy_connect {
+        return proxy::run_proxy_connect(host, *port, proxy::BRIDGE_PORT)
+            .map(|()| 0);
+    }
     // Internal: the in-sandbox end of a --publish-port, under the same
     // marker.
     if cli.publish_bridge.is_some()

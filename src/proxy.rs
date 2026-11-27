@@ -2225,6 +2225,92 @@ pub(crate) fn run_bridge(port: u16, socket: &Path) -> Result<(), String> {
     }
 }
 
+/// Where the landlock wrapper binary -- ai-jail itself -- sits inside the
+/// sandbox; the ProxyCommand below runs it.
+pub(crate) const IN_SANDBOX_SELF_PATH: &str = "/tmp/.ai-jail-landlock";
+
+/// The `ssh` ProxyCommand a filtered-egress sandbox gets when an allowlist
+/// entry opens a host's port 22 (`github.com:22`).
+pub(crate) fn ssh_proxy_command() -> String {
+    format!("{IN_SANDBOX_SELF_PATH} --proxy-connect %h %p")
+}
+
+/// SSH through filtered egress (§6.9 of Zeo's proposal): `ssh` has no proxy
+/// of its own, so its ProxyCommand runs this. It opens a CONNECT tunnel to
+/// `host:port` through the in-sandbox bridge -- the outer proxy decides, with
+/// the same allowlist, port policy, DNS pinning and address guard as any
+/// tunnel -- and then pipes stdin to the tunnel and the tunnel to stdout.
+/// A refusal is an error naming the proxy's status line, never a fallback.
+pub(crate) fn run_proxy_connect(
+    host: &str,
+    port: u16,
+    bridge_port: u16,
+) -> Result<(), String> {
+    proxy_connect_with(host, port, bridge_port, io::stdin(), io::stdout())
+}
+
+/// [`run_proxy_connect`] with its two ends as parameters, for the tests.
+fn proxy_connect_with<R, W>(
+    host: &str,
+    port: u16,
+    bridge_port: u16,
+    mut input: R,
+    mut output: W,
+) -> Result<(), String>
+where
+    R: Read + Send + 'static,
+    W: Write,
+{
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut tunnel = TcpStream::connect((Ipv4Addr::LOCALHOST, bridge_port))
+        .map_err(|e| format!("cannot reach the egress bridge: {e}"))?;
+    tunnel
+        .write_all(
+            format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .map_err(|e| format!("cannot ask the egress proxy: {e}"))?;
+    let _ = tunnel.set_read_timeout(Some(Duration::from_secs(30)));
+    let reply = read_request(&mut tunnel, REQUEST_CAP)
+        .map_err(|_| "the egress proxy did not answer".to_string())?;
+    let _ = tunnel.set_read_timeout(None);
+    let head_end = reply
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(reply.len(), |at| at + 4);
+    let status = String::from_utf8_lossy(&reply[..head_end]);
+    let status = status.lines().next().unwrap_or_default().to_string();
+    let accepted = status
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code == "200");
+    if !accepted {
+        return Err(format!("the egress proxy refused {authority}: {status}"));
+    }
+    // Bytes the server sent right behind the reply (an SSH banner) are the
+    // stream's first bytes.
+    output
+        .write_all(&reply[head_end..])
+        .and_then(|()| output.flush())
+        .map_err(|e| e.to_string())?;
+    let mut upstream = tunnel.try_clone().map_err(|e| e.to_string())?;
+    let up = thread::spawn(move || {
+        let _ = io::copy(&mut input, &mut upstream);
+        let _ = upstream.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut tunnel, &mut output);
+    let _ = output.flush();
+    // The server ended the session; the client closes our input next.
+    drop(up);
+    Ok(())
+}
+
 /// Fixed path inside the sandbox where the host-side Unix socket of a
 /// `--forward-port` is bind-mounted (Linux). One per port, under the
 /// same fresh /tmp tmpfs as the proxy socket.
@@ -4070,6 +4156,55 @@ mod tests {
         {
             assert!(!raw.contains(leaked), "{leaked} in {raw}");
         }
+    }
+
+    /// A one-shot TCP server: reads `expect` bytes, then answers `reply`.
+    fn line_server(expect: usize, reply: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut got = vec![0_u8; expect];
+            conn.read_exact(&mut got).unwrap();
+            conn.write_all(reply).unwrap();
+            conn.write_all(&got).unwrap();
+        });
+        port
+    }
+
+    #[test]
+    fn proxy_connect_pipes_through_an_allowed_tunnel() {
+        let server = line_server(5, b"SSH-2.0-fixture\r\n");
+        let proxy = Proxy::start(test_config(&["127.0.0.1"]), None).unwrap();
+        let mut output = Vec::new();
+        proxy_connect_with(
+            "127.0.0.1",
+            server,
+            proxy.port(),
+            &b"hello"[..],
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, b"SSH-2.0-fixture\r\nhello");
+    }
+
+    #[test]
+    fn proxy_connect_names_the_refusal_and_sends_nothing() {
+        // Listed for 443/80 only: port 22 is refused by the port policy.
+        let mut config = test_config(&["127.0.0.1"]);
+        config.danger_any_port = false;
+        let proxy = Proxy::start(config, None).unwrap();
+        let mut output = Vec::new();
+        let error = proxy_connect_with(
+            "127.0.0.1",
+            22,
+            proxy.port(),
+            &b"secret"[..],
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.contains("403"), "{error}");
+        assert!(output.is_empty());
     }
 
     #[test]
