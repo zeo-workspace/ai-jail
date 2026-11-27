@@ -30,6 +30,7 @@ mod state_root;
 mod statusbar;
 #[cfg(target_os = "linux")]
 mod teardown;
+mod tls_inject;
 
 #[cfg(test)]
 mod test_utils;
@@ -199,18 +200,28 @@ fn prepare_secrets(
     }
     let bindings_spec: Vec<(String, String)> =
         config.secret_hosts.clone().into_iter().collect();
+    // One nonce per launch: every placeholder of this session derives
+    // from it, so no two sessions share a placeholder.
+    let session = secret::session_nonce();
     let mut bindings = Vec::new();
-    for (key, host) in bindings_spec {
-        if host.contains("://") || host.contains('/') {
-            return Err(format!(
-                "--secret {key}: host must be a bare hostname, not {host:?}"
-            ));
+    for (key, hosts_value) in bindings_spec {
+        let hosts = secret::split_hosts(&hosts_value);
+        if hosts.is_empty() {
+            return Err(format!("--secret {key}: names no host"));
         }
-        if !config.host_is_allowlisted(&host) {
-            return Err(format!(
-                "--secret {key}: {host} is not in allow_hosts or allow_private_hosts \
-                 (pass --allow-host {host} or --allow-private-host {host})"
-            ));
+        for host in &hosts {
+            if host.contains("://") || host.contains('/') || host.contains(':')
+            {
+                return Err(format!(
+                    "--secret {key}: host must be a bare hostname, not {host:?}"
+                ));
+            }
+            if !config.host_is_allowlisted(host) {
+                return Err(format!(
+                    "--secret {key}: {host} is not in allow_hosts or allow_private_hosts \
+                     (pass --allow-host {host} or --allow-private-host {host})"
+                ));
+            }
         }
         // Resolve the value the child would actually receive. apply_env_pass
         // applies entries in order, skipping bare variables absent from the
@@ -242,9 +253,15 @@ fn prepare_secrets(
                 )
             });
         };
-        let binding = secret::SecretBinding::new(&key, &real, &host);
+        let key_bindings: Vec<secret::SecretBinding> = hosts
+            .iter()
+            .map(|host| {
+                secret::SecretBinding::with_session(&key, &real, host, &session)
+            })
+            .collect();
         // Remove EVERY entry for this key, then insert exactly one placeholder,
-        // so no later duplicate can reintroduce the real value.
+        // so no later duplicate can reintroduce the real value. Every host's
+        // binding shares it (same key, value and session).
         config.env_pass.retain(|entry| {
             config::parse_env_entry(entry)
                 .map(|(name, _)| name != key.as_str())
@@ -252,8 +269,8 @@ fn prepare_secrets(
         });
         config
             .env_pass
-            .push(format!("{key}={}", binding.placeholder));
-        bindings.push(binding);
+            .push(format!("{key}={}", key_bindings[0].placeholder));
+        bindings.extend(key_bindings);
     }
     Ok(bindings)
 }
@@ -2295,7 +2312,20 @@ fn run(
         proxy_config.stats = std::sync::Arc::clone(&egress_stats);
         proxy_config.drain_on_exit = egress_log.is_some() || summary.is_some();
         proxy_config.prompt = host_prompt(config);
-        let proxy_config = launch_runner.finish_proxy_config(proxy_config);
+        let mut proxy_config = launch_runner.finish_proxy_config(proxy_config);
+        // HTTPS injection (Linux): one CA per launch, constrained to the
+        // secret-bound hosts; Proxy::start writes its trust bundle beside
+        // the socket for the sandbox to mount.
+        if !proxy_config.secrets.is_empty() {
+            let hosts: Vec<String> = proxy_config
+                .secrets
+                .iter()
+                .map(|b| b.host.clone())
+                .collect();
+            let ca = tls_inject::InjectCa::generate(&hosts)
+                .map_err(|e| format!("--secret over HTTPS: {e}"))?;
+            proxy_config.inject_ca = Some(std::sync::Arc::new(ca));
+        }
         let socket = proxy::default_socket_path();
         let proxy = proxy::Proxy::start(proxy_config, Some(&socket))
             .map_err(|e| format!("Failed to start the egress proxy: {e}"))?;
@@ -3378,6 +3408,60 @@ mod tests {
             ..Config::default()
         };
         assert!(super::prepare_secrets(&mut config).is_err());
+    }
+
+    #[test]
+    fn a_secret_bound_to_several_hosts_shares_one_placeholder() {
+        let mut config = Config {
+            allow_hosts: vec!["api.example.com".into(), "example.com".into()],
+            env_pass: vec!["KEY=real-value".into()],
+            secret_hosts: [(
+                "KEY".into(),
+                "api.example.com, example.com".into(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Config::default()
+        };
+        let bindings = super::prepare_secrets(&mut config).unwrap();
+        let hosts: Vec<&str> =
+            bindings.iter().map(|b| b.host.as_str()).collect();
+        assert_eq!(hosts, ["api.example.com", "example.com"]);
+        assert_eq!(bindings[0].placeholder, bindings[1].placeholder);
+        assert_eq!(
+            config.env_pass,
+            vec![format!("KEY={}", bindings[0].placeholder)],
+            "one placeholder entry, never the value"
+        );
+
+        // A second launch draws a new session nonce: a new placeholder.
+        let mut again = Config {
+            allow_hosts: vec!["api.example.com".into(), "example.com".into()],
+            env_pass: vec!["KEY=real-value".into()],
+            secret_hosts: [("KEY".into(), "api.example.com".into())]
+                .into_iter()
+                .collect(),
+            ..Config::default()
+        };
+        let next = super::prepare_secrets(&mut again).unwrap();
+        assert_ne!(next[0].placeholder, bindings[0].placeholder);
+
+        // Every host must be allowlisted, and none may carry a port.
+        for value in ["api.example.com,evil.example", "example.com:443", " , "]
+        {
+            let mut bad = Config {
+                allow_hosts: vec![
+                    "api.example.com".into(),
+                    "example.com".into(),
+                ],
+                env_pass: vec!["KEY=real-value".into()],
+                secret_hosts: [("KEY".into(), value.into())]
+                    .into_iter()
+                    .collect(),
+                ..Config::default()
+            };
+            assert!(super::prepare_secrets(&mut bad).is_err(), "{value:?}");
+        }
     }
 
     #[test]

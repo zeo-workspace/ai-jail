@@ -344,19 +344,40 @@ like `--allow-private-host`. Loopback, link-local, multicast, unspecified, and
 cloud-metadata answers are refused without asking. Repository policy cannot
 enable it, and `--lockdown` disables it.
 
-### Phantom credentials: `--secret KEY=host`
+### Phantom credentials: `--secret KEY=host[,host...]`
 
 With filtered egress on, `--secret ANTHROPIC_API_KEY=api.anthropic.com`
 (repeatable, or `secret_hosts = { ... }` in trusted global config) keeps the real
 value out of the sandbox: the child env carries an `AIJAIL-PHANTOM-…`
-placeholder, and the egress proxy swaps in the real value only for requests
-terminating at the bound host. The key must already be passed via `--env` or
-`--env-from-file`. One honest caveat: CONNECT tunnels stay opaque — this only
-covers clients that can speak plain HTTP to the proxy (e.g. an
-`ANTHROPIC_BASE_URL=http://…` override); those requests are terminated and
-re-originated over TLS by the supervisor, which therefore sees that plaintext
-for secret-bound hosts. HTTPS clients that only CONNECT keep working exactly
-as before, with no substitution.
+placeholder, drawn anew for every launch, and the egress proxy swaps in the
+real value only in requests to the bound hosts — several, comma-separated
+(`GITHUB_TOKEN=github.com,api.github.com`), each also in `--allow-host` and
+without a port. The key must already be passed via `--env` or
+`--env-from-file`. A placeholder used as the password of `Authorization: Basic`
+(how `git push` sends a token) is substituted too.
+
+Both transports are covered:
+
+- **Plain HTTP** to the proxy (an `ANTHROPIC_BASE_URL=http://…` override) is
+  terminated and re-originated over TLS, as before.
+- **HTTPS (Linux).** For each launch with a secret, the supervisor makes a CA
+  whose private key lives only in its memory and whose X.509 name constraints
+  permit the bound hosts alone — never another name and never an IP address
+  unless one is bound. The sandbox trusts it through a bundle (the system roots
+  plus that CA) mounted read-only at `/tmp/.ai-jail-ca-bundle.pem` and named by
+  `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` and `GIT_SSL_CAINFO`;
+  Node gets the CA alone through `NODE_EXTRA_CA_CERTS`. A CONNECT to a bound
+  host is answered by the proxy with a short-lived certificate for that host;
+  it reads one request, rewrites its head, and re-originates it over real,
+  verified TLS to the same host and port. Every other tunnel stays opaque.
+
+Request bodies may use `Content-Length` or `chunked`; a request whose framing
+the upstream could read differently (Transfer-Encoding with Content-Length,
+any coding but `chunked`, conflicting lengths, whitespace before a colon, line
+folding) is refused with `400` before anything is dialed. Limits of this first
+version: one request per connection (`Connection: close`), no WebSocket or
+other upgrade on a bound host, and no HTTPS injection on macOS. The supervisor
+sees the plaintext of requests to bound hosts, by construction.
 
 ### Host loopback services: `--forward-port PORT`
 
@@ -778,10 +799,10 @@ flag is CLI-only; no configuration key enables it.
 | `run_id`                         | 32 hex characters, the same for every line of one launch                                                                                                                                                                                                                                           |
 | `host`, `port`                   | the requested target; `null` when no request was parsed                                                                                                                                                                                                                                            |
 | `verdict`                        | `allow`, `deny` (refused by policy) or `error` (the connection failed: a malformed or oversized request, or an upstream or client that could not be reached or written to)                                                                                                                         |
-| `reason`                         | why: `in-allowlist`, `secret-termination`, `prompt-allow`; `not-in-allowlist`, `port-not-allowed`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed` |
+| `reason`                         | why: `in-allowlist`, `secret-termination`, `secret-injection`, `prompt-allow`; `not-in-allowlist`, `port-not-allowed`, `forbidden-address-range`, `prompt-deny`, `prompt-no-answer`; `connection-cap`, `request-too-large`, `malformed-request`, `ambiguous-framing`, `method-not-allowed`, `client-read-failed`, `upstream-unreachable`, `client-write-failed`, `inject-ca-failed` |
 | `bytes_up`, `bytes_down`         | bytes relayed to and from the upstream, counted even when the transfer ends early                                                                                                                                                                                                                  |
 | `duration_ms`                    | from accept to close                                                                                                                                                                                                                                                                               |
-| `upstream_host`, `upstream_port` | only on a `secret-termination` line: the host and port the proxy itself dialed over TLS                                                                                                                                                                                                            |
+| `upstream_host`, `upstream_port` | only on a `secret-termination` or `secret-injection` line: the host and port the proxy itself dialed over TLS                                                                                                                                                                                       |
 
 Adding a field keeps `v`; removing, renaming, retyping or re-meaning one
 increments it. No request content is ever logged: no path, query, method,
